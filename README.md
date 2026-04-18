@@ -4,7 +4,9 @@ A small, local, rebuildable in-memory cache over a Unix domain socket. Written i
 
 ## What it is
 
-- A scope-first hot-window cache / write-buffer that sits in front of your real data store.
+- A scope-first hot-window cache / write-buffer that sits in front of your real data store. (A *scope* is what other systems call a **namespace** or **bucket** — conceptually comparable to a **table** in SQL terms: every item lives inside exactly one.)
+- Typical use: keep a hot slice of your data in RAM so it does not have to be re-queried from the database on every request. For example, the replies to a forum topic, the recent chat messages of a given user, or a rolling feed per session — each lives in its own scope and can be served directly from memory.
+- Also usable as a write-buffer: append high-frequency events (analytics hits, log lines, chat messages) to a scope, and let a background worker drain the buffer every few seconds with a single bulk insert against the database. This flattens write spikes and keeps the DB from being hammered on every request. `/delete-up-to` exists specifically for this drain pattern — trim the cache up to the last seq you committed.
 - Wipeable and rebuildable at any time — the source of truth lives elsewhere (a database, a JSON file, data built in code, anything).
 - Tuned for modest VPS footprints (~1 GB RAM alongside DB + app), with a 100 MiB default store cap.
 - **Extremely fast**: sub-50-nanosecond reads on a populated store (see [Performance](#performance)).
@@ -15,7 +17,7 @@ A small, local, rebuildable in-memory cache over a Unix domain socket. Written i
 - A business-logic layer.
 - Payloads are opaque JSON — the cache never inspects, parses, or searches inside them.
 
-Filtering and addressing are limited to three fields: `scope`, `id`, `seq`.
+inmem-cache is intentionally simple. Filtering and addressing are deliberately limited to three fields — `scope`, `id`, `seq` — and that limitation is the whole point: it is what keeps the cache fast and easy to reason about. There is no rich query language, but because `scope` and `id` are free-form strings the client fully controls, a surprisingly wide set of access patterns can be modeled on top of them.
 
 ## Status
 
