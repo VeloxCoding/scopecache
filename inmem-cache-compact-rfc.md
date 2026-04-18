@@ -2,11 +2,11 @@
 
 ## 1. Scope
 
-`inmem-cache` is a small, local, rebuildable in-memory cache/buffer that runs alongside a database.  
-The database is always the source of truth.
+`inmem-cache` is a small, local, rebuildable in-memory cache/buffer.  
+The source of truth lives elsewhere — a database, a file, data generated in code, anything — and the cache is always rebuildable from it.
 
-The service exists primarily to offload hot reads.  
-It may also support simple write-buffer behavior, as long as that behavior remains within the same limited scope-first model.
+The service supports both hot-read caching and simple write-buffer use.
+Its built-in semantics are limited to a small set of scope-first primitives: append, read, address, update, delete, and replace items within a scope. Higher-level usage patterns are left to the client.
 
 This system is **not**:
 - a database
@@ -36,7 +36,7 @@ This system is **not**:
 7. Clients must not send `seq` on write endpoints.
 8. `id` is optional. If present, it must be unique within its scope.
 9. The cache may be rebuilt or discarded at any time.
-10. The database remains authoritative.
+10. The external source of truth remains authoritative.
 
 ---
 
@@ -362,7 +362,7 @@ Its core identity is:
 - in-memory
 - rebuildable
 - disposable
-- DB-backed as source of truth
+- backed by an external source of truth (DB, file, generated data, …)
 - limited to simple top-level semantics
 - explicitly not a second database
 

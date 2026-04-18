@@ -6,7 +6,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **inmem-cache** — a Caddy module providing a local, rebuildable, disposable in-memory cache.
 
-The DB is always the source of truth. This cache is NOT a database, search engine, analytics store, or business-logic layer. It can be wiped and rebuilt at any time.
+The source of truth lives outside this cache — it can be a database, a JSON file, an array built in code, or anything else. This cache is NOT a database, search engine, analytics store, or business-logic layer. It can be wiped and rebuilt from that source at any time.
+
+The service supports both hot-read caching and simple write-buffer use.
+Its built-in semantics are limited to a small set of scope-first primitives: append, read, address, update, delete, and replace items within a scope. Higher-level usage patterns are left to the client.
 
 ### Item Model
 - **scope**: required partition key. Max 128 bytes; no surrounding whitespace; no control characters.
