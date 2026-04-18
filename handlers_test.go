@@ -1,4 +1,4 @@
-package main
+package inmemcache
 
 import (
 	"encoding/json"
@@ -18,7 +18,7 @@ func newTestHandler(maxItems int) (http.Handler, *API) {
 	// small maxStoreBytes so their writes can fail the store cap on purpose.
 	api := NewAPI(NewStore(maxItems, 100<<20))
 	mux := http.NewServeMux()
-	api.registerRoutes(mux)
+	api.RegisterRoutes(mux)
 	return mux, api
 }
 

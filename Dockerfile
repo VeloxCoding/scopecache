@@ -2,7 +2,8 @@ FROM golang:1.23-alpine AS builder
 WORKDIR /src
 COPY go.mod ./
 COPY *.go ./
-RUN CGO_ENABLED=0 go build -o /out/inmem-cache .
+COPY cmd ./cmd
+RUN CGO_ENABLED=0 go build -o /out/inmem-cache ./cmd/inmem-cache
 
 FROM alpine:latest
 RUN apk add --no-cache curl

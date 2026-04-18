@@ -42,9 +42,13 @@ All byte-ish JSON fields (`tracked_store_mb`, `max_store_mb`, `approx_scope_mb`,
 
 ## Development Phase
 
-**Currently in Phase 1: standalone.** The code is a plain `package main` HTTP server listening on a Unix socket. Phase 3 will convert it into a Caddy module (`package inmemcache` with `caddy.RegisterModule()`).
+The project moves through three phases:
 
-Until the standalone version is validated by tests, do **not** add Caddy-specific code or imports.
+1. **Phase 1 — flat standalone** *(done)*: single `package main` at the repo root.
+2. **Phase 2 — core/cmd split** *(current)*: core logic lives in `package inmemcache` at the repo root; the standalone binary is at `cmd/inmem-cache/`. Stdlib-only.
+3. **Phase 3 — Caddy module** *(upcoming)*: a thin `caddymodule/` package wraps the core with `caddy.RegisterModule()` + Provision/Validate/Cleanup. The standalone entrypoint keeps working alongside it.
+
+Do **not** add Caddy-specific code or imports to `package inmemcache` — the core must remain stdlib-only so `go test ./...` never needs Caddy. Caddy imports belong only in the `caddymodule/` subpackage (Phase 3).
 
 ## Build & Development
 
@@ -59,7 +63,7 @@ docker compose up -d dev
 docker compose exec dev sh
 
 # Inside dev shell:
-go build -o /tmp/inmem-cache .
+go build -o /tmp/inmem-cache ./cmd/inmem-cache
 go test ./...
 go test -run TestName ./...
 go vet ./...
@@ -68,13 +72,46 @@ go vet ./...
 curl --unix-socket /run/inmem.sock http://localhost/help
 ```
 
-## File Layout
+## Layout
 
-- [main.go](main.go) — `main()`, Unix socket listener, mux wiring
-- [handlers.go](handlers.go) — HTTP handlers + `registerRoutes()`; stable API surface
-- [store.go](store.go) — `Store` + `ScopeBuffer`; all cache logic
-- [validation.go](validation.go) — input validation + query param normalization
-- [types.go](types.go) — item model, constants, size estimators
+```
+caddy_module/                         (module github.com/DenverCoding/inmem-cache)
+├── go.mod
+├── Dockerfile
+├── docker-compose.yml
+├── Caddyfile
+├── CLAUDE.md
+├── inmem-cache-compact-rfc.md
+│
+├── store.go                          ── package inmemcache  (core, stdlib-only)
+├── store_test.go
+├── handlers.go
+├── handlers_test.go
+├── validation.go
+├── validation_test.go
+├── types.go                          (without DefaultSocketPath / UnixSocketPerm)
+│
+├── cmd/
+│   └── inmem-cache/
+│       ├── main.go                   ── package main  (standalone binary)
+│       ├── socket_linux.go
+│       └── socket_other.go
+│
+└── caddymodule/                      (added in Phase 3)
+    └── module.go                     ── package caddymodule
+```
+
+### Public API surface of `package inmemcache`
+
+Kept deliberately small so the core stays refactorable:
+
+- `func NewStore(defaultMaxItems int, maxStoreBytes int64) *Store`
+- `func NewAPI(store *Store) *API`
+- `func (api *API) RegisterRoutes(mux *http.ServeMux)`
+
+Env-var parsing (`INMEM_SCOPE_MAX_ITEMS`, `INMEM_MAX_STORE_MB`, `INMEM_SOCKET_PATH`) lives in `cmd/inmem-cache/` — the core package takes plain values so the Caddy module can supply them from its own JSON config instead. Planned next step: wrap the two `NewStore` parameters into a `Config` struct once the Caddy adapter is being built, so both entrypoints pass the same shape.
+
+Handler methods (`handleAppend`, `handleWarm`, …) stay exported on `*API` so the Caddy module can dispatch to them directly, but normal consumers go through `RegisterRoutes`. Socket-specific concerns (`DefaultSocketPath`, `UnixSocketPerm`, platform `socket_*.go`) live in `cmd/inmem-cache/` — they are not part of the core.
 
 ## Architecture
 

@@ -1,4 +1,4 @@
-package main
+package inmemcache
 
 import (
 	"encoding/json"

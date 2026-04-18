@@ -1,4 +1,4 @@
-package main
+package inmemcache
 
 import (
 	"encoding/json"
@@ -761,7 +761,7 @@ NOTES:
 	_, _ = w.Write([]byte(helpText))
 }
 
-func (api *API) registerRoutes(mux *http.ServeMux) {
+func (api *API) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/append", api.handleAppend)
 	mux.HandleFunc("/warm", api.handleWarm)
 	mux.HandleFunc("/rebuild", api.handleRebuild)

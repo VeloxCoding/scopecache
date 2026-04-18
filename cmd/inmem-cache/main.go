@@ -12,7 +12,24 @@ import (
 	"strconv"
 	"syscall"
 	"time"
+
+	inmemcache "github.com/DenverCoding/inmem-cache"
 )
+
+// UnixSocketPerm is applied to the listening socket file on POSIX systems
+// so the Caddy / inmem-cache group can connect without the file being
+// world-readable. It is a no-op on Windows (Chmod there only toggles the
+// read-only attribute), which is harmless: Windows AF_UNIX access is
+// already gated by NTFS ACLs on the containing directory.
+const UnixSocketPerm = 0660
+
+// DefaultSocketPath is the platform-specific default for the listening
+// AF_UNIX socket. Linux uses /run/inmem.sock (a tmpfs that vanishes on
+// reboot, which matches the cache's disposable semantics); other OSes fall
+// back to os.TempDir() because /run does not exist or is not user-writable
+// there. Per-platform definitions live in socket_linux.go and socket_other.go.
+// The value can be overridden at runtime via the INMEM_SOCKET_PATH env var.
+var DefaultSocketPath string
 
 // scopeMaxItemsFromEnv returns INMEM_SCOPE_MAX_ITEMS if set to a positive
 // integer, otherwise the compile-time default. A malformed or non-positive
@@ -21,12 +38,12 @@ import (
 func scopeMaxItemsFromEnv() int {
 	raw := os.Getenv("INMEM_SCOPE_MAX_ITEMS")
 	if raw == "" {
-		return ScopeMaxItems
+		return inmemcache.ScopeMaxItems
 	}
 	n, err := strconv.Atoi(raw)
 	if err != nil || n <= 0 {
-		log.Printf("INMEM_SCOPE_MAX_ITEMS=%q is not a positive integer; using default %d", raw, ScopeMaxItems)
-		return ScopeMaxItems
+		log.Printf("INMEM_SCOPE_MAX_ITEMS=%q is not a positive integer; using default %d", raw, inmemcache.ScopeMaxItems)
+		return inmemcache.ScopeMaxItems
 	}
 	return n
 }
@@ -50,12 +67,12 @@ func socketPathFromEnv() string {
 func maxStoreBytesFromEnv() int64 {
 	raw := os.Getenv("INMEM_MAX_STORE_MB")
 	if raw == "" {
-		return int64(MaxStoreMiB) << 20
+		return int64(inmemcache.MaxStoreMiB) << 20
 	}
 	n, err := strconv.Atoi(raw)
 	if err != nil || n <= 0 {
-		log.Printf("INMEM_MAX_STORE_MB=%q is not a positive integer; using default %d MiB", raw, MaxStoreMiB)
-		return int64(MaxStoreMiB) << 20
+		log.Printf("INMEM_MAX_STORE_MB=%q is not a positive integer; using default %d MiB", raw, inmemcache.MaxStoreMiB)
+		return int64(inmemcache.MaxStoreMiB) << 20
 	}
 	return int64(n) << 20
 }
@@ -93,12 +110,12 @@ func listenUnixSocket(path string) (net.Listener, error) {
 func main() {
 	maxItems := scopeMaxItemsFromEnv()
 	maxStoreBytes := maxStoreBytesFromEnv()
-	store := NewStore(maxItems, maxStoreBytes)
-	api := NewAPI(store)
+	store := inmemcache.NewStore(maxItems, maxStoreBytes)
+	api := inmemcache.NewAPI(store)
 	log.Printf("inmem cache capacity: %d items per scope, %d MiB store-wide", maxItems, maxStoreBytes>>20)
 
 	mux := http.NewServeMux()
-	api.registerRoutes(mux)
+	api.RegisterRoutes(mux)
 
 	server := &http.Server{
 		Handler:           mux,

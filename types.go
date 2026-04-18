@@ -1,4 +1,4 @@
-package main
+package inmemcache
 
 import (
 	"encoding/json"
@@ -25,22 +25,7 @@ const (
 	BulkRequestBytesOverhead = 16 << 20 // 16 MiB
 
 	ReadHeatWindowDays = 7
-
-	// UnixSocketPerm is applied to the listening socket file on POSIX systems
-	// so the Caddy / inmem-cache group can connect without the file being
-	// world-readable. It is a no-op on Windows (Chmod there only toggles the
-	// read-only attribute), which is harmless: Windows AF_UNIX access is
-	// already gated by NTFS ACLs on the containing directory.
-	UnixSocketPerm = 0660
 )
-
-// DefaultSocketPath is the platform-specific default for the listening
-// AF_UNIX socket. Linux uses /run/inmem.sock (a tmpfs that vanishes on
-// reboot, which matches the cache's disposable semantics); other OSes fall
-// back to os.TempDir() because /run does not exist or is not user-writable
-// there. Per-platform definitions live in socket_linux.go and socket_other.go.
-// The value can be overridden at runtime via the INMEM_SOCKET_PATH env var.
-var DefaultSocketPath string
 
 // MB is an int64 byte count that serializes to JSON as a number in MiB with
 // 4 decimals (e.g. 79845 bytes → 0.0762). One display unit across every
