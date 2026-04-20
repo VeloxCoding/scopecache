@@ -5,7 +5,6 @@ import (
 	"errors"
 	"sync"
 	"testing"
-	"unsafe"
 )
 
 func newItem(scope, id string, payload map[string]interface{}) Item {
@@ -744,30 +743,32 @@ func TestDeleteUpToSeq_DoesNotRollbackLastSeq(t *testing.T) {
 	}
 }
 
-func TestDeleteUpToSeq_ClearsBackingSlots(t *testing.T) {
-	buf := NewScopeBuffer(8)
-	_, _ = buf.appendItem(newItem("s", "a", map[string]interface{}{"marker": "A"}))
-	_, _ = buf.appendItem(newItem("s", "b", map[string]interface{}{"marker": "B"}))
-	_, _ = buf.appendItem(newItem("s", "c", map[string]interface{}{"marker": "C"}))
-
-	if n := buf.deleteUpToSeq(2); n != 2 {
-		t.Fatalf("deleted=%d want 2", n)
+func TestDeleteUpToSeq_ReleasesBackingArray(t *testing.T) {
+	// Fill a scope well past its natural grow-cycle so the backing array
+	// has capacity noticeably larger than the survivors. Drain the prefix
+	// and assert the backing array was reallocated to match the remainder
+	// — that is the guarantee that frees the removed-payload memory for
+	// GC in the write-buffer drain-from-front pattern.
+	const fill = 1000
+	buf := NewScopeBuffer(fill * 2)
+	for i := 0; i < fill; i++ {
+		_, _ = buf.appendItem(newItem("s", "", nil))
 	}
-	if len(buf.items) != 1 {
-		t.Fatalf("len=%d want 1", len(buf.items))
+	preCap := cap(buf.items)
+	if preCap < fill {
+		t.Fatalf("sanity: pre-drain cap=%d want >= %d", preCap, fill)
 	}
 
-	// After the reslice, &buf.items[0] points at the original slot 2 in the
-	// backing array. The two dropped slots (original indices 0 and 1) now
-	// sit one and two Item-widths before the new start. Both must be zeroed
-	// so their payloads are eligible for GC.
-	itemSize := unsafe.Sizeof(Item{})
-	base := unsafe.Pointer(&buf.items[0])
-	for back := uintptr(1); back <= 2; back++ {
-		slot := (*Item)(unsafe.Pointer(uintptr(base) - back*itemSize))
-		if slot.ID != "" || slot.Seq != 0 || slot.Payload != nil {
-			t.Fatalf("dropped slot %d back not cleared: %+v", back, *slot)
-		}
+	drained := buf.deleteUpToSeq(uint64(fill - 10))
+	if drained != fill-10 {
+		t.Fatalf("drained=%d want %d", drained, fill-10)
+	}
+	if len(buf.items) != 10 {
+		t.Fatalf("len=%d want 10", len(buf.items))
+	}
+	if cap(buf.items) != len(buf.items) {
+		t.Fatalf("backing array not released: cap=%d len=%d (pre-drain cap was %d)",
+			cap(buf.items), len(buf.items), preCap)
 	}
 }
 

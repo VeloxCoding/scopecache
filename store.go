@@ -649,9 +649,6 @@ func (b *ScopeBuffer) deleteUpToSeq(maxSeq uint64) int {
 		return 0
 	}
 
-	// Zero each slot before resliceing past it. Reslicing alone leaves the
-	// Items reachable via the backing array, pinning their payloads against
-	// GC.
 	var freedBytes int64
 	for i := 0; i < idx; i++ {
 		removed := b.items[i]
@@ -660,9 +657,16 @@ func (b *ScopeBuffer) deleteUpToSeq(maxSeq uint64) int {
 		if removed.ID != "" {
 			delete(b.byID, removed.ID)
 		}
-		b.items[i] = Item{}
 	}
-	b.items = b.items[idx:]
+	// Copy the kept suffix into a fresh backing array so the old one —
+	// which still holds the removed payloads in its prefix — becomes
+	// GC-eligible. A bare reslice (b.items[idx:]) would pin the full
+	// original array behind a small remainder; this matters for the
+	// write-buffer pattern where repeated drain-from-front otherwise
+	// retains memory proportional to the historical high-watermark.
+	rest := make([]Item, len(b.items)-idx)
+	copy(rest, b.items[idx:])
+	b.items = rest
 
 	b.bytes -= freedBytes
 	if b.store != nil {
