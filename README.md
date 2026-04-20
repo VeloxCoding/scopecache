@@ -194,4 +194,6 @@ The full design and endpoint contract lives in [inmem-cache-compact-rfc.md](inme
 
 ## License
 
-TBD.
+Licensed under the [Apache License, Version 2.0](LICENSE). See the `LICENSE` file for the full text.
+
+Copyright 2026 DenverCoding.
