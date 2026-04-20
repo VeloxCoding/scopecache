@@ -164,7 +164,11 @@ Two independent caps apply, either violation returns **HTTP 507 Insufficient Sto
 
 ## Performance
 
-Single-item read on a ~57 MiB dataset (100 scopes × 1000 items × ~580 B/item):
+Two distinct numbers are worth reporting: the *core ceiling* (how fast the cache itself is when called in-process) and the *end-to-end throughput* a real client sees over the Unix socket. Both are measured on a populated 100 scope × 1000 item × ~580 B/item dataset (~57 MiB).
+
+### In-process lookups (cache core)
+
+Single-item read, direct function call against the store — no HTTP layer:
 
 | Benchmark                        | Time/op | Allocs/op |
 |----------------------------------|---------|-----------|
@@ -172,11 +176,29 @@ Single-item read on a ~57 MiB dataset (100 scopes × 1000 items × ~580 B/item):
 | `GetBySeq`                       | ~27 ns  | 0         |
 | `GetByID` (parallel, 32 cores)   | ~29 ns  | 0         |
 
-That's roughly **30 million reads per second per core**, and the scope-level `RWMutex` does not serialize readers, so throughput scales with cores.
+That is roughly **30 million reads per second per core**. The scope-level `RWMutex` does not serialize readers, so throughput scales with cores. These numbers describe the ceiling of the cache core itself, not the rate a client sees over the socket.
+
+### HTTP over Unix socket (end-to-end)
+
+What an actual client pays: the full request path through `net/http`, the Unix-socket syscalls, JSON encoding/decoding where applicable, and the same scope-lock acquisition as above. Keep-alive connections are reused (standard `http.Client` pool behaviour).
+
+| Benchmark                              | Time/op  | Throughput                   |
+|----------------------------------------|----------|------------------------------|
+| `HTTP_GetByID` (serial)                | ~99 µs   | ~10,000 req/s per core       |
+| `HTTP_GetByID` (parallel, 32 cores)    | ~8.8 µs  | ~114,000 req/s aggregate     |
+| `HTTP_RenderByID` (serial)             | ~103 µs  | ~9,700 req/s per core        |
+| `HTTP_RenderByID` (parallel, 32 cores) | ~8.1 µs  | ~124,000 req/s aggregate     |
+| `HTTP_Head10` (serial, `limit=10`)     | ~168 µs  | ~6,000 req/s per core        |
+| `HTTP_Append` (serial)                 | ~142 µs  | ~7,000 req/s per core        |
+
+A few things fall out of these numbers:
+
+- **HTTP framing, not the cache, sets the floor.** Per-request cost is dominated by `net/http` + syscall overhead. The cache work itself is still in the tens of nanoseconds.
+- **`/render` vs `/get` are near-identical at this payload size.** The JSON envelope costs ~4 µs serial at ~580 B payloads — negligible relative to the ~100 µs total. The gap widens for larger payloads where the envelope's per-byte marshalling cost grows.
+- **Parallel scaling is ~12-15×** on 32 cores, not linear. The listener's accept serialization, connection-pool coordination, and GC cycles account for the gap. Throughput does scale — just not in proportion to cores.
+- **Writes are ~1.5× the cost of reads**, which matches expectations: `/append` takes a scope write-lock plus an atomic store-bytes CAS, so it cannot run concurrently against the same scope the way reads can.
 
 Measured with `go test -bench=. -benchtime=3s` on an AMD Ryzen AI Max+ 395 (Linux, Go 1.23).
-
-**What these numbers do and do not mean.** The table above measures **in-process Go lookups** — direct function calls against the cache, with no HTTP layer in between. They describe the ceiling of the cache core itself, not end-to-end request throughput. When a real caller hits the Unix socket, each request also pays `net/http` + syscall + (for `/get`) JSON-marshaling overhead, which dominates once the cache itself takes ~30 ns. Real-world per-request throughput over the socket is therefore substantially lower than the raw benchmark suggests — concrete numbers depend on payload size, keepalive, and which endpoint is used. `/render` serves raw bytes with no JSON envelope and is the fastest socket-level path; `/get` returns a JSON-wrapped item and pays the extra marshal cost.
 
 Reproduce with:
 
