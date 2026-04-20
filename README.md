@@ -163,7 +163,7 @@ All overrides via environment variables:
 
 ## Limits
 
-Two independent caps apply, either violation returns **HTTP 507 Insufficient Storage** — the cache never evicts on its own. Clients free capacity via `/delete-up-to`, `/delete-scope`, or a fitting `/warm`/`/rebuild`.
+Three independent caps apply; any violation returns **HTTP 507 Insufficient Storage** (per-scope, store-wide) or **HTTP 400 Bad Request** (per-item shape rule). The cache never evicts on its own — clients free capacity via `/delete-up-to`, `/delete-scope`, `/wipe`, or a fitting `/warm`/`/rebuild`.
 
 - **Per-scope item cap** — 100,000 items (default).
 - **Store-wide byte cap** — 100 MiB aggregate (default).
