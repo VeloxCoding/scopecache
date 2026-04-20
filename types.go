@@ -177,6 +177,18 @@ func (e *CounterOverflowError) Error() string {
 	return "the counter operation would exceed the allowed range of ±(2^53-1)"
 }
 
+// ScopeDetachedError is returned by a scope-buffer write method when the
+// buffer has been unlinked from its Store (by /delete-scope, /wipe, or
+// /rebuild) between the handler's getScope/getOrCreateScope call and the
+// buffer-level mutation. The write would otherwise succeed into an orphan
+// buffer that no subsequent reader can reach, so the caller is told the
+// write did not take effect. The handler converts this to 409 Conflict.
+type ScopeDetachedError struct{}
+
+func (e *ScopeDetachedError) Error() string {
+	return "the scope was deleted while the request was in flight; please retry"
+}
+
 func nowUnixMicro() int64 {
 	return time.Now().UnixMicro()
 }

@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"math"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // checkKeyField enforces the shape rules for scope/id strings:
@@ -13,6 +15,12 @@ import (
 // The transport layer does not permit NUL or control bytes in URL/JSON
 // identifiers cleanly; rejecting them here avoids log/URL poisoning and
 // keeps scope/id safe to splice into diagnostic output.
+//
+// The control-char check iterates bytes, not runes. Range-over-string would
+// yield utf8.RuneError (0xFFFD) for malformed UTF-8, which is >0x7f and
+// would pass the check even though a raw 0x00..0x1f byte was present.
+// Byte iteration catches those regardless of UTF-8 validity; high bytes
+// (0x80+) are left alone so valid multi-byte UTF-8 passes through.
 func checkKeyField(fieldName, value string, maxLen int) error {
 	if len(value) > maxLen {
 		return errors.New("the '" + fieldName + "' field must not exceed " + strconv.Itoa(maxLen) + " bytes")
@@ -20,8 +28,9 @@ func checkKeyField(fieldName, value string, maxLen int) error {
 	if value != strings.TrimSpace(value) {
 		return errors.New("the '" + fieldName + "' field must not have leading or trailing whitespace")
 	}
-	for _, r := range value {
-		if r < 0x20 || r == 0x7f {
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		if c < 0x20 || c == 0x7f {
 			return errors.New("the '" + fieldName + "' field must not contain control characters")
 		}
 	}
@@ -109,6 +118,15 @@ func normalizeHours(raw string) (int64, error) {
 	n, err := strconv.ParseInt(raw, 10, 64)
 	if err != nil || n < 0 {
 		return 0, errors.New("the 'hours' parameter must be a non-negative integer")
+	}
+
+	// The caller multiplies hours by μs/hour (3.6e9). Values above this
+	// threshold would overflow int64 during that multiplication — the
+	// practical ceiling is still ~2.9 million years, far beyond any
+	// sensible age filter.
+	const usPerHour = int64(time.Hour / time.Microsecond)
+	if n > math.MaxInt64/usPerHour {
+		return 0, errors.New("the 'hours' parameter is unreasonably large")
 	}
 
 	return n, nil

@@ -570,6 +570,11 @@ func (api *API) handleWipe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// /wipe takes no request body. We still cap what Go's auto-drain might
+	// read so a misbehaving client cannot pin server memory by pushing a
+	// large body to a body-less endpoint.
+	r.Body = http.MaxBytesReader(w, r.Body, 1024)
+
 	deletedScopes, deletedItems, freedBytes := api.store.wipe()
 
 	writeJSONWithDuration(w, http.StatusOK, map[string]interface{}{

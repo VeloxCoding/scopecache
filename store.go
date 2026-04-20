@@ -14,7 +14,13 @@ type ScopeBuffer struct {
 	// store is set when the buffer is owned by a Store. When nil (orphan
 	// buffers used in unit tests) byte-budget accounting is skipped — the
 	// tests exercise item-count and seq logic without spinning up a store.
-	store           *Store
+	store *Store
+	// detached is set true when the buffer has been unlinked from its Store
+	// by /delete-scope, /wipe or /rebuild. Writes that reach a detached
+	// buffer via a stale pointer return *ScopeDetachedError so the caller
+	// learns the write did not take effect, rather than silently writing
+	// into an orphan buffer that is unreachable and about to be GC'd.
+	detached        bool
 	items           []Item
 	byID            map[string]Item
 	bySeq           map[uint64]Item
@@ -185,6 +191,10 @@ func (b *ScopeBuffer) appendItem(item Item) (Item, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
+	if b.detached {
+		return Item{}, &ScopeDetachedError{}
+	}
+
 	if len(b.items) >= b.maxItems {
 		return Item{}, &ScopeFullError{Count: len(b.items), Cap: b.maxItems}
 	}
@@ -278,6 +288,10 @@ func (b *ScopeBuffer) upsertByID(item Item) (Item, bool, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
+	if b.detached {
+		return Item{}, false, &ScopeDetachedError{}
+	}
+
 	if existing, exists := b.byID[item.ID]; exists {
 		delta := int64(len(item.Payload)) - int64(len(existing.Payload))
 		if b.store != nil && delta != 0 {
@@ -343,6 +357,10 @@ func (b *ScopeBuffer) upsertByID(item Item) (Item, bool, error) {
 func (b *ScopeBuffer) counterAdd(scope, id string, by int64) (int64, bool, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+
+	if b.detached {
+		return 0, false, &ScopeDetachedError{}
+	}
 
 	if existing, exists := b.byID[id]; exists {
 		current, err := parseCounterValue(existing.Payload)
@@ -431,6 +449,10 @@ func (b *ScopeBuffer) updateByID(id string, payload json.RawMessage) (int, error
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
+	if b.detached {
+		return 0, &ScopeDetachedError{}
+	}
+
 	existing, ok := b.byID[id]
 	if !ok {
 		return 0, nil
@@ -469,6 +491,10 @@ func (b *ScopeBuffer) updateBySeq(seq uint64, payload json.RawMessage) (int, err
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
+	if b.detached {
+		return 0, &ScopeDetachedError{}
+	}
+
 	existing, ok := b.bySeq[seq]
 	if !ok {
 		return 0, nil
@@ -505,34 +531,37 @@ func (b *ScopeBuffer) deleteByID(id string) int {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	if _, ok := b.byID[id]; !ok {
+	existing, ok := b.byID[id]
+	if !ok {
 		return 0
 	}
 
-	for i := range b.items {
-		if b.items[i].ID != id {
-			continue
-		}
-
-		removed := b.items[i]
-		removedSize := approxItemSize(removed)
-		// Shift the tail down, then zero the now-duplicate last slot before
-		// shrinking. Without this the backing array keeps a reference and
-		// the Item's payload cannot be GC'd.
-		copy(b.items[i:], b.items[i+1:])
-		b.items[len(b.items)-1] = Item{}
-		b.items = b.items[:len(b.items)-1]
-		delete(b.bySeq, removed.Seq)
-		delete(b.byID, id)
-
-		b.bytes -= removedSize
-		if b.store != nil {
-			b.store.totalBytes.Add(-removedSize)
-		}
-		return 1
+	// items is ordered ascending by seq (monotonic append, no mid-slice
+	// inserts), so binary search finds the index in O(log n) rather than
+	// scanning the slice by id.
+	i := sort.Search(len(b.items), func(i int) bool {
+		return b.items[i].Seq >= existing.Seq
+	})
+	if i == len(b.items) || b.items[i].Seq != existing.Seq {
+		// Unreachable under b.mu: b.byID confirmed the item exists and items/bySeq are kept in sync.
+		return 0
 	}
 
-	return 0
+	removedSize := approxItemSize(existing)
+	// Shift the tail down, then zero the now-duplicate last slot before
+	// shrinking. Without this the backing array keeps a reference and
+	// the Item's payload cannot be GC'd.
+	copy(b.items[i:], b.items[i+1:])
+	b.items[len(b.items)-1] = Item{}
+	b.items = b.items[:len(b.items)-1]
+	delete(b.bySeq, existing.Seq)
+	delete(b.byID, id)
+
+	b.bytes -= removedSize
+	if b.store != nil {
+		b.store.totalBytes.Add(-removedSize)
+	}
+	return 1
 }
 
 func (b *ScopeBuffer) deleteBySeq(seq uint64) int {
@@ -790,11 +819,11 @@ func (s *Store) deleteScope(scope string) (int, bool) {
 	// Hold buf.mu as a write lock across the whole sequence so an in-flight
 	// mutator on this buf (via a stale pointer obtained before we ran) either
 	// completes before we touch the counter or waits until after we're done.
-	// Crucially we also clear buf.store: any mutator that wakes up afterwards
-	// sees a detached buf and skips all store-counter accounting, so its
-	// orphaned work cannot inflate or drain s.totalBytes. The orphan buf
-	// stays internally consistent (items, byID, bySeq, bytes keep tracking
-	// each other) and is collected once the last stale pointer drops.
+	// Crucially we also detach the buffer: any write that wakes up afterwards
+	// returns *ScopeDetachedError instead of silently writing into an orphan
+	// that is unreachable and about to be GC'd. store is cleared too so any
+	// remaining code path that survives the detach check still skips
+	// store-counter accounting.
 	buf.mu.Lock()
 	itemCount := len(buf.items)
 	scopeBytes := buf.bytes
@@ -802,17 +831,18 @@ func (s *Store) deleteScope(scope string) (int, bool) {
 	if scopeBytes > 0 {
 		s.totalBytes.Add(-scopeBytes)
 	}
+	buf.detached = true
 	buf.store = nil
 	buf.mu.Unlock()
 	return itemCount, true
 }
 
 // wipe removes every scope from the store and resets the byte counter to
-// zero in one atomic step. Each scope buffer is detached (buf.store = nil)
-// under its own write-lock before the store map is replaced, mirroring the
-// /delete-scope pattern: any in-flight mutator waiting on buf.mu wakes up
-// on a detached buffer and skips store-counter accounting, so orphaned work
-// cannot corrupt the post-wipe state.
+// zero in one atomic step. Each scope buffer is detached under its own
+// write-lock before the store map is replaced, mirroring the /delete-scope
+// pattern: any in-flight write waiting on buf.mu wakes up on a detached
+// buffer and returns *ScopeDetachedError, so orphaned work cannot silently
+// "succeed" into a buffer that nobody can ever read from again.
 //
 // freedBytes is captured via totalBytes.Swap(0) AFTER every buf has been
 // detached, so it covers any bytes a concurrent /append committed through
@@ -830,6 +860,7 @@ func (s *Store) wipe() (int, int, int64) {
 	for _, buf := range s.scopes {
 		buf.mu.Lock()
 		totalItems += len(buf.items)
+		buf.detached = true
 		buf.store = nil
 		buf.mu.Unlock()
 	}
@@ -994,10 +1025,20 @@ func (s *Store) rebuildAll(grouped map[string][]Item) (int, int, error) {
 		}
 	}
 
-	// Phase 2 — swap the store map and reset the byte counter under one
-	// lock. Any /append that was blocked on s.mu.RLock sees the new map
-	// and the new baseline as a single coherent state.
+	// Phase 2 — detach every existing buffer, then swap the store map and
+	// reset the byte counter under one lock. Detaching is essential:
+	// without it, a concurrent /append holding a stale buf pointer obtained
+	// via getOrCreateScope would run AFTER the swap and call reserveBytes
+	// against the freshly reset counter, permanently inflating totalBytes
+	// (its item lands in an unreachable orphan buffer). Mirrors wipe and
+	// /delete-scope; see ScopeBuffer.detached.
 	s.mu.Lock()
+	for _, buf := range s.scopes {
+		buf.mu.Lock()
+		buf.detached = true
+		buf.store = nil
+		buf.mu.Unlock()
+	}
 	s.scopes = newScopes
 	s.totalBytes.Store(totalNewBytes)
 	s.mu.Unlock()

@@ -996,8 +996,9 @@ func TestStore_Wipe_FreesHeadroomForNextAppend(t *testing.T) {
 }
 
 // A ScopeBuffer pointer held before wipe must detach cleanly: further
-// mutations on it must not corrupt the store's byte counter. This mirrors
-// the orphan-buffer guarantee of deleteScope.
+// writes on it must return *ScopeDetachedError rather than silently
+// succeeding into an orphan buffer no reader can reach. The store's byte
+// counter must also remain at zero.
 func TestStore_Wipe_DetachesOrphanedBuffers(t *testing.T) {
 	s := NewStore(10, 100<<20, 1<<20)
 
@@ -1008,12 +1009,46 @@ func TestStore_Wipe_DetachesOrphanedBuffers(t *testing.T) {
 
 	s.wipe()
 
-	// The caller still has `buf`; operating on it must not touch totalBytes.
-	if _, err := buf.appendItem(newItem("s", "b", nil)); err != nil {
-		t.Fatalf("orphan append: %v", err)
+	// The caller still has `buf`; a write must now fail with ScopeDetachedError.
+	_, err := buf.appendItem(newItem("s", "b", nil))
+	var sde *ScopeDetachedError
+	if !errors.As(err, &sde) {
+		t.Fatalf("orphan append: got %v, want *ScopeDetachedError", err)
 	}
 	if got := s.totalBytes.Load(); got != 0 {
 		t.Fatalf("orphan mutation leaked into totalBytes: got %d want 0", got)
+	}
+}
+
+// /rebuild swaps the entire store map. Any stale ScopeBuffer pointer held
+// by an in-flight /append must be detached — otherwise reserveBytes on the
+// post-rebuild counter inflates totalBytes permanently, while the item
+// lands in an orphan buffer that no reader can reach. Mirrors the wipe and
+// delete-scope guarantees.
+func TestStore_RebuildAll_DetachesOrphanedBuffers(t *testing.T) {
+	s := NewStore(10, 100<<20, 1<<20)
+
+	buf, _ := s.getOrCreateScope("old")
+	if _, err := buf.appendItem(newItem("old", "a", nil)); err != nil {
+		t.Fatalf("pre-rebuild append: %v", err)
+	}
+
+	grouped := map[string][]Item{"new": {newItem("new", "x", nil)}}
+	if _, _, err := s.rebuildAll(grouped); err != nil {
+		t.Fatalf("rebuildAll: %v", err)
+	}
+
+	// The pre-rebuild buf pointer is stale; a write must now fail.
+	_, err := buf.appendItem(newItem("old", "b", nil))
+	var sde *ScopeDetachedError
+	if !errors.As(err, &sde) {
+		t.Fatalf("orphan append: got %v, want *ScopeDetachedError", err)
+	}
+	// Counter must still match only the rebuilt scope's item — the orphan
+	// write must not have inflated it.
+	newBuf, _ := s.getScope("new")
+	if got, want := s.totalBytes.Load(), newBuf.bytes; got != want {
+		t.Fatalf("totalBytes=%d want %d (orphan leaked into counter)", got, want)
 	}
 }
 
