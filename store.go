@@ -252,6 +252,42 @@ func (b *ScopeBuffer) commitReplacement(r scopeReplacement, newBytes int64) {
 	b.lastSeq = r.lastSeq
 }
 
+// commitReplacementPreReserved is the batch-aware commit used by
+// Store.replaceScopes. The caller has already atomically reserved
+// (newBytes - oldSnapshot) bytes against the store counter via reserveBytes,
+// so this commit must NOT re-add that delta; it only releases drift caused
+// by concurrent writes to this scope between the snapshot and the commit,
+// which keeps the store-wide byte cap strict across batch replacements.
+//
+// Drift handling, using oldSnapshot (b.bytes as read under RLock during
+// the batch's cap check):
+//
+//   - Concurrent /append on this scope in the window: b.bytes grew by +X
+//     and the appender did totalBytes.Add(+X). Drift = b.bytes - oldSnapshot
+//     = X; we Add(-X), releasing that reservation (the appended item gets
+//     discarded by the replacement anyway).
+//   - Concurrent /delete on this scope in the window: b.bytes shrank by Y
+//     and the deleter did totalBytes.Add(-Y). Drift is negative; Add(-drift)
+//     is positive, compensating for the extra release so the scope's net
+//     contribution to totalBytes is exactly (newBytes - oldSnapshot).
+//   - No concurrent activity: drift = 0, no counter adjustment.
+func (b *ScopeBuffer) commitReplacementPreReserved(r scopeReplacement, newBytes int64, oldSnapshot int64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.store != nil {
+		drift := b.bytes - oldSnapshot
+		if drift != 0 {
+			b.store.totalBytes.Add(-drift)
+		}
+	}
+	b.bytes = newBytes
+	b.items = r.items
+	b.byID = r.byID
+	b.bySeq = r.bySeq
+	b.lastSeq = r.lastSeq
+}
+
 // sumItemBytes returns the total approxItemSize across a flat item slice.
 // Used by batch operations to compute per-plan newBytes before commit.
 func sumItemBytes(items []Item) int64 {
@@ -927,6 +963,7 @@ func (s *Store) replaceScopes(grouped map[string][]Item) (int, error) {
 		scope       string
 		replacement scopeReplacement
 		newBytes    int64
+		oldBytes    int64 // per-scope snapshot taken in Phase 1.5
 	}
 
 	// Phase 1 — validate and build replacements. Pure function of the input,
@@ -959,37 +996,43 @@ func (s *Store) replaceScopes(grouped map[string][]Item) (int, error) {
 		return 0, &ScopeCapacityError{Offenders: offenders}
 	}
 
-	// Phase 1.5 — compute net byte delta of the batch against the current
-	// store and check the byte cap before committing anything. Snapshots are
-	// taken under each scope's RLock so the per-scope contribution is a
-	// point-in-time read; concurrent /append to a scope being replaced is
-	// tolerated — commitReplacement re-reads b.bytes under b.mu and the
-	// fresh per-scope delta cancels out any in-flight additions to
-	// s.totalBytes (the appended item is being replaced anyway).
-	snapshot := s.totalBytes.Load()
+	// Phase 1.5 — atomically reserve the net byte delta of the batch. Per-
+	// scope old sizes are snapshotted under each scope's RLock so we can
+	// compute totalDelta, then reserveBytes() CASes against the store
+	// counter. A successful reservation holds capacity against every
+	// concurrent write path (append/update/upsert/counter_add) on every
+	// other scope, so the store-wide cap is strict even under batch +
+	// single-write load. Snapshots may be stale by the time the CAS runs;
+	// that is fine because Phase 2 uses the same oldBytes to release any
+	// drift (concurrent appends/deletes that landed on scopes being
+	// replaced), so the per-scope net contribution to totalBytes ends up
+	// exactly (newBytes - oldBytes) regardless of interleaving.
 	var totalDelta int64
-	for _, p := range plans {
+	for i := range plans {
 		var old int64
-		if buf, ok := s.getScope(p.scope); ok {
+		if buf, ok := s.getScope(plans[i].scope); ok {
 			buf.mu.RLock()
 			old = buf.bytes
 			buf.mu.RUnlock()
 		}
-		totalDelta += p.newBytes - old
+		plans[i].oldBytes = old
+		totalDelta += plans[i].newBytes - old
 	}
-	if snapshot+totalDelta > s.maxStoreBytes {
+	if ok, current, max := s.reserveBytes(totalDelta); !ok {
 		return 0, &StoreFullError{
-			StoreBytes: snapshot,
+			StoreBytes: current,
 			AddedBytes: totalDelta,
-			Cap:        s.maxStoreBytes,
+			Cap:        max,
 		}
 	}
 
 	// Phase 2 — get-or-create and commit. Neither step can fail, so either
 	// every scope is replaced or (if an earlier phase aborted) none are.
+	// commitReplacementPreReserved honours the upfront reservation: it only
+	// releases drift on this scope, it does not re-add (newBytes - oldBytes).
 	for _, p := range plans {
 		buf, _ := s.getOrCreateScope(p.scope)
-		buf.commitReplacement(p.replacement, p.newBytes)
+		buf.commitReplacementPreReserved(p.replacement, p.newBytes, p.oldBytes)
 	}
 
 	return len(plans), nil

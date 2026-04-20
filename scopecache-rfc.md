@@ -102,7 +102,7 @@ Writes that would exceed **either** cap are **rejected** with HTTP `507 Insuffic
 - `/warm` and `/rebuild` with any single scope over the item cap → `507` with the **full list** of offending scopes. The batch is atomic: nothing is applied when any scope would overflow.
 - Any write that would push the store over the byte cap → `507` carrying `approx_store_mb`, `added_mb`, and `max_store_mb`. `/warm` and `/rebuild` remain atomic: nothing is applied when the post-commit store size would exceed the byte cap.
 
-Store-wide byte tracking uses an atomic counter reserved via compare-and-swap on the hot `/append` path; batch endpoints (`/warm`, `/rebuild`) compute a fresh byte delta under each scope's lock at commit time so concurrent appends cannot desync the counter.
+Store-wide byte tracking uses an atomic counter reserved via compare-and-swap on every write path. `/append`, `/update`, `/upsert`, and `/counter_add` reserve their per-item delta directly. `/warm` reserves the net batch delta up-front via the same CAS before committing any scope; a concurrent write that tries to slip in between the batch's cap check and its commit therefore sees the post-reserve total and is rejected if the cap is exceeded, so the store cap is strict under mixed batch + single-write load. `/rebuild` takes the store-wide write lock, so its cap check is trivially atomic. Batch commits reconcile their per-scope counter deltas against the fresh `buf.bytes` under each scope's write-lock, so concurrent writes to scopes being replaced do not desync the counter.
 
 All byte-ish fields in JSON responses (`approx_store_mb`, `max_store_mb`, `approx_scope_mb`, `added_mb`) are serialized as MiB with 4 decimals. Internal size math stays in bytes.
 

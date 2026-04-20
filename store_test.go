@@ -3,6 +3,7 @@ package scopecache
 import (
 	"encoding/json"
 	"errors"
+	"sync"
 	"testing"
 	"unsafe"
 )
@@ -1598,6 +1599,81 @@ func TestStore_ReplaceScopes_RejectsAtByteCap(t *testing.T) {
 	preSize := approxItemSize(newItem("untouched", "u", nil))
 	if got := s.totalBytes.Load(); got != preSize {
 		t.Fatalf("totalBytes=%d want %d (only pre-seed should count)", got, preSize)
+	}
+}
+
+// /warm must never push totalBytes past the cap, even when concurrent
+// /append traffic targets scopes outside the batch. The pre-fix design
+// snapshotted totalBytes before commit, so an appender that slipped in
+// between snapshot and commit could collectively overshoot the cap:
+// the batch's pre-check would see room, the appender's own check would
+// also see room, but once both committed the sum exceeded the cap.
+// reserveBytes-based admission closes that window: the batch reserves
+// its delta atomically via CAS, after which any concurrent appender
+// sees the post-reserve total and is rejected if the cap is exceeded.
+//
+// Setup: cap = 5 item-sizes, store pre-seeded with 2 items, /warm grows
+// the batch scope by +2 items, 16 concurrent appenders each try +1 on
+// a different scope. Safe outcome: /warm fits (+2 → 4) and at most ONE
+// appender fits (4 → 5). Anything past that violates the cap.
+func TestStore_ReplaceScopes_StrictCapAgainstConcurrentAppends(t *testing.T) {
+	itemSize := approxItemSize(newItem("s", "x", nil))
+	capBytes := itemSize * 5
+
+	const iterations = 500
+	const appendersPerIter = 16
+
+	for iter := 0; iter < iterations; iter++ {
+		s := NewStore(100, capBytes, 1<<20)
+
+		// Pre-seed "batch" with 2 items; /warm will replace it with 4
+		// items, net delta +2 item-sizes.
+		batch, _ := s.getOrCreateScope("batch")
+		_, _ = batch.appendItem(newItem("batch", "a", nil))
+		_, _ = batch.appendItem(newItem("batch", "b", nil))
+
+		grouped := map[string][]Item{
+			"batch": {
+				newItem("batch", "c", nil),
+				newItem("batch", "d", nil),
+				newItem("batch", "e", nil),
+				newItem("batch", "f", nil),
+			},
+		}
+
+		var wg sync.WaitGroup
+		wg.Add(appendersPerIter + 1)
+		for i := 0; i < appendersPerIter; i++ {
+			i := i
+			go func() {
+				defer wg.Done()
+				scope := "other" + string(rune('A'+i))
+				buf, _ := s.getOrCreateScope(scope)
+				_, _ = buf.appendItem(newItem(scope, "w", nil))
+			}()
+		}
+		go func() {
+			defer wg.Done()
+			_, _ = s.replaceScopes(grouped)
+		}()
+		wg.Wait()
+
+		got := s.totalBytes.Load()
+		if got > capBytes {
+			t.Fatalf("iter %d: totalBytes=%d exceeds cap=%d (race let writers overshoot)",
+				iter, got, capBytes)
+		}
+
+		// Accounting invariant: totalBytes must equal sum of per-scope bytes.
+		var sum int64
+		for _, buf := range s.listScopes() {
+			buf.mu.RLock()
+			sum += buf.bytes
+			buf.mu.RUnlock()
+		}
+		if got != sum {
+			t.Fatalf("iter %d: totalBytes=%d != sum(buf.bytes)=%d", iter, got, sum)
+		}
 	}
 }
 
