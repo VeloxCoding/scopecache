@@ -69,6 +69,12 @@ func TestNormalizeHours(t *testing.T) {
 	if _, err := normalizeHours("xx"); err == nil {
 		t.Error("xx should error")
 	}
+	// Value that would overflow int64 when multiplied by μs/hour. The
+	// ceiling is MaxInt64 / 3_600_000_000 ≈ 2.56e9; pick something clearly
+	// past it so the overflow guard fires regardless of rounding.
+	if _, err := normalizeHours("9223372036854775807"); err == nil {
+		t.Error("MaxInt64 hours should error (overflow guard)")
+	}
 }
 
 func TestValidateWriteItem(t *testing.T) {
@@ -236,11 +242,48 @@ func TestValidateUpdateItem(t *testing.T) {
 		{"no payload (by id)", Item{Scope: "s", ID: "a"}},
 		{"no payload (by seq)", Item{Scope: "s", Seq: 1}},
 		{"null payload", Item{Scope: "s", ID: "a", Payload: json.RawMessage(`null`)}},
+		{"id with control char", Item{Scope: "s", ID: "a\x01", Payload: json.RawMessage(`{}`)}},
 	}
 	for _, tc := range cases {
 		if err := validateUpdateItem(tc.item, MaxItemBytes); err == nil {
 			t.Errorf("%s: expected error", tc.name)
 		}
+	}
+}
+
+func TestValidateDeleteRequest(t *testing.T) {
+	if err := validateDeleteRequest(DeleteRequest{Scope: "s", ID: "a"}); err != nil {
+		t.Errorf("valid (by id) rejected: %v", err)
+	}
+	if err := validateDeleteRequest(DeleteRequest{Scope: "s", Seq: 3}); err != nil {
+		t.Errorf("valid (by seq) rejected: %v", err)
+	}
+
+	cases := []struct {
+		name string
+		req  DeleteRequest
+	}{
+		{"no scope", DeleteRequest{ID: "a"}},
+		{"neither id nor seq", DeleteRequest{Scope: "s"}},
+		{"both id and seq", DeleteRequest{Scope: "s", ID: "a", Seq: 1}},
+		{"id with control char", DeleteRequest{Scope: "s", ID: "a\x01"}},
+	}
+	for _, tc := range cases {
+		if err := validateDeleteRequest(tc.req); err == nil {
+			t.Errorf("%s: expected error", tc.name)
+		}
+	}
+}
+
+func TestValidateDeleteUpToRequest(t *testing.T) {
+	if err := validateDeleteUpToRequest(DeleteUpToRequest{Scope: "s", MaxSeq: 5}); err != nil {
+		t.Errorf("valid rejected: %v", err)
+	}
+	if err := validateDeleteUpToRequest(DeleteUpToRequest{MaxSeq: 5}); err == nil {
+		t.Error("empty scope should error")
+	}
+	if err := validateDeleteUpToRequest(DeleteUpToRequest{Scope: "s"}); err == nil {
+		t.Error("zero max_seq should error")
 	}
 }
 

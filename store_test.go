@@ -904,6 +904,13 @@ func TestStore_DeleteScope(t *testing.T) {
 	if ok || n != 0 {
 		t.Fatalf("deleteScope(missing): ok=%v n=%d", ok, n)
 	}
+
+	// Empty scope is a shape bug from the caller — the store refuses it up
+	// front rather than walking the map for a key that cannot exist.
+	n, ok = s.deleteScope("")
+	if ok || n != 0 {
+		t.Fatalf("deleteScope(\"\"): ok=%v n=%d", ok, n)
+	}
 }
 
 // --- Store.wipe ---------------------------------------------------------------
@@ -1071,6 +1078,19 @@ func TestStore_ReplaceScopes_LeavesOtherScopesUntouched(t *testing.T) {
 	}
 	if len(keep.items) != keepLen {
 		t.Fatal("untouched scope was mutated")
+	}
+}
+
+// A grouped map with an empty scope key must be rejected with a shape error
+// (not an offender list), since the empty scope could not have passed the
+// handler's per-item validation.
+func TestStore_ReplaceScopes_RejectsEmptyScope(t *testing.T) {
+	s := NewStore(10, 100<<20, 1<<20)
+	grouped := map[string][]Item{
+		"": {newItem("", "a", nil)},
+	}
+	if _, err := s.replaceScopes(grouped); err == nil {
+		t.Fatal("expected empty-scope rejection")
 	}
 }
 
