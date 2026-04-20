@@ -19,6 +19,16 @@ A small, local, rebuildable in-memory cache over a Unix domain socket. Written i
 
 inmem-cache is intentionally simple. Filtering and addressing are deliberately limited to three fields — `scope`, `id`, `seq` — and that limitation is the whole point: it is what keeps the cache fast and easy to reason about. There is no rich query language, but because `scope` and `id` are free-form strings the client fully controls, a surprisingly wide set of access patterns can be modeled on top of them.
 
+## Architecture
+
+Three layers with clear boundaries:
+
+- **Core** — `package inmemcache`. The cache engine itself. Stdlib-only, framework-agnostic, caller-anonymous: it registers HTTP routes on a standard `*http.ServeMux` and knows nothing about auth, identity, or who is calling. This is what the [spec](inmem-cache-compact-rfc.md) describes.
+- **Standalone adapter** — `cmd/inmem-cache/`. Thin binary that reads env vars, opens a Unix socket, and serves the core. What you use if you're running behind nginx/apache, or with no reverse proxy at all.
+- **Caddy-module adapter** — `caddymodule/` (Phase 3, planned). Wraps the core as a Caddy module. Also the home for cross-cutting concerns that require request context: auth enforcement, identity-to-scope mapping, per-tenant logging and metrics.
+
+The rule: new **cache features** go into the core. **Cross-cutting concerns** (auth, identity, per-tenant policy) go into an adapter. This keeps the core small and refactorable, keeps both adapters symmetrical, and means cache semantics cannot drift between standalone and Caddy deployments.
+
 ## Status
 
 Phase 2 — core logic lives in `package inmemcache` at the repo root; the standalone binary is in `cmd/inmem-cache/`. A Caddy-module wrapper (Phase 3) is planned.

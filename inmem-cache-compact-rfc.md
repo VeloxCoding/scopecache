@@ -16,6 +16,17 @@ This system is **not**:
 - a workflow engine
 - a business-logic layer
 
+### 1.1 Where this spec fits
+
+This RFC describes **the core** (`package inmemcache`): the cache engine and its HTTP contract. The core is framework-agnostic and caller-anonymous — it registers routes on an `*http.ServeMux`, validates request shape (scope/id/payload), and serves cache operations. It does not know who the caller is, and implements no auth, identity, or per-tenant policy.
+
+Thin **adapters** wrap the core and are out of scope for this document:
+
+- `cmd/inmem-cache/` — standalone binary that opens a Unix socket and serves the core directly.
+- `caddymodule/` — Caddy-module wrapper; also the home for cross-cutting concerns that require request context (authN/authZ enforcement, identity-to-scope mapping, per-tenant logging/metrics).
+
+New **cache features** belong in the core and are spec'd here. **Cross-cutting concerns** (auth, identity, per-tenant policy) belong in an adapter and are deliberately not specified in this document.
+
 ---
 
 ## 2. Core rules
