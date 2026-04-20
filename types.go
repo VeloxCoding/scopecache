@@ -11,12 +11,18 @@ const (
 	MaxLimit           = 10000  // hard ceiling on ?limit; higher values are clamped, not rejected
 	ScopeMaxItems      = 100000 // per-scope capacity default; writes that would exceed this are rejected (507). Overridable via SCOPECACHE_SCOPE_MAX_ITEMS
 	MaxStoreMiB        = 100    // store-wide aggregate approxItemSize default in MiB; writes past this are rejected (507). Tuned for ~1 GB VPS footprints. Overridable via SCOPECACHE_MAX_STORE_MB
-	MaxItemBytes       = 1 << 20 // 1 MiB cap on approxItemSize (overhead + scope + id + payload), not on raw payload alone
+	MaxItemBytes       = 1 << 20 // per-item cap default in bytes on approxItemSize (overhead + scope + id + payload). Overridable via SCOPECACHE_MAX_ITEM_MB (integer MiB)
 	MaxScopeBytes      = 128
 	MaxIDBytes         = 128
-	// Request body cap for single-item endpoints. Sits above MaxItemBytes to
-	// allow for JSON framing overhead.
-	MaxSingleRequestBytes = 2 << 20 // 2 MiB  — /append, /update, /delete, /delete-scope
+
+	// SingleRequestBytesOverhead is the headroom added on top of the configured
+	// per-item cap to produce the request body cap for single-item endpoints
+	// (/append, /update, /upsert, /delete, /delete-scope, /delete-up-to,
+	// /counter_add). Covers JSON framing — keys ("scope","id","payload"),
+	// quotes, colons, braces — on top of the item payload. The scope and id
+	// bytes themselves are already counted inside approxItemSize, so the
+	// framing overhead is tiny and constant. 4 KiB leaves generous slack.
+	SingleRequestBytesOverhead = 4096
 
 	// BulkRequestBytesOverhead is the headroom added on top of the configured
 	// store cap to produce the per-request cap for /warm and /rebuild. See
@@ -196,4 +202,15 @@ func approxItemSize(item Item) int64 {
 // provides a sane floor for very small store caps.
 func bulkRequestBytesFor(maxStoreBytes int64) int64 {
 	return maxStoreBytes + maxStoreBytes/10 + BulkRequestBytesOverhead
+}
+
+// singleRequestBytesFor returns the per-request body cap for single-item
+// endpoints, derived from the configured per-item cap. The item cap is a
+// semantic limit on approxItemSize (enforced in the validator); this request
+// cap is a DoS guardrail on the raw HTTP body (enforced by MaxBytesReader).
+// The 4 KiB overhead covers JSON framing (keys, quotes, braces) on top of the
+// item bytes — scope and id are already counted inside approxItemSize, so the
+// framing is tiny and constant.
+func singleRequestBytesFor(maxItemBytes int64) int64 {
+	return maxItemBytes + SingleRequestBytesOverhead
 }

@@ -77,6 +77,24 @@ func maxStoreBytesFromEnv() int64 {
 	return int64(n) << 20
 }
 
+// maxItemBytesFromEnv returns SCOPECACHE_MAX_ITEM_MB (in MiB, converted to bytes)
+// if set to a positive integer, otherwise the compile-time default. Operators
+// raise this when the use-case stores larger blobs (rendered HTML, large JSON
+// documents); the single-item HTTP body cap scales with it automatically via
+// singleRequestBytesFor.
+func maxItemBytesFromEnv() int64 {
+	raw := os.Getenv("SCOPECACHE_MAX_ITEM_MB")
+	if raw == "" {
+		return int64(scopecache.MaxItemBytes)
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n <= 0 {
+		log.Printf("SCOPECACHE_MAX_ITEM_MB=%q is not a positive integer; using default %d MiB", raw, scopecache.MaxItemBytes>>20)
+		return int64(scopecache.MaxItemBytes)
+	}
+	return int64(n) << 20
+}
+
 const shutdownGracePeriod = 5 * time.Second
 
 func listenUnixSocket(path string) (net.Listener, error) {
@@ -110,9 +128,10 @@ func listenUnixSocket(path string) (net.Listener, error) {
 func main() {
 	maxItems := scopeMaxItemsFromEnv()
 	maxStoreBytes := maxStoreBytesFromEnv()
-	store := scopecache.NewStore(maxItems, maxStoreBytes)
+	maxItemBytes := maxItemBytesFromEnv()
+	store := scopecache.NewStore(maxItems, maxStoreBytes, maxItemBytes)
 	api := scopecache.NewAPI(store)
-	log.Printf("scopecache capacity: %d items per scope, %d MiB store-wide", maxItems, maxStoreBytes>>20)
+	log.Printf("scopecache capacity: %d items per scope, %d MiB store-wide, %d MiB per item", maxItems, maxStoreBytes>>20, maxItemBytes>>20)
 
 	mux := http.NewServeMux()
 	api.RegisterRoutes(mux)

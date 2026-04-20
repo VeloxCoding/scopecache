@@ -159,6 +159,7 @@ All overrides via environment variables:
 | `SCOPECACHE_SOCKET_PATH`       | `/run/scopecache.sock`   | Listening socket path                 |
 | `SCOPECACHE_SCOPE_MAX_ITEMS`   | `100000`                 | Max items per scope                   |
 | `SCOPECACHE_MAX_STORE_MB`      | `100`                    | Store-wide byte cap (integer MiB)     |
+| `SCOPECACHE_MAX_ITEM_MB`       | `1`                      | Per-item size cap (integer MiB)       |
 
 ## Limits
 
@@ -166,7 +167,7 @@ Two independent caps apply, either violation returns **HTTP 507 Insufficient Sto
 
 - **Per-scope item cap** — 100,000 items (default).
 - **Store-wide byte cap** — 100 MiB aggregate (default).
-- **Per-item cap** — 1 MiB (enforced on the approximate item size: overhead + scope + id + payload).
+- **Per-item cap** — 1 MiB (default); enforced on the approximate item size (overhead + scope + id + payload). Raise it via `SCOPECACHE_MAX_ITEM_MB` when the use-case stores larger blobs (rendered HTML, large JSON documents).
 
 ## Performance
 

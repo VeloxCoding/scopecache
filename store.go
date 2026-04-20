@@ -686,6 +686,7 @@ type Store struct {
 	scopes          map[string]*ScopeBuffer
 	defaultMaxItems int
 	maxStoreBytes   int64
+	maxItemBytes    int64
 	// totalBytes tracks the running sum of approxItemSize across every item
 	// in every scope. Kept in an atomic so /append can reserve against it
 	// without touching the store-level mutex; writes that would push it past
@@ -699,11 +700,12 @@ type Store struct {
 	totalBytes atomic.Int64
 }
 
-func NewStore(defaultMaxItems int, maxStoreBytes int64) *Store {
+func NewStore(defaultMaxItems int, maxStoreBytes int64, maxItemBytes int64) *Store {
 	return &Store{
 		scopes:          make(map[string]*ScopeBuffer),
 		defaultMaxItems: defaultMaxItems,
 		maxStoreBytes:   maxStoreBytes,
+		maxItemBytes:    maxItemBytes,
 	}
 }
 

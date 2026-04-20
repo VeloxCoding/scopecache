@@ -16,7 +16,7 @@ func benchStore(b *testing.B, numScopes, itemsPerScope, payloadBytes int) (*Stor
 	b.Helper()
 
 	// Cap tall enough for the dataset: 1 GiB store, 1M items per scope.
-	store := NewStore(1_000_000, 1<<30)
+	store := NewStore(1_000_000, 1<<30, 1<<20)
 
 	payloadFiller := make([]byte, payloadBytes)
 	for i := range payloadFiller {

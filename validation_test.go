@@ -73,19 +73,19 @@ func TestNormalizeHours(t *testing.T) {
 
 func TestValidateWriteItem(t *testing.T) {
 	ok := Item{Scope: "s", Payload: json.RawMessage(`{"v":1}`)}
-	if err := validateWriteItem(ok, "/append"); err != nil {
+	if err := validateWriteItem(ok, "/append", MaxItemBytes); err != nil {
 		t.Errorf("valid item rejected: %v", err)
 	}
 
-	if err := validateWriteItem(Item{Scope: "s"}, "/append"); err == nil {
+	if err := validateWriteItem(Item{Scope: "s"}, "/append", MaxItemBytes); err == nil {
 		t.Error("missing payload should error")
 	}
 
-	if err := validateWriteItem(Item{}, "/append"); err == nil {
+	if err := validateWriteItem(Item{}, "/append", MaxItemBytes); err == nil {
 		t.Error("missing scope should error")
 	}
 
-	if err := validateWriteItem(Item{Scope: "s", Payload: json.RawMessage(`{}`), Seq: 5}, "/append"); err == nil {
+	if err := validateWriteItem(Item{Scope: "s", Payload: json.RawMessage(`{}`), Seq: 5}, "/append", MaxItemBytes); err == nil {
 		t.Error("non-zero seq should error")
 	}
 }
@@ -106,7 +106,7 @@ func TestValidateWriteItem_AcceptsAnyJSONShape(t *testing.T) {
 	}
 	for _, p := range shapes {
 		item := Item{Scope: "s", Payload: p}
-		if err := validateWriteItem(item, "/append"); err != nil {
+		if err := validateWriteItem(item, "/append", MaxItemBytes); err != nil {
 			t.Errorf("shape %s rejected: %v", string(p), err)
 		}
 	}
@@ -124,7 +124,7 @@ func TestValidateWriteItem_RejectsMissingAndNullPayload(t *testing.T) {
 		{"literal null with whitespace", Item{Scope: "s", Payload: json.RawMessage(`  null  `)}},
 	}
 	for _, tc := range cases {
-		if err := validateWriteItem(tc.item, "/append"); err == nil {
+		if err := validateWriteItem(tc.item, "/append", MaxItemBytes); err == nil {
 			t.Errorf("%s: expected error", tc.name)
 		}
 	}
@@ -137,7 +137,7 @@ func TestValidateWriteItem_RejectsOversizedPayload(t *testing.T) {
 		buf[i] = 'x'
 	}
 	item := Item{Scope: "s", Payload: json.RawMessage(buf)}
-	if err := validateWriteItem(item, "/append"); err == nil {
+	if err := validateWriteItem(item, "/append", MaxItemBytes); err == nil {
 		t.Error("expected oversized item to be rejected")
 	}
 }
@@ -148,7 +148,7 @@ func TestValidateWriteItem_AcceptsExactCapPayload(t *testing.T) {
 		buf[i] = 'y'
 	}
 	item := Item{Scope: "s", Payload: json.RawMessage(buf)}
-	if err := validateWriteItem(item, "/append"); err != nil {
+	if err := validateWriteItem(item, "/append", MaxItemBytes); err != nil {
 		t.Errorf("under-cap item rejected: %v", err)
 	}
 }
@@ -182,7 +182,7 @@ func TestValidateWriteItem_ScopeAndIDShapeRules(t *testing.T) {
 		{"id has control char", Item{Scope: "s", ID: "x\x01", Payload: json.RawMessage(`{}`)}},
 	}
 	for _, tc := range cases {
-		if err := validateWriteItem(tc.item, "/append"); err == nil {
+		if err := validateWriteItem(tc.item, "/append", MaxItemBytes); err == nil {
 			t.Errorf("%s: expected error", tc.name)
 		}
 	}
@@ -209,7 +209,7 @@ func TestValidateWriteItem_AcceptsKeyEdges(t *testing.T) {
 		{"empty id is allowed", Item{Scope: "s", ID: "", Payload: json.RawMessage(`{}`)}},
 	}
 	for _, tc := range cases {
-		if err := validateWriteItem(tc.item, "/append"); err != nil {
+		if err := validateWriteItem(tc.item, "/append", MaxItemBytes); err != nil {
 			t.Errorf("%s: unexpectedly rejected: %v", tc.name, err)
 		}
 	}
@@ -217,12 +217,12 @@ func TestValidateWriteItem_AcceptsKeyEdges(t *testing.T) {
 
 func TestValidateUpdateItem(t *testing.T) {
 	goodByID := Item{Scope: "s", ID: "a", Payload: json.RawMessage(`{"v":1}`)}
-	if err := validateUpdateItem(goodByID); err != nil {
+	if err := validateUpdateItem(goodByID, MaxItemBytes); err != nil {
 		t.Errorf("valid update (by id) rejected: %v", err)
 	}
 
 	goodBySeq := Item{Scope: "s", Seq: 7, Payload: json.RawMessage(`{"v":1}`)}
-	if err := validateUpdateItem(goodBySeq); err != nil {
+	if err := validateUpdateItem(goodBySeq, MaxItemBytes); err != nil {
 		t.Errorf("valid update (by seq) rejected: %v", err)
 	}
 
@@ -238,7 +238,7 @@ func TestValidateUpdateItem(t *testing.T) {
 		{"null payload", Item{Scope: "s", ID: "a", Payload: json.RawMessage(`null`)}},
 	}
 	for _, tc := range cases {
-		if err := validateUpdateItem(tc.item); err == nil {
+		if err := validateUpdateItem(tc.item, MaxItemBytes); err == nil {
 			t.Errorf("%s: expected error", tc.name)
 		}
 	}

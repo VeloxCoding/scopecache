@@ -17,14 +17,21 @@ type API struct {
 	// derived from the store's configured byte cap via bulkRequestBytesFor so
 	// a fully-loaded store can always be expressed as a single bulk request.
 	maxBulkBytes int64
+	// maxSingleBytes is the per-request body cap for single-item endpoints
+	// (/append, /update, /upsert, /delete, /delete-scope, /delete-up-to,
+	// /counter_add). Derived from the store's per-item cap via
+	// singleRequestBytesFor so the HTTP guardrail always sits just above the
+	// semantic item-size limit enforced in the validator.
+	maxSingleBytes int64
 }
 
 // NewAPI wires the HTTP API to a Store and derives request caps that scale
 // with the store's configuration.
 func NewAPI(store *Store) *API {
 	return &API{
-		store:        store,
-		maxBulkBytes: bulkRequestBytesFor(store.maxStoreBytes),
+		store:          store,
+		maxBulkBytes:   bulkRequestBytesFor(store.maxStoreBytes),
+		maxSingleBytes: singleRequestBytesFor(store.maxItemBytes),
 	}
 }
 
@@ -119,12 +126,12 @@ func (api *API) handleAppend(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var item Item
-	if err := decodeBody(w, r, MaxSingleRequestBytes, &item); err != nil {
+	if err := decodeBody(w, r, api.maxSingleBytes, &item); err != nil {
 		badRequest(w, started, err.Error())
 		return
 	}
 
-	if err := validateWriteItem(item, "/append"); err != nil {
+	if err := validateWriteItem(item, "/append", api.store.maxItemBytes); err != nil {
 		badRequest(w, started, err.Error())
 		return
 	}
@@ -175,7 +182,7 @@ func (api *API) handleWarm(w http.ResponseWriter, r *http.Request) {
 	}
 
 	for i := range req.Items {
-		if err := validateWriteItem(req.Items[i], "/warm"); err != nil {
+		if err := validateWriteItem(req.Items[i], "/warm", api.store.maxItemBytes); err != nil {
 			badRequest(w, started, "invalid item at index "+strconv.Itoa(i)+": "+err.Error())
 			return
 		}
@@ -230,7 +237,7 @@ func (api *API) handleRebuild(w http.ResponseWriter, r *http.Request) {
 	}
 
 	for i := range req.Items {
-		if err := validateWriteItem(req.Items[i], "/rebuild"); err != nil {
+		if err := validateWriteItem(req.Items[i], "/rebuild", api.store.maxItemBytes); err != nil {
 			badRequest(w, started, "invalid item at index "+strconv.Itoa(i)+": "+err.Error())
 			return
 		}
@@ -274,12 +281,12 @@ func (api *API) handleUpsert(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var item Item
-	if err := decodeBody(w, r, MaxSingleRequestBytes, &item); err != nil {
+	if err := decodeBody(w, r, api.maxSingleBytes, &item); err != nil {
 		badRequest(w, started, err.Error())
 		return
 	}
 
-	if err := validateUpsertItem(item); err != nil {
+	if err := validateUpsertItem(item, api.store.maxItemBytes); err != nil {
 		badRequest(w, started, err.Error())
 		return
 	}
@@ -330,7 +337,7 @@ func (api *API) handleCounterAdd(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req CounterAddRequest
-	if err := decodeBody(w, r, MaxSingleRequestBytes, &req); err != nil {
+	if err := decodeBody(w, r, api.maxSingleBytes, &req); err != nil {
 		badRequest(w, started, err.Error())
 		return
 	}
@@ -392,12 +399,12 @@ func (api *API) handleUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var item Item
-	if err := decodeBody(w, r, MaxSingleRequestBytes, &item); err != nil {
+	if err := decodeBody(w, r, api.maxSingleBytes, &item); err != nil {
 		badRequest(w, started, err.Error())
 		return
 	}
 
-	if err := validateUpdateItem(item); err != nil {
+	if err := validateUpdateItem(item, api.store.maxItemBytes); err != nil {
 		badRequest(w, started, err.Error())
 		return
 	}
@@ -445,7 +452,7 @@ func (api *API) handleDelete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req DeleteRequest
-	if err := decodeBody(w, r, MaxSingleRequestBytes, &req); err != nil {
+	if err := decodeBody(w, r, api.maxSingleBytes, &req); err != nil {
 		badRequest(w, started, err.Error())
 		return
 	}
@@ -488,7 +495,7 @@ func (api *API) handleDeleteUpTo(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req DeleteUpToRequest
-	if err := decodeBody(w, r, MaxSingleRequestBytes, &req); err != nil {
+	if err := decodeBody(w, r, api.maxSingleBytes, &req); err != nil {
 		badRequest(w, started, err.Error())
 		return
 	}
@@ -526,7 +533,7 @@ func (api *API) handleDeleteScope(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req DeleteScopeRequest
-	if err := decodeBody(w, r, MaxSingleRequestBytes, &req); err != nil {
+	if err := decodeBody(w, r, api.maxSingleBytes, &req); err != nil {
 		badRequest(w, started, err.Error())
 		return
 	}
@@ -968,7 +975,7 @@ func (api *API) handleHelp(w http.ResponseWriter, r *http.Request) {
 RULES:
 - payload must be a valid JSON value (object, array, string, number, bool); its contents are opaque to the cache — never inspected or searched
 - payload must be present on writes; literal null is treated as missing
-- per-item size cap is 1 MiB (measured against the raw JSON bytes of payload plus scope/id overhead)
+- per-item size cap is 1 MiB by default (override with SCOPECACHE_MAX_ITEM_MB, integer MiB); measured against the raw JSON bytes of payload plus scope/id overhead
 - scope and id must be <= 128 bytes, with no surrounding whitespace and no control characters
 - filtering only operates on scope, id and seq
 - read endpoints use a default limit of 1,000 when ?limit is omitted, and a maximum of 10,000 (higher values are clamped, not rejected)
@@ -978,7 +985,7 @@ RULES:
 - per-scope capacity is 100,000 items by default (override with SCOPECACHE_SCOPE_MAX_ITEMS); writes that would exceed the cap are rejected with 507 Insufficient Storage — nothing is silently evicted
 - /append past the cap returns 507 with the offending scope. /warm and /rebuild reject the entire batch with the full list of over-cap scopes; make room first with /delete-up-to or /delete-scope
 - store-wide byte cap is 100 MiB by default (override with SCOPECACHE_MAX_STORE_MB, integer MiB); writes that would push the aggregate approxItemSize past it are rejected with 507. The response carries tracked_store_mb, added_mb, and max_store_mb; free room with /delete-scope or /delete-up-to
-- per-request body cap for /warm and /rebuild scales with the store cap (~store + 10% + 16 MiB), so a full cache always fits in one bulk request. Single-item endpoints have a fixed 2 MiB body cap.
+- per-request body cap for /warm and /rebuild scales with the store cap (~store + 10% + 16 MiB), so a full cache always fits in one bulk request. Single-item endpoints use a body cap derived from the per-item cap (item + 4 KiB).
 - every byte-ish field in JSON responses (tracked_store_mb, max_store_mb, approx_scope_mb, added_mb) is expressed in MiB with 4 decimals — one unit across /stats, /delete-scope-candidates and 507 responses
 - the listening socket path defaults to /run/scopecache.sock on Linux and $TMPDIR/scopecache.sock on macOS/Windows; override with SCOPECACHE_SOCKET_PATH
 

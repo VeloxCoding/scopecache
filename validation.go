@@ -63,10 +63,10 @@ func payloadPresent(p json.RawMessage) bool {
 	return !bytes.Equal(bytes.TrimSpace(p), []byte("null"))
 }
 
-func checkItemSize(item Item) error {
-	if size := approxItemSize(item); size > MaxItemBytes {
+func checkItemSize(item Item, maxItemBytes int64) error {
+	if size := approxItemSize(item); size > maxItemBytes {
 		return errors.New("the item's approximate size (" + strconv.FormatInt(size, 10) +
-			" bytes) exceeds the maximum of " + strconv.Itoa(MaxItemBytes) + " bytes")
+			" bytes) exceeds the maximum of " + strconv.FormatInt(maxItemBytes, 10) + " bytes")
 	}
 	return nil
 }
@@ -114,7 +114,7 @@ func normalizeHours(raw string) (int64, error) {
 	return n, nil
 }
 
-func validateWriteItem(item Item, endpoint string) error {
+func validateWriteItem(item Item, endpoint string, maxItemBytes int64) error {
 	if err := validateScope(item.Scope, endpoint); err != nil {
 		return err
 	}
@@ -127,10 +127,10 @@ func validateWriteItem(item Item, endpoint string) error {
 	if item.Seq != 0 {
 		return errors.New("the 'seq' field is managed by the cache and must not be provided to the '" + endpoint + "' endpoint")
 	}
-	return checkItemSize(item)
+	return checkItemSize(item, maxItemBytes)
 }
 
-func validateUpsertItem(item Item) error {
+func validateUpsertItem(item Item, maxItemBytes int64) error {
 	if err := validateScope(item.Scope, "/upsert"); err != nil {
 		return err
 	}
@@ -143,10 +143,10 @@ func validateUpsertItem(item Item) error {
 	if item.Seq != 0 {
 		return errors.New("the 'seq' field is managed by the cache and must not be provided to the '/upsert' endpoint")
 	}
-	return checkItemSize(item)
+	return checkItemSize(item, maxItemBytes)
 }
 
-func validateUpdateItem(item Item) error {
+func validateUpdateItem(item Item, maxItemBytes int64) error {
 	if err := validateScope(item.Scope, "/update"); err != nil {
 		return err
 	}
@@ -163,7 +163,7 @@ func validateUpdateItem(item Item) error {
 	if !payloadPresent(item.Payload) {
 		return errors.New("the 'payload' field is required")
 	}
-	return checkItemSize(item)
+	return checkItemSize(item, maxItemBytes)
 }
 
 // validateCounterAddRequest returns the parsed `by` on success so the handler
