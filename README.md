@@ -142,7 +142,7 @@ Contract: hit returns `200` with the raw payload bytes; miss returns `404` with 
 
 ### Other endpoints
 
-`/head`, `/tail`, `/warm`, `/rebuild`, `/update`, `/upsert`, `/counter_add`, `/delete`, `/delete-up-to`, `/delete-scope`, `/wipe`, `/delete-scope-candidates`, `/stats`, `/help` — see section 12 of the [spec](scopecache-rfc.md) for full examples.
+`/head`, `/tail`, `/warm`, `/rebuild`, `/update`, `/upsert`, `/counter_add`, `/delete`, `/delete-up-to`, `/delete-scope`, `/wipe`, `/delete-scope-candidates`, `/stats`, `/help` — see section 13 of the [spec](scopecache-rfc.md) for full examples.
 
 `/upsert` creates a new item or replaces an existing one by `scope` + `id`. It is the idempotent, retry-safe write path: unlike `/append` (which rejects duplicate ids) or `/update` (which soft-misses on absent items), `/upsert` always writes. `seq` is preserved on replace and freshly assigned on create. The response includes `"created": true` for a fresh item and `false` for a replace.
 
@@ -221,6 +221,31 @@ go test ./...
 ```
 
 Module path: `github.com/DenverCoding/scopecache`. Stdlib only.
+
+## Testing
+
+All tests are stdlib-only and run without Docker. A few commands cover the full matrix:
+
+```bash
+go test ./...                                                   # unit + integration
+go test -race ./...                                             # same, with race detector
+go test -cover ./...                                            # coverage summary
+go test -run=^$ -bench=. -benchmem ./...                        # benchmarks
+go test -run=^$ -fuzz=FuzzValidateWriteItem -fuzztime=30s       # one fuzz target
+docker compose exec dev sh //src//e2e_test.sh                   # E2E over the real Unix socket
+```
+
+What each file covers:
+
+- [store_test.go](store_test.go) — core store/buffer invariants: append, upsert, counter, delete, rebuild, detach-on-replace.
+- [handlers_test.go](handlers_test.go) — HTTP contract: status codes, JSON envelopes, validation errors.
+- [validation_test.go](validation_test.go) — input-validation boundary (scope/id shape, payload presence, counter ranges, hours overflow).
+- [fuzz_test.go](fuzz_test.go) — property-based coverage of the validators with Go's native fuzzer.
+- [stress_test.go](stress_test.go) — 16 goroutines × mixed ops, with a post-run invariant check.
+- [bench_test.go](bench_test.go), [bench_http_test.go](bench_http_test.go) — in-process and HTTP throughput benchmarks (see [Performance](#performance)).
+- [e2e_test.sh](e2e_test.sh) — end-to-end curl suite against the live Unix socket.
+
+The exact contracts these tests enforce are listed in §10 of the [spec](scopecache-rfc.md).
 
 ## Spec
 

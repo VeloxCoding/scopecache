@@ -404,11 +404,38 @@ Next:
 Out of scope (by design):
 
 - Automatic eviction or watermark-based cooling. Writes over the cap return
-  `507` with exact numbers; the client frees space explicitly. See §4 and §10.
+  `507` with exact numbers; the client frees space explicitly. See §4 and §11.
 
 ---
 
-## 10. Comparison with Redis
+## 10. Verification
+
+This section lists the invariants that the test harness enforces. The tests live alongside the core (`*_test.go`, stdlib-only) plus one shell script for end-to-end coverage (`e2e_test.sh`). A failing test here is a breaking change to the contract, not an implementation detail.
+
+**Shape / validation invariants** (unit + fuzz):
+
+- `checkKeyField` rejects surrounding whitespace and control bytes; accepted strings fit the declared length cap.
+- `normalizeHours` rejects negatives and values that would overflow when multiplied by `time.Hour / time.Microsecond`.
+- `validateWriteItem` rejects empty scope, empty or literal-`null` payload, oversize items, and out-of-spec scope/id shapes.
+- `validateCounterAddRequest` rejects zero `by` and values outside ±(2^53 − 1); scope and id are required.
+
+**Store coherence invariants** (unit + stress):
+
+- `s.totalBytes == Σ buf.bytes` across all scopes — the atomic counter matches ground truth even after concurrent load.
+- Within each scope: `buf.bytes == Σ approxItemSize(item)`; `len(buf.items) == len(buf.bySeq)`; items strictly ordered by ascending `seq`; every `buf.byID[id]` points at a matching entry in `buf.bySeq`.
+- After `/delete-scope`, `/wipe`, or a `/rebuild` swap, stale scope-buffer pointers are detached: writes on orphans stay local and cannot decrement the post-swap byte counter.
+
+**HTTP contract invariants** (handlers + E2E):
+
+- Hit/miss envelopes: `/get` and `/delete` return `200` with `"hit":false` on miss; `/render` returns `404` with an empty body; validation errors keep the JSON envelope.
+- Method/route: unknown routes → `404`; wrong method on a known route → `405`.
+- Capacity: per-item shape violations → `400`; per-scope or store-byte overflow → `507` with exact numbers; counter on non-integer payload → `409`.
+
+The stress harness drives a realistic mix of reads, appends, upserts, counter increments, updates, deletes, trims, scope deletions and rebuilds from many goroutines for a fixed duration, then walks every scope and verifies the coherence invariants above. Run it under `-race` to also exercise the concurrency model.
+
+---
+
+## 11. Comparison with Redis
 
 `scopecache` and Redis solve overlapping problems but make different trade-offs. This section is orientation, not a benchmark.
 
@@ -432,7 +459,7 @@ Out of scope (by design):
 
 ---
 
-## 11. Summary
+## 12. Summary
 
 `scopecache` is a scope-first hot-window cache.
 
@@ -447,7 +474,7 @@ Its core identity is:
 - explicitly not a second database
 
 
-## 12. Examples
+## 13. Examples
 
 The service listens on a Unix domain socket (default `/run/scopecache.sock`), so every curl example passes `--unix-socket` and uses `http://localhost/...` as a dummy URL host. Set `SCOPECACHE_SOCKET_PATH` to override the path; adjust `--unix-socket` accordingly.
 
