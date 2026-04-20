@@ -141,7 +141,7 @@ func storeFull(w http.ResponseWriter, started time.Time, e *StoreFullError) {
 	writeJSONWithDuration(w, http.StatusInsufficientStorage, orderedFields{
 		{"ok", false},
 		{"error", "store is at byte capacity"},
-		{"tracked_store_mb", MB(e.StoreBytes)},
+		{"approx_store_mb", MB(e.StoreBytes)},
 		{"added_mb", MB(e.AddedBytes)},
 		{"max_store_mb", MB(e.Cap)},
 	}, started)
@@ -1018,16 +1018,17 @@ func (api *API) handleStats(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Top-level order: ok, then config/caps, then aggregates, then the
-	// variable-size scopes blob. duration_us is appended by the helper.
+	// /stats is a state endpoint: scope/item counts and current byte usage.
+	// Static config (DefaultLimit, MaxLimit, per-item/per-scope caps) lives
+	// in /help, not here. max_store_mb is the one cap that *does* appear —
+	// it pairs with approx_store_mb so a client can compute headroom in a
+	// single call. duration_us is appended by the helper.
 	writeJSONWithDuration(w, http.StatusOK, orderedFields{
 		{"ok", true},
-		{"default_limit", st.DefaultLimit},
-		{"max_limit", st.MaxLimit},
-		{"max_store_mb", st.MaxStoreMB},
 		{"scope_count", st.ScopeCount},
 		{"total_items", st.TotalItems},
-		{"tracked_store_mb", st.TrackedStoreMB},
+		{"approx_store_mb", st.ApproxStoreMB},
+		{"max_store_mb", st.MaxStoreMB},
 		{"scopes", scopes},
 	}, started)
 }
@@ -1054,9 +1055,9 @@ RULES:
 - write operations reject duplicates for the same scope + id
 - per-scope capacity is 100,000 items by default (override with SCOPECACHE_SCOPE_MAX_ITEMS); writes that would exceed the cap are rejected with 507 Insufficient Storage — nothing is silently evicted
 - /append past the cap returns 507 with the offending scope. /warm and /rebuild reject the entire batch with the full list of over-cap scopes; make room first with /delete-up-to or /delete-scope
-- store-wide byte cap is 100 MiB by default (override with SCOPECACHE_MAX_STORE_MB, integer MiB); writes that would push the aggregate approxItemSize past it are rejected with 507. The response carries tracked_store_mb, added_mb, and max_store_mb; free room with /delete-scope or /delete-up-to
+- store-wide byte cap is 100 MiB by default (override with SCOPECACHE_MAX_STORE_MB, integer MiB); writes that would push the aggregate approxItemSize past it are rejected with 507. The response carries approx_store_mb, added_mb, and max_store_mb; free room with /delete-scope or /delete-up-to
 - per-request body cap for /warm and /rebuild scales with the store cap (~store + 10% + 16 MiB), so a full cache always fits in one bulk request. Single-item endpoints use a body cap derived from the per-item cap (item + 4 KiB).
-- every byte-ish field in JSON responses (tracked_store_mb, max_store_mb, approx_scope_mb, added_mb) is expressed in MiB with 4 decimals — one unit across /stats, /delete-scope-candidates and 507 responses
+- every byte-ish field in JSON responses (approx_store_mb, max_store_mb, approx_scope_mb, added_mb) is expressed in MiB with 4 decimals — one unit across /stats, /delete-scope-candidates and 507 responses
 - the listening socket path defaults to /run/scopecache.sock on Linux and $TMPDIR/scopecache.sock on macOS/Windows; override with SCOPECACHE_SOCKET_PATH
 
 ENDPOINTS:

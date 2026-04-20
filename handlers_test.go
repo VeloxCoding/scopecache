@@ -757,8 +757,8 @@ func TestWipe_StatsReportEmptyAfterwards(t *testing.T) {
 	if mustFloat(t, out, "total_items") != 0 {
 		t.Errorf("total_items=%v want 0", out["total_items"])
 	}
-	if mustFloat(t, out, "tracked_store_mb") != 0 {
-		t.Errorf("tracked_store_mb=%v want 0", out["tracked_store_mb"])
+	if mustFloat(t, out, "approx_store_mb") != 0 {
+		t.Errorf("approx_store_mb=%v want 0", out["approx_store_mb"])
 	}
 }
 

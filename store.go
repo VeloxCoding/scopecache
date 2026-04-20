@@ -736,7 +736,7 @@ type Store struct {
 	// maxStoreBytes are rejected with StoreFullError.
 	//
 	// This is the authoritative counter for admission control and is surfaced
-	// (converted to MiB) as tracked_store_mb in /stats. It is deliberately
+	// (converted to MiB) as approx_store_mb in /stats. It is deliberately
 	// leaner than ScopeBuffer.approxSizeBytes — keeping it a pure approxItemSize
 	// sum means the budget the client sees in a 507 response matches the budget
 	// reserveBytes enforces.
@@ -889,13 +889,11 @@ func (s *Store) wipe() (int, int, int64) {
 // /stats handler can flatten it into orderedFields for the wire, and so any
 // in-package caller (tests, future adapters) can read fields directly.
 type StoreStats struct {
-	ScopeCount     int
-	TotalItems     int
-	DefaultLimit   int
-	MaxLimit       int
-	TrackedStoreMB MB
-	MaxStoreMB     MB
-	Scopes         map[string]ScopeStats
+	ScopeCount    int
+	TotalItems    int
+	ApproxStoreMB MB
+	MaxStoreMB    MB
+	Scopes        map[string]ScopeStats
 }
 
 func (s *Store) stats() StoreStats {
@@ -916,13 +914,11 @@ func (s *Store) stats() StoreStats {
 	}
 
 	return StoreStats{
-		ScopeCount:     len(scopeStats),
-		TotalItems:     totalItems,
-		DefaultLimit:   DefaultLimit,
-		MaxLimit:       MaxLimit,
-		TrackedStoreMB: MB(s.totalBytes.Load()),
-		MaxStoreMB:     MB(s.maxStoreBytes),
-		Scopes:         scopeStats,
+		ScopeCount:    len(scopeStats),
+		TotalItems:    totalItems,
+		ApproxStoreMB: MB(s.totalBytes.Load()),
+		MaxStoreMB:    MB(s.maxStoreBytes),
+		Scopes:        scopeStats,
 	}
 }
 

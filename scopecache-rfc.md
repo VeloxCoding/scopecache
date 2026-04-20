@@ -100,11 +100,11 @@ Writes that would exceed **either** cap are **rejected** with HTTP `507 Insuffic
 
 - `/append` past the per-scope item cap → `507` with one offender: the target scope.
 - `/warm` and `/rebuild` with any single scope over the item cap → `507` with the **full list** of offending scopes. The batch is atomic: nothing is applied when any scope would overflow.
-- Any write that would push the store over the byte cap → `507` carrying `tracked_store_mb`, `added_mb`, and `max_store_mb`. `/warm` and `/rebuild` remain atomic: nothing is applied when the post-commit store size would exceed the byte cap.
+- Any write that would push the store over the byte cap → `507` carrying `approx_store_mb`, `added_mb`, and `max_store_mb`. `/warm` and `/rebuild` remain atomic: nothing is applied when the post-commit store size would exceed the byte cap.
 
 Store-wide byte tracking uses an atomic counter reserved via compare-and-swap on the hot `/append` path; batch endpoints (`/warm`, `/rebuild`) compute a fresh byte delta under each scope's lock at commit time so concurrent appends cannot desync the counter.
 
-All byte-ish fields in JSON responses (`tracked_store_mb`, `max_store_mb`, `approx_scope_mb`, `added_mb`) are serialized as MiB with 4 decimals. Internal size math stays in bytes.
+All byte-ish fields in JSON responses (`approx_store_mb`, `max_store_mb`, `approx_scope_mb`, `added_mb`) are serialized as MiB with 4 decimals. Internal size math stays in bytes.
 
 ---
 
@@ -444,7 +444,7 @@ The stress harness drives a realistic mix of reads, appends, upserts, counter in
 - **Operational simplicity.** One Go binary; Phase 3 embeds it in Caddy so there are zero extra processes. No `redis.conf`, AOF/RDB, or eviction policies. Unix socket only — no TCP, auth, ACLs, or TLS.
 - **Domain fit.** The `scope/id/seq` model maps directly to how clients use the cache, with no translation to generic primitives. `/warm` and `/rebuild` are atomic all-or-nothing in a single call where Redis needs MULTI/EXEC or Lua. Scope-level read-heat and `/delete-scope-candidates` ranking are built in.
 - **Debuggability.** HTTP + JSON. `curl` works, every language already speaks it, no client-library versioning.
-- **Predictable-when-full behaviour.** The cache never evicts on its own. Writes past a cap return `507` with exact numbers (`tracked_store_mb`, `added_mb`, `max_store_mb`); clients free space via `/delete-up-to`, `/delete-scope`, or a fitting `/warm`/`/rebuild`.
+- **Predictable-when-full behaviour.** The cache never evicts on its own. Writes past a cap return `507` with exact numbers (`approx_store_mb`, `added_mb`, `max_store_mb`); clients free space via `/delete-up-to`, `/delete-scope`, or a fitting `/warm`/`/rebuild`.
 
 **Where Redis wins**
 
@@ -724,7 +724,7 @@ Response:
 
 Atomic: when the call returns, every scope, every item and every byte
 reservation has been released. A follow-up `/stats` reports
-`scope_count: 0`, `total_items: 0`, `tracked_store_mb: 0`.
+`scope_count: 0`, `total_items: 0`, `approx_store_mb: 0`.
 
 ### 12.17 Stats
 
