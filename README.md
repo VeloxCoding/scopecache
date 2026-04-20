@@ -1,7 +1,7 @@
 # scopecache
 
 A small, local, in-memory cache and write buffer written in Go — stdlib only, served over a Unix domain socket.
-Tuned for modest VPS footprints, it can deliver millions of reads per second per core.
+Tuned for modest VPS footprints, it can deliver millions of reads per second per core (in process Go lookups).
 Data lives in scopes (namespaces) and is addressable only by scope, id, or seq; the entire cache is disposable and can be wiped and rebuilt from the source of truth at any time.
 Payloads can also be served directly via `/render`, allowing Caddy, nginx, or Apache to send cached HTML, JSON, or XML straight to the client without an application layer in between. This can substantially reduce per-request overhead and allow a single server to handle far more traffic on cacheable paths.
 
@@ -174,7 +174,9 @@ Single-item read on a ~57 MiB dataset (100 scopes × 1000 items × ~580 B/item):
 
 That's roughly **30 million reads per second per core**, and the scope-level `RWMutex` does not serialize readers, so throughput scales with cores.
 
-Measured with `go test -bench=. -benchtime=3s` on an AMD Ryzen AI Max+ 395 (Linux, Go 1.23). Numbers are in-process Go lookups — HTTP and Unix-socket overhead is additional but small (stdlib `net/http` + `net.UnixConn`, no JSON transformation on the read path beyond marshaling the item).
+Measured with `go test -bench=. -benchtime=3s` on an AMD Ryzen AI Max+ 395 (Linux, Go 1.23).
+
+**What these numbers do and do not mean.** The table above measures **in-process Go lookups** — direct function calls against the cache, with no HTTP layer in between. They describe the ceiling of the cache core itself, not end-to-end request throughput. When a real caller hits the Unix socket, each request also pays `net/http` + syscall + (for `/get`) JSON-marshaling overhead, which dominates once the cache itself takes ~30 ns. Real-world per-request throughput over the socket is therefore substantially lower than the raw benchmark suggests — concrete numbers depend on payload size, keepalive, and which endpoint is used. `/render` serves raw bytes with no JSON envelope and is the fastest socket-level path; `/get` returns a JSON-wrapped item and pays the extra marshal cost.
 
 Reproduce with:
 
