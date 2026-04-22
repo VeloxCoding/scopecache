@@ -1,9 +1,8 @@
 FROM golang:1.26-alpine AS builder
 WORKDIR /src
-COPY go.mod go.sum ./
+COPY go.mod ./
 COPY *.go ./
 COPY cmd ./cmd
-COPY caddymodule ./caddymodule
 RUN CGO_ENABLED=0 go build -o /out/scopecache ./cmd/scopecache
 
 FROM alpine:latest

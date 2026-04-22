@@ -1,0 +1,32 @@
+# Dockerfile for a Caddy binary with the scopecache module baked in.
+#
+# Two --with flags because the adapter and the core live in different
+# modules now (caddymodule/ has its own go.mod). The xcaddy-generated main
+# go.mod needs a replace for BOTH modules because Go does not honour
+# replace directives inside dependency go.mod files — only those in the
+# main module. Consequence: caddymodule's own `replace scopecache => ../`
+# is inactive here, so we restate it via --with at the top level.
+#
+# The first --with produces a harmless blank import of the core package
+# (core has no Caddy init() — nothing registers), but its job is the
+# replace: scopecache => /src. The second --with imports and registers
+# the Caddy module proper.
+#
+# Production consumers skip this whole dance: `xcaddy --with
+# github.com/VeloxCoding/scopecache/caddymodule@vX.Y.Z` pulls the pinned
+# scopecache version from the parent repo's tags via the submodule's
+# require-directive, no replaces needed.
+
+FROM caddy:2.11.2-builder-alpine AS builder
+WORKDIR /src
+COPY go.mod ./
+COPY *.go ./
+COPY cmd ./cmd
+COPY caddymodule ./caddymodule
+
+RUN xcaddy build v2.11.2 \
+    --with github.com/VeloxCoding/scopecache=/src \
+    --with github.com/VeloxCoding/scopecache/caddymodule=/src/caddymodule
+
+FROM caddy:2.11.2-alpine
+COPY --from=builder /src/caddy /usr/bin/caddy

@@ -1,19 +1,28 @@
 #!/bin/sh
 # End-to-end test suite: exercises every scopecache endpoint over the real
-# Unix socket. Intended to run inside the `dev` container (which shares the
-# /run volume with the `scopecache` service) so the socket path is just
-# /run/scopecache.sock.
+# transport. Supports two modes, chosen by env:
 #
-# Usage (from the host):
-#   docker compose up -d --build scopecache
-#   docker compose exec dev sh /src/e2e_test.sh
+#   unix socket (default) — standalone scopecache service:
+#     SOCK=/run/scopecache.sock BASE=http://localhost
+#     docker compose up -d --build scopecache
+#     docker compose exec dev sh /src/e2e_test.sh
+#
+#   tcp — Caddy module wrapping the core (caddymodule/):
+#     SOCK= BASE=http://caddyscope:8080
+#     docker compose up -d --build caddyscope
+#     docker compose exec -e SOCK= -e BASE=http://caddyscope:8080 dev \
+#         sh /src/e2e_test.sh
+#
+# Empty SOCK disables --unix-socket and the script falls through to plain TCP.
+# Every assertion is transport-agnostic — passing on both modes proves the
+# standalone adapter and the Caddy adapter behave identically.
 #
 # The script fails fast on the first unexpected status code or body shape.
 
 set -eu
 
-SOCK=${SOCK:-/run/scopecache.sock}
-BASE=http://localhost
+SOCK=${SOCK-/run/scopecache.sock}
+BASE=${BASE:-http://localhost}
 
 pass=0
 fail=0
@@ -22,16 +31,26 @@ say()   { printf '%s\n' "$*"; }
 okmsg() { pass=$((pass+1)); printf '  ok   %s\n' "$*"; }
 bad()   { fail=$((fail+1)); printf '  FAIL %s\n' "$*"; }
 
+# SOCK="" disables the unix-socket flag so the same curl line works for both
+# the standalone binary (AF_UNIX) and the Caddy module (TCP).
+if [ -n "$SOCK" ]; then
+    _sockargs="--unix-socket $SOCK"
+else
+    _sockargs=""
+fi
+
 # req METHOD PATH [BODY]
 # Prints "<status>\n<body>" so callers can `read` them separately.
 req() {
     _method=$1; _path=$2; _body=${3:-}
     if [ -n "$_body" ]; then
-        curl -s -o /tmp/body -w '%{http_code}' --unix-socket "$SOCK" \
+        # shellcheck disable=SC2086
+        curl -s -o /tmp/body -w '%{http_code}' $_sockargs \
              -X "$_method" -H 'Content-Type: application/json' \
              -d "$_body" "$BASE$_path"
     else
-        curl -s -o /tmp/body -w '%{http_code}' --unix-socket "$SOCK" \
+        # shellcheck disable=SC2086
+        curl -s -o /tmp/body -w '%{http_code}' $_sockargs \
              -X "$_method" "$BASE$_path"
     fi
     printf '\n'

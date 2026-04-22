@@ -1,0 +1,30 @@
+# Minimal Caddyfile that mounts scopecache at the root of :8080.
+#
+# The scopecache block's three subdirectives mirror the standalone binary's
+# env vars (SCOPECACHE_SCOPE_MAX_ITEMS, SCOPECACHE_MAX_STORE_MB,
+# SCOPECACHE_MAX_ITEM_MB). Omit any of them to use the compile-time default.
+#
+# Mount paths other than root work too — the handler returns "next" for any
+# path it does not recognise, so `handle /cache/*` with a `uri strip_prefix
+# /cache` in front of the scopecache block also serves the API cleanly
+# underneath a prefix.
+{
+    admin off
+    log {
+        output stdout
+        format console
+    }
+}
+
+:8080 {
+    scopecache {
+        scope_max_items 100000
+        max_store_mb    100
+        max_item_mb     1
+    }
+    # scopecache calls next() for any path it does not recognise; this
+    # terminal handler then returns 404 instead of Caddy's default empty
+    # 200. Drop or replace with your own handlers when mounting scopecache
+    # alongside other services.
+    respond 404
+}

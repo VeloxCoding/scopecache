@@ -15,9 +15,12 @@ package caddymodule
 
 import (
 	"net/http"
+	"strconv"
 
 	"github.com/VeloxCoding/scopecache"
 	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
+	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
 
@@ -89,12 +92,71 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	return next.ServeHTTP(w, r)
 }
 
+// UnmarshalCaddyfile parses the `scopecache` handler directive. All three
+// subdirectives are optional; an unset value falls back to the core default
+// inside Provision. Example:
+//
+//	scopecache {
+//	    scope_max_items 100000
+//	    max_store_mb    100
+//	    max_item_mb     1
+//	}
+//
+// Integer-only — these are capacity knobs, not byte strings, so we keep the
+// Caddyfile surface narrow rather than inventing size-unit parsing that does
+// not map cleanly onto the core's MiB/int16 shape.
+func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
+	for d.Next() {
+		if d.NextArg() {
+			return d.ArgErr()
+		}
+		for d.NextBlock(0) {
+			key := d.Val()
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			n, err := strconv.Atoi(d.Val())
+			if err != nil {
+				return d.Errf("%s: %v", key, err)
+			}
+			switch key {
+			case "scope_max_items":
+				h.ScopeMaxItems = n
+			case "max_store_mb":
+				h.MaxStoreMB = n
+			case "max_item_mb":
+				h.MaxItemMB = n
+			default:
+				return d.Errf("unrecognized option: %s", key)
+			}
+		}
+	}
+	return nil
+}
+
+// parseCaddyfile is the Caddyfile-syntax entry point registered with
+// http.handlers so `scopecache { ... }` is recognised as a handler directive.
+func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
+	var m Handler
+	if err := m.UnmarshalCaddyfile(h.Dispenser); err != nil {
+		return nil, err
+	}
+	return &m, nil
+}
+
 func init() {
 	caddy.RegisterModule(Handler{})
+	httpcaddyfile.RegisterHandlerDirective("scopecache", parseCaddyfile)
+	// Without an explicit order Caddy rejects the Caddyfile directive with
+	// "not an ordered HTTP handler". Placing scopecache just before the
+	// `respond` catch-all matches how terminal handlers are usually slotted
+	// in and means operators never need to write a manual `order` line.
+	httpcaddyfile.RegisterDirectiveOrder("scopecache", httpcaddyfile.Before, "respond")
 }
 
 var (
 	_ caddy.Module                = (*Handler)(nil)
 	_ caddy.Provisioner           = (*Handler)(nil)
 	_ caddyhttp.MiddlewareHandler = (*Handler)(nil)
+	_ caddyfile.Unmarshaler       = (*Handler)(nil)
 )
