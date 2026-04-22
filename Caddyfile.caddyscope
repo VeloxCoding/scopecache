@@ -17,6 +17,17 @@
 }
 
 :8080 {
+    # Demo override: /render emits application/octet-stream (scopecache
+    # deliberately does not sniff MIME types — see CLAUDE.md "fronting
+    # proxy sets the real MIME type"). For this demo every /render
+    # response is HTML, so rewrite the Content-Type here. In a real
+    # deployment the operator decides per path/scope what the MIME type
+    # should be.
+    # `>` prefix = "late" header op — overschrijft de Content-Type die
+    # scopecache zelf op /render zet (application/octet-stream).
+    @render path /render
+    header @render >Content-Type "text/html; charset=utf-8"
+
     scopecache {
         scope_max_items 100000
         max_store_mb    100
