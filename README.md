@@ -44,6 +44,23 @@ The rule: new **cache features** go into the core. **Cross-cutting concerns** (a
 
 Phase 3 — core in `package scopecache` (repo root), standalone binary in `cmd/scopecache/`, Caddy adapter in `caddymodule/` (its own Go module so the core stays stdlib-only for non-Caddy consumers).
 
+## Deployment modes
+
+scopecache ships in two forms. Both run the exact same core; what differs is the glue around it.
+
+**Standalone binary (Unix socket).** A separate `scopecache` daemon listens on a Unix socket; nginx/apache/Caddy proxies to it. Pick this if you already run nginx or apache, or if multiple apps on the box need to share one cache instance without routing through Caddy.
+
+**Caddy module (in-process).** scopecache is compiled into your Caddy binary as an HTTP handler. Pick this if Caddy is already your edge. It gets you:
+
+- **No IPC.** Cache lookup is an in-process function call, not a socket round-trip. No `usermod -aG` dance to grant the proxy user access to the socket.
+- **One process, one binary, one systemd unit.** One log stream, one restart.
+- **Caddy's edge stack for free.** TLS + auto Let's Encrypt, HTTP/2, HTTP/3 (QUIC), gzip/brotli, access logs, matchers — all inherited by the cache endpoints.
+- **Config in one place.** The `scopecache { … }` block sits next to the routes that use it, not split across a systemd unit and a proxy config.
+- **Middleware composition.** `basic_auth`, `jwt`, `forward_auth`, rate-limit plugins, `header` directives run *before* scopecache in the chain. This is where request-context-aware policy belongs (see [cross-cutting-concerns.md](cross-cutting-concerns.md)).
+- **Per-vhost mounting.** `handle /cache/*` with `uri strip_prefix`, or separate scopecache instances per site with different caps — all expressible in Caddyfile.
+
+**Tradeoffs of the module path:** tied to Caddy's lifecycle (a Caddy restart restarts the cache — usually fine since the cache is disposable by design), tied to Caddy's version (xcaddy rebuild on upgrades), and can't be shared across apps without routing everything through the same Caddy.
+
 ## Quickstart (Docker)
 
 Standalone, listening on a Unix domain socket:
