@@ -26,7 +26,7 @@ Payloads can also be served directly via `/render`, allowing Caddy, nginx, or Ap
 - A business-logic layer.
 - Payloads are opaque JSON — the cache never inspects, parses, or searches inside them.
 - Not an HTTP response cache. Tools like **Varnish**, nginx `proxy_cache`, Apache `mod_cache`, and Caddy's **souin** key on URL (+ `Vary` headers) and respect HTTP cache semantics transparently for the app. scopecache is a **data cache**: the app explicitly writes and reads fragments by scope/id, and the cache never looks at URLs or `Cache-Control`. The two compose cleanly side by side — scopecache holds warm data, an HTTP cache at the edge caches the rendered response.
-- `/render` comes close to an HTTP-cache feel — Caddy/nginx/apache can serve raw payload bytes to clients without an application layer — but it stays **scope/id/seq-keyed, not URL-keyed**, and does not interpret `Cache-Control`, `ETag`, or conditional GETs.
+- `/render` comes close to an HTTP-cache feel — Caddy/nginx/apache can serve raw payload bytes to clients without an application layer — but it stays **scope/id/seq-keyed, not URL-keyed**, and does not interpret `Cache-Control`, `ETag`, or conditional GETs. As a functional stand-in for an HTTP cache on paths where you control the keys, `/render` is an acceptable substitute; on an in-memory hit it serves in the order of microseconds, within the same ballpark as Varnish or souin.
 
 ## Architecture
 
