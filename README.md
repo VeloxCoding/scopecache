@@ -30,6 +30,42 @@ Read endpoints are equally proxyable. Even without `/render`, the regular query 
 - Not an HTTP response cache. Tools like **Varnish**, nginx `proxy_cache`, Apache `mod_cache`, and Caddy's **souin** key on URL (+ `Vary` headers) and respect HTTP cache semantics transparently for the app. scopecache is a **data cache**: the app explicitly writes and reads fragments by scope/id, and the cache never looks at URLs or `Cache-Control`. The two compose cleanly side by side — scopecache holds warm data, an HTTP cache at the edge caches the rendered response.
 - `/render` comes close to an HTTP-cache feel — Caddy/nginx/apache can serve raw payload bytes to clients without an application layer — but it stays **scope/id/seq-keyed, not URL-keyed**, and does not interpret `Cache-Control`, `ETag`, or conditional GETs. As a functional stand-in for an HTTP cache on paths where you control the keys, `/render` is an acceptable substitute; on an in-memory hit it serves in the order of microseconds, within the same ballpark as Varnish or souin.
 
+## Pre-compute + publish
+
+> Preliminary positioning from the phase-4 harness. Subject to change as measurement and workload breadth mature.
+
+scopecache, Varnish, Redis, and nginx static files all live in the "cache bytes for fast serving" neighbourhood, but they differ sharply in **who decides what to cache and when**. That control axis — not throughput — is scopecache's distinctive feature.
+
+| system | model | populated by | invalidation | cold start |
+|-|-|-|-|-|
+| **nginx static** | file-system driven | file write + atomic rename | file overwrite | disk read |
+| **Varnish** | reactive (pull) | cache-miss → origin → fill | `PURGE`/`BAN` + TTL | first request pays the full backend |
+| **Redis `GET`** (from app) | raw KV | app explicitly `SET` | TTL or app `DEL` | app still sits in front of every request |
+| **scopecache `/render`** | proactive (push) | app explicitly `/warm` | overwrite via `/warm` | pre-warmed — first request costs what the thousandth costs |
+
+`/render` is a *publish target*, not an HTTP response cache in the Varnish sense. The flow is: render offline (cron, worker, build step, after a CMS save), push to scopecache with `/warm`, bytes are atomically live. No user traffic is required to populate the cache. No cold-start for the first visitor after a release. No fsync wall — a full refresh of the hot set is one in-memory map swap.
+
+This is a distinct operational model from on-demand caching (Varnish) or app-driven KV (Redis), with properties that neither provides on its own: atomic multi-item swap, deterministic cache contents, no cold-miss amplification of backend load, no on-disk state to manage. It composes cleanly with those tools rather than replacing them — Varnish in front of scopecache for edge TLS termination; Redis next to scopecache for session state while scopecache holds rendered pages.
+
+### Phase-4 end-to-end bench (2 vCPU, 128 MB cgroup, 170 MB SQLite DB)
+
+Same harness (FrankenPHP + SQLite forum), same output bytes (~4.7 KiB HTML per response), two paths:
+
+| endpoint | ok | req/s | avg ms | p50 | p95 | p99 | max |
+|-|-|-|-|-|-|-|-|
+| `GET /?page=random` — PHP → PDO → SQLite → render | 3,615 | 1,197 | 7.87 | 4.62 | 44.32 | 47.40 | 48.99 |
+| `GET /render?scope=html&id=page-<rand>` — scopecache direct | 26,942 | **11,116** | **0.61** | **0.23** | **0.49** | **0.90** | **55.91** |
+
+~9–10× throughput and ~90× at p95, identical hardware serving identical bytes. Both paths run through the **same Caddy binary** on the same hardware — what differs is everything past the matcher.
+
+SQLite is not the bottleneck here. Instrumenting the PHP path separately showed the script body itself (all queries included) costs 0.3–0.4 ms; the remaining ~4–10 ms of the PHP path is Caddy's matcher chain, FrankenPHP worker dispatch, `php_server` try_files, and PHP interpreter startup — i.e. the **request lifecycle around PHP**, not the DB work inside it. A covering-index experiment confirmed this independently: it produced zero measurable change on GET /. An all-in-RAM SQLite would land in roughly the same neighbourhood as the numbers above.
+
+What `/render` removes is therefore not the DB query but the whole PHP request lifecycle. The comparison is essentially *Caddy-plus-PHP versus Caddy-alone serving the same bytes* — the bytes happened to originate from SQLite in this harness, but the saving is on the serving side.
+
+The preliminary signal: when the same bytes can be served from either path, the pre-compute-and-publish path saves an order of magnitude of CPU per response. That scales directly: a box handling ~1,200 req/s via PHP+SQLite on this harness can handle ~11,000 req/s via `/render` without re-entering the application layer.
+
+*Harness lives in `phase4/` (git-ignored local testbench); measurement notes, caveats, and known artefacts in `phase4/CLAUDE.md`.*
+
 ## Architecture
 
 Three layers with clear boundaries:

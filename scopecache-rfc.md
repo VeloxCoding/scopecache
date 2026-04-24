@@ -109,6 +109,9 @@ Writes that would exceed **either** cap are **rejected** with HTTP `507 Insuffic
 - Any write that would push the store over the byte cap → `507` carrying `approx_store_mb`, `added_mb`, and `max_store_mb`. `/warm` and `/rebuild` remain atomic: nothing is applied when the post-commit store size would exceed the byte cap.
 
 Store-wide byte tracking uses an atomic counter reserved via compare-and-swap on every write path. `/append`, `/update`, `/upsert`, and `/counter_add` reserve their per-item delta directly. `/warm` reserves the net batch delta up-front via the same CAS before committing any scope; a concurrent write that tries to slip in between the batch's cap check and its commit therefore sees the post-reserve total and is rejected if the cap is exceeded, so the store cap is strict under mixed batch + single-write load. `/rebuild` takes the store-wide write lock, so its cap check is trivially atomic. Batch commits reconcile their per-scope counter deltas against the fresh `buf.bytes` under each scope's write-lock, so concurrent writes to scopes being replaced do not desync the counter.
+The scope lock is implemented entirely in-process using Go’s sync.RWMutex, with one instance per ScopeBuffer. Lock acquisition and release are sub-microsecond under no contention, and the critical section itself typically completes within microseconds.
+Long-running scope replacement can create temporary contention for the affected scope. This is expected behavior: /warm is scoped and atomic, so the target scope is intentionally unavailable for concurrent mutation, and may block readers/writers briefly while replacement is committed. The impact is isolated to that scope and does not block unrelated scopes.
+
 
 All byte-ish fields in JSON responses (`approx_store_mb`, `max_store_mb`, `approx_scope_mb`, `added_mb`) are serialized as MiB with 4 decimals. Internal size math stays in bytes.
 
