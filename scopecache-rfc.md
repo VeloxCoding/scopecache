@@ -1148,7 +1148,7 @@ curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/multi_call \
   }'
 ```
 
-Response:
+Response (captured against an already-warm scope; see the cold-start note below):
 
 ```json
 {
@@ -1159,8 +1159,8 @@ Response:
       "status": 200,
       "body": {
         "ok": true,
-        "item": { "scope": "thread:900", "id": "post_1", "seq": 1, "payload": { "text": "hello" } },
-        "duration_us": 2435
+        "item": { "scope": "thread:900", "id": "post_1", "seq": 2, "payload": { "text": "hello" } },
+        "duration_us": 5
       }
     },
     {
@@ -1169,8 +1169,8 @@ Response:
         "ok": true,
         "hit": true,
         "count": 1,
-        "item": { "scope": "thread:900", "id": "post_1", "seq": 1, "payload": { "text": "hello" } },
-        "duration_us": 32,
+        "item": { "scope": "thread:900", "id": "post_1", "seq": 2, "payload": { "text": "hello" } },
+        "duration_us": 4,
         "approx_response_mb": 0.0001
       }
     },
@@ -1180,18 +1180,20 @@ Response:
         "ok": true,
         "hit": true,
         "deleted_count": 1,
-        "duration_us": 8
+        "duration_us": 2
       }
     }
   ],
-  "duration_us": 2628,
+  "duration_us": 110,
   "approx_response_mb": 0.0004
 }
 ```
 
 Each `results[i].body` is **literally** the JSON the standalone endpoint would have returned — `/get` carries its own `hit`/`count`/`approx_response_mb`/`duration_us`, `/delete` carries `hit`/`deleted_count`/`duration_us`, and so on. The outer envelope adds the batch-level `count`, `approx_response_mb`, and `duration_us` (total dispatcher time, including every sub-call).
 
-Sequential dispatch is observable here: the `/get` at index 1 sees `seq: 1` from the `/append` at index 0, and the `/delete` at index 2 reports `deleted_count: 1` because the item it just observed via `/get` is still there.
+Sequential dispatch is observable here: the `/get` at index 1 sees the same `seq` and payload that the `/append` at index 0 just produced, and the `/delete` at index 2 reports `deleted_count: 1` because the item it just observed via `/get` is still there.
+
+**Cold-start note.** The first `/append` into a freshly-created (or freshly-wiped) scope pays a one-time `ScopeBuffer` allocation cost — typically a few hundred microseconds, occasionally up to a few milliseconds if the Go runtime is also doing first-touch allocations. Subsequent operations on the same scope drop into the single-digit-microsecond range shown above. The numbers in this section are warm-state; production workloads with long-lived scopes will look much more like these than like the first call after a `/wipe`.
 
 A sub-call that errors does **not** abort the batch. For example, replacing the `/get` above with a malformed one (no `id` and no `seq`) lands a `400` slot in `results[1]` while the `/append` at index 0 stays applied and the `/delete` at index 2 still runs:
 
@@ -1204,8 +1206,8 @@ A sub-call that errors does **not** abort the batch. For example, replacing the 
       "status": 200,
       "body": {
         "ok": true,
-        "item": { "scope": "thread:900", "id": "post_1", "seq": 1, "payload": { "text": "hello" } },
-        "duration_us": 379
+        "item": { "scope": "thread:900", "id": "post_1", "seq": 3, "payload": { "text": "hello" } },
+        "duration_us": 5
       }
     },
     {
@@ -1213,7 +1215,7 @@ A sub-call that errors does **not** abort the batch. For example, replacing the 
       "body": {
         "ok": false,
         "error": "exactly one of 'id' or 'seq' must be provided",
-        "duration_us": 3
+        "duration_us": 1
       }
     },
     {
@@ -1222,11 +1224,11 @@ A sub-call that errors does **not** abort the batch. For example, replacing the 
         "ok": true,
         "hit": true,
         "deleted_count": 1,
-        "duration_us": 6
+        "duration_us": 4
       }
     }
   ],
-  "duration_us": 857,
+  "duration_us": 89,
   "approx_response_mb": 0.0004
 }
 ```
