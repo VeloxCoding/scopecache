@@ -426,7 +426,7 @@ Contract: hit returns `200` with the raw payload bytes; miss returns `404` with 
 
 ### Other endpoints
 
-`/head`, `/tail`, `/ts_range`, `/warm`, `/rebuild`, `/update`, `/upsert`, `/counter_add`, `/delete`, `/delete-up-to`, `/delete-scope`, `/wipe`, `/delete-scope-candidates`, `/stats`, `/help` — see section 13 of the [spec](scopecache-rfc.md) for full examples.
+`/head`, `/tail`, `/ts_range`, `/warm`, `/rebuild`, `/update`, `/upsert`, `/counter_add`, `/delete`, `/delete-up-to`, `/delete-scope`, `/wipe`, `/multi_call`, `/delete-scope-candidates`, `/stats`, `/help` — see section 13 of the [spec](scopecache-rfc.md) for full examples.
 
 `/ts_range` filters a scope by a client-supplied top-level `ts` (signed int64, milliseconds since unix epoch by convention — the cache is opaque to the unit). At least one of `since_ts` / `until_ts` must be provided; both together form an inclusive `[since_ts, until_ts]` window. Items without a `ts` are excluded. Results are returned in ascending `seq` order — `ts` is a filter, not an ordering key. Responses on `/head`, `/tail`, and `/ts_range` carry `{ "ok", "items", "truncated" }`; `truncated: true` means more matching items exist beyond the returned `limit`. `/ts_range` has **no pagination cursor** because `ts` is mutable (via `/update` / `/upsert`) and non-unique — narrow the window or raise `limit` to fetch more. `ts` is optional on `/append`, `/warm`, `/rebuild`, `/update` (absent = preserve) and `/upsert` (absent = clear, matching its whole-item replace semantics).
 
@@ -436,24 +436,31 @@ Contract: hit returns `200` with the raw payload bytes; miss returns `404` with 
 
 `/wipe` clears the entire store in one atomic call: every scope, every item, every byte reservation. It takes no request body. The response carries `{"ok", "deleted_scopes", "deleted_items", "freed_mb"}` so a client can verify what was released. The store-wide complement of `/delete-scope` — useful for test teardown, emergency reset, or preparing a fresh slate before a `/rebuild`. The cache never wipes on its own; this is explicitly a client-initiated action.
 
+`/multi_call` dispatches `N` self-contained sub-calls in a single HTTP roundtrip. The body is `{"calls": [{"path": "/get", "query": {...}}, {"path": "/append", "body": {...}}, ...]}`; the response is `{"ok", "count", "results", "approx_response_mb", "duration_us"}` where each `results[i]` is `{"status", "body"}` carrying literally the JSON the standalone endpoint would have produced. Sub-calls run **strictly sequentially**, so a `/get` at index `k+1` observes everything writes at indices `0..k` committed; there is **no cross-call atomicity**, a write at index 0 stays applied even if a later sub-call errors. The whitelist is closed: `/append`, `/get`, `/head`, `/tail`, `/ts_range`, `/update`, `/upsert`, `/counter_add`, `/delete`, `/delete-up-to`, `/delete-scope`, `/stats`, `/delete-scope-candidates`. Store-wide locks (`/warm`, `/rebuild`, `/wipe`), raw-byte `/render`, `text/plain` `/help`, and `/multi_call` itself are excluded — a path outside the whitelist rejects the whole batch with `400`. Use case: collapse the call-count tax for small fanouts ("fetch K known ids", "do a small mixed read+write"). On a loopback Unix socket a 3-call batch typically returns in the low hundreds of microseconds vs. ~1 ms for three separate roundtrips; the gap widens on TCP. See section 13.20 of the [spec](scopecache-rfc.md) for the full contract and a captured example response.
+
 ## Configuration
 
 All overrides via environment variables:
 
-| Variable                       | Default                  | Purpose                               |
-|--------------------------------|--------------------------|---------------------------------------|
-| `SCOPECACHE_SOCKET_PATH`       | `/run/scopecache.sock`   | Listening socket path                 |
-| `SCOPECACHE_SCOPE_MAX_ITEMS`   | `100000`                 | Max items per scope                   |
-| `SCOPECACHE_MAX_STORE_MB`      | `100`                    | Store-wide byte cap (integer MiB)     |
-| `SCOPECACHE_MAX_ITEM_MB`       | `1`                      | Per-item size cap (integer MiB)       |
+| Variable                          | Default                  | Purpose                                       |
+|-----------------------------------|--------------------------|-----------------------------------------------|
+| `SCOPECACHE_SOCKET_PATH`          | `/run/scopecache.sock`   | Listening socket path                         |
+| `SCOPECACHE_SCOPE_MAX_ITEMS`      | `100000`                 | Max items per scope                           |
+| `SCOPECACHE_MAX_STORE_MB`         | `100`                    | Store-wide byte cap (integer MiB)             |
+| `SCOPECACHE_MAX_ITEM_MB`          | `1`                      | Per-item size cap (integer MiB)               |
+| `SCOPECACHE_MAX_RESPONSE_MB`      | `25`                     | Per-response byte cap (integer MiB)           |
+| `SCOPECACHE_MAX_MULTI_CALL_MB`    | `16`                     | `/multi_call` input body cap (integer MiB)    |
+| `SCOPECACHE_MAX_MULTI_CALL_COUNT` | `10`                     | `/multi_call` max sub-calls per batch         |
 
 ## Limits
 
-Three independent caps apply; any violation returns **HTTP 507 Insufficient Storage** (per-scope, store-wide) or **HTTP 400 Bad Request** (per-item shape rule). The cache never evicts on its own — clients free capacity via `/delete-up-to`, `/delete-scope`, `/wipe`, or a fitting `/warm`/`/rebuild`.
+Several independent caps apply; any violation returns **HTTP 507 Insufficient Storage** (per-scope, store-wide, per-response) or **HTTP 400 Bad Request** (shape rules: per-item, `/multi_call` count and body). The cache never evicts on its own — clients free capacity via `/delete-up-to`, `/delete-scope`, `/wipe`, or a fitting `/warm`/`/rebuild`.
 
 - **Per-scope item cap** — 100,000 items (default).
 - **Store-wide byte cap** — 100 MiB aggregate (default).
 - **Per-item cap** — 1 MiB (default); enforced on the approximate item size (overhead + scope + id + payload). Raise it via `SCOPECACHE_MAX_ITEM_MB` when the use-case stores larger blobs (rendered HTML, large JSON documents).
+- **Per-response cap** — 25 MiB (default); applies uniformly to every HTTP response, including `/multi_call`'s outer envelope. Prevents pathological responses from `/tail?limit=10000` over 1 MiB items, multi-tenant `/stats` enumeration, and accumulated batch aggregates.
+- **`/multi_call` caps** — 16 MiB input body and 10 sub-calls per batch (defaults). Both bound dispatcher work per HTTP request; raise them on bigger hardware.
 
 ## Eviction / TTL
 
