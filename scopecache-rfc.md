@@ -433,6 +433,48 @@ Behavior:
 
 ---
 
+## 6.3 Composite endpoints
+
+```text
+POST /multi_call
+```
+
+`/multi_call` is the one endpoint that is neither pure read nor pure write — it dispatches `N` self-contained sub-calls in a single HTTP roundtrip. Its semantics intentionally compose the underlying endpoints rather than introducing new ones.
+
+### `POST /multi_call`
+Input:
+- `calls[]` required (pointer-distinguished from absent — `{}` is `400`, `{"calls": []}` is `200` with empty results)
+- each entry: `path` required (must be in the whitelist below), `query` optional (object → URL-query string), `body` optional (forwarded verbatim for POST sub-calls)
+
+Allowed paths (closed whitelist):
+- per-scope/per-item ops: `/append`, `/get`, `/head`, `/tail`, `/ts_range`, `/update`, `/upsert`, `/counter_add`, `/delete`, `/delete-up-to`, `/delete-scope`
+- aggregate reads: `/stats`, `/delete-scope-candidates`
+
+Excluded paths (rejected with `400` for the whole batch):
+- store-wide locks: `/warm`, `/rebuild`, `/wipe` — would block unrelated calls behind a store-wide lock; a `/get` after `/rebuild` in the same batch would read a totally different dataset than the caller expected
+- raw-byte: `/render` — the response is bytes, not a JSON value, so it does not nest cleanly into a `results[]` array
+- `text/plain`: `/help` — same reason
+- self-reference: `/multi_call`
+
+Behavior:
+- sub-calls dispatch **strictly sequentially**, taking each scope's lock for its sub-call and releasing it before the next; a `/get` at index `k+1` observes everything writes at indices `0..k` committed
+- each sub-call goes through the **same handler code** as the standalone endpoint — same caps, same locks, same validators, same envelope shape; the dispatcher does no semantic pre-validation
+- HTTP method per path is fixed by a static map inside the dispatcher (no `method` field on `calls[]` entries); the whitelist is closed, so there is no client choice to expose
+- pre-validation is shape-only: a `path` not in the whitelist rejects the whole batch up-front (no side effect lands), matching the cache's "malformed input rejects the whole request" stance
+- **no cross-call atomicity**: a write that succeeded at index `k` stays applied even if index `k+1` errors. The slot for the failing sub-call carries whatever status/body the standalone endpoint would have produced (typically `400` or `409`); the batch keeps running. This matches the cache's overall stance — there is no rollback at any level
+- **caps**: the input body is bounded by `SCOPECACHE_MAX_MULTI_CALL_MB` (default 16 MiB), the number of sub-calls per batch by `SCOPECACHE_MAX_MULTI_CALL_COUNT` (default 10), and each sub-call response — *plus* the outer envelope — by `SCOPECACHE_MAX_RESPONSE_MB` (default 25 MiB, see §4)
+- **response cap**, asymmetric:
+  - if a sub-call's *own response alone* exceeds the per-response cap (e.g. a `/tail` that produced 30 MiB of items), its slot becomes a `507` carrying `approx_response_mb` and `max_response_mb` — exactly what the standalone endpoint would have returned
+  - if the sub-call's body fits but **accumulating** it into the outer envelope would exceed the cap, the slot's *status is preserved* (the operation actually succeeded or failed as reported) and only the *body* is replaced with a minimal truncation marker: `{"ok": true, "response_truncated": true}` for `2xx` slots, `{"ok": false, "response_truncated": true}` for non-`2xx` slots. A write that landed must not be misreported as `507` just because its metadata response wouldn't fit.
+  - already-applied write side effects are **never** rolled back, even when the outer envelope hits the cap — same as every other `507` in this cache
+- **no separate stats counter** — sub-calls increment the per-endpoint counters they would have incremented standalone (one `/append` call counts as one append, whether it ran solo or inside a batch). Counting the dispatcher itself would double-count.
+
+Response carries `{ "ok", "count", "results", "approx_response_mb", "duration_us" }` — the uniform read-family signature. `count` is `len(results)`. Each `results[i]` is `{"status": <int>, "body": <json value>}` where `body` is **literally** the JSON the standalone endpoint would have produced for that call (same fields, same ordering, same envelope), so a `/get` slot already carries its own `count` / `approx_response_mb` / `duration_us` inside its `body`.
+
+The outer `duration_us` is total dispatcher time including all sub-calls; per-slot timing lives inside each slot's body where the standalone endpoint already puts it.
+
+---
+
 ## 7. Operational model
 
 1. The service listens on a local Unix domain socket only (default `/run/scopecache.sock` on Linux, `$TMPDIR/scopecache.sock` elsewhere; override with `SCOPECACHE_SOCKET_PATH`). There is no TCP listener.
@@ -1092,7 +1134,122 @@ Response:
 
 Atomic: when the call returns, every scope, every item and every byte reservation has been released. A follow-up `/stats` reports `scope_count: 0`, `total_items: 0`, `approx_store_mb: 0`.
 
-### 13.20 Stats
+### 13.20 Multi-call (batched dispatch in one roundtrip)
+
+```bash
+curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/multi_call \
+  -H "Content-Type: application/json" \
+  -d '{
+    "calls": [
+      { "path": "/append", "body":  { "scope": "thread:900", "id": "post_1", "payload": { "text": "hello" } } },
+      { "path": "/get",    "query": { "scope": "thread:900", "id": "post_1" } },
+      { "path": "/delete", "body":  { "scope": "thread:900", "id": "post_1" } }
+    ]
+  }'
+```
+
+Response:
+
+```json
+{
+  "ok": true,
+  "count": 3,
+  "results": [
+    {
+      "status": 200,
+      "body": {
+        "ok": true,
+        "item": { "scope": "thread:900", "id": "post_1", "seq": 1, "payload": { "text": "hello" } },
+        "duration_us": 2435
+      }
+    },
+    {
+      "status": 200,
+      "body": {
+        "ok": true,
+        "hit": true,
+        "count": 1,
+        "item": { "scope": "thread:900", "id": "post_1", "seq": 1, "payload": { "text": "hello" } },
+        "duration_us": 32,
+        "approx_response_mb": 0.0001
+      }
+    },
+    {
+      "status": 200,
+      "body": {
+        "ok": true,
+        "hit": true,
+        "deleted_count": 1,
+        "duration_us": 8
+      }
+    }
+  ],
+  "duration_us": 2628,
+  "approx_response_mb": 0.0004
+}
+```
+
+Each `results[i].body` is **literally** the JSON the standalone endpoint would have returned — `/get` carries its own `hit`/`count`/`approx_response_mb`/`duration_us`, `/delete` carries `hit`/`deleted_count`/`duration_us`, and so on. The outer envelope adds the batch-level `count`, `approx_response_mb`, and `duration_us` (total dispatcher time, including every sub-call).
+
+Sequential dispatch is observable here: the `/get` at index 1 sees `seq: 1` from the `/append` at index 0, and the `/delete` at index 2 reports `deleted_count: 1` because the item it just observed via `/get` is still there.
+
+A sub-call that errors does **not** abort the batch. For example, replacing the `/get` above with a malformed one (no `id` and no `seq`) lands a `400` slot in `results[1]` while the `/append` at index 0 stays applied and the `/delete` at index 2 still runs:
+
+```json
+{
+  "ok": true,
+  "count": 3,
+  "results": [
+    {
+      "status": 200,
+      "body": {
+        "ok": true,
+        "item": { "scope": "thread:900", "id": "post_1", "seq": 1, "payload": { "text": "hello" } },
+        "duration_us": 379
+      }
+    },
+    {
+      "status": 400,
+      "body": {
+        "ok": false,
+        "error": "exactly one of 'id' or 'seq' must be provided",
+        "duration_us": 3
+      }
+    },
+    {
+      "status": 200,
+      "body": {
+        "ok": true,
+        "hit": true,
+        "deleted_count": 1,
+        "duration_us": 6
+      }
+    }
+  ],
+  "duration_us": 857,
+  "approx_response_mb": 0.0004
+}
+```
+
+Excluded paths (`/warm`, `/rebuild`, `/wipe`, `/render`, `/help`, `/multi_call` itself) are rejected up-front for the **whole** batch with a single `400`:
+
+```bash
+curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/multi_call \
+  -H "Content-Type: application/json" \
+  -d '{"calls":[{"path":"/get","query":{"scope":"x","id":"y"}},{"path":"/wipe"}]}'
+```
+
+```json
+{
+  "ok": false,
+  "error": "path '/wipe' (calls[1]) is not allowed in /multi_call",
+  "duration_us": 82
+}
+```
+
+The `/get` at index 0 does not run — pre-validation catches the malformed input before any side effect lands.
+
+### 13.21 Stats
 
 ```bash
 curl -s --unix-socket /run/scopecache.sock "http://localhost/stats"
