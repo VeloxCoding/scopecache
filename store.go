@@ -838,6 +838,13 @@ type Store struct {
 	// (NewStore takes the whole Config; NewAPI reads from Store) holds for
 	// every adapter. Surfaced (in MiB) on /help and inside 507 bodies.
 	maxResponseBytes int64
+	// maxMultiCallBytes caps the input body for /multi_call (in bytes);
+	// maxMultiCallCount caps the number of sub-calls per batch. Same
+	// reasoning as maxResponseBytes for living on Store: keeps adapters
+	// flowing every knob through Config without piping HTTP-layer caps
+	// through a separate constructor.
+	maxMultiCallBytes int64
+	maxMultiCallCount int
 	// totalBytes tracks the running sum of approxItemSize across every item
 	// in every scope. Kept in an atomic so /append can reserve against it
 	// without touching the store-level mutex; writes that would push it past
@@ -853,11 +860,13 @@ type Store struct {
 
 func NewStore(c Config) *Store {
 	return &Store{
-		scopes:           make(map[string]*ScopeBuffer),
-		defaultMaxItems:  c.ScopeMaxItems,
-		maxStoreBytes:    c.MaxStoreBytes,
-		maxItemBytes:     c.MaxItemBytes,
-		maxResponseBytes: c.MaxResponseBytes,
+		scopes:            make(map[string]*ScopeBuffer),
+		defaultMaxItems:   c.ScopeMaxItems,
+		maxStoreBytes:     c.MaxStoreBytes,
+		maxItemBytes:      c.MaxItemBytes,
+		maxResponseBytes:  c.MaxResponseBytes,
+		maxMultiCallBytes: c.MaxMultiCallBytes,
+		maxMultiCallCount: c.MaxMultiCallCount,
 	}
 }
 

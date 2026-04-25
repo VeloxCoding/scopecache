@@ -43,6 +43,12 @@ type Handler struct {
 	// MaxResponseMB caps the byte size of /head, /tail and /ts_range responses
 	// in MiB. 0 = use scopecache.MaxResponseMiB.
 	MaxResponseMB int `json:"max_response_mb,omitempty"`
+	// MaxMultiCallMB caps the input body size of /multi_call in MiB.
+	// 0 = use scopecache.MaxMultiCallMiB.
+	MaxMultiCallMB int `json:"max_multi_call_mb,omitempty"`
+	// MaxMultiCallCount caps the number of sub-calls per /multi_call batch.
+	// 0 = use scopecache.MaxMultiCallCount.
+	MaxMultiCallCount int `json:"max_multi_call_count,omitempty"`
 
 	api *scopecache.API
 	mux *http.ServeMux
@@ -62,10 +68,12 @@ func (Handler) CaddyModule() caddy.ModuleInfo {
 // internal mux. Called once per module instance at Caddy start / config reload.
 func (h *Handler) Provision(_ caddy.Context) error {
 	cfg := scopecache.Config{
-		ScopeMaxItems:    h.ScopeMaxItems,
-		MaxStoreBytes:    int64(h.MaxStoreMB) << 20,
-		MaxItemBytes:     int64(h.MaxItemMB) << 20,
-		MaxResponseBytes: int64(h.MaxResponseMB) << 20,
+		ScopeMaxItems:     h.ScopeMaxItems,
+		MaxStoreBytes:     int64(h.MaxStoreMB) << 20,
+		MaxItemBytes:      int64(h.MaxItemMB) << 20,
+		MaxResponseBytes:  int64(h.MaxResponseMB) << 20,
+		MaxMultiCallBytes: int64(h.MaxMultiCallMB) << 20,
+		MaxMultiCallCount: h.MaxMultiCallCount,
 	}
 	if cfg.ScopeMaxItems == 0 {
 		cfg.ScopeMaxItems = scopecache.ScopeMaxItems
@@ -78,6 +86,12 @@ func (h *Handler) Provision(_ caddy.Context) error {
 	}
 	if cfg.MaxResponseBytes == 0 {
 		cfg.MaxResponseBytes = int64(scopecache.MaxResponseMiB) << 20
+	}
+	if cfg.MaxMultiCallBytes == 0 {
+		cfg.MaxMultiCallBytes = int64(scopecache.MaxMultiCallMiB) << 20
+	}
+	if cfg.MaxMultiCallCount == 0 {
+		cfg.MaxMultiCallCount = scopecache.MaxMultiCallCount
 	}
 
 	store := scopecache.NewStore(cfg)
@@ -99,15 +113,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	return next.ServeHTTP(w, r)
 }
 
-// UnmarshalCaddyfile parses the `scopecache` handler directive. All four
+// UnmarshalCaddyfile parses the `scopecache` handler directive. All
 // subdirectives are optional; an unset value falls back to the core default
 // inside Provision. Example:
 //
 //	scopecache {
-//	    scope_max_items  100000
-//	    max_store_mb     100
-//	    max_item_mb      1
-//	    max_response_mb  25
+//	    scope_max_items        100000
+//	    max_store_mb           100
+//	    max_item_mb            1
+//	    max_response_mb        25
+//	    max_multi_call_mb      16
+//	    max_multi_call_count   10
 //	}
 //
 // Integer-only — these are capacity knobs, not byte strings, so we keep the
@@ -136,6 +152,10 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				h.MaxItemMB = n
 			case "max_response_mb":
 				h.MaxResponseMB = n
+			case "max_multi_call_mb":
+				h.MaxMultiCallMB = n
+			case "max_multi_call_count":
+				h.MaxMultiCallCount = n
 			default:
 				return d.Errf("unrecognized option: %s", key)
 			}

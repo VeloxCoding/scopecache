@@ -115,6 +115,39 @@ func maxResponseBytesFromEnv() int64 {
 	return int64(n) << 20
 }
 
+// maxMultiCallBytesFromEnv returns SCOPECACHE_MAX_MULTI_CALL_MB (in MiB,
+// converted to bytes) if set to a positive integer, otherwise the
+// compile-time default. Caps the input body size of /multi_call; the
+// outer response is bounded separately by SCOPECACHE_MAX_RESPONSE_MB.
+func maxMultiCallBytesFromEnv() int64 {
+	raw := os.Getenv("SCOPECACHE_MAX_MULTI_CALL_MB")
+	if raw == "" {
+		return int64(scopecache.MaxMultiCallMiB) << 20
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n <= 0 {
+		log.Printf("SCOPECACHE_MAX_MULTI_CALL_MB=%q is not a positive integer; using default %d MiB", raw, scopecache.MaxMultiCallMiB)
+		return int64(scopecache.MaxMultiCallMiB) << 20
+	}
+	return int64(n) << 20
+}
+
+// maxMultiCallCountFromEnv returns SCOPECACHE_MAX_MULTI_CALL_COUNT if set to
+// a positive integer, otherwise the compile-time default. Caps the number of
+// sub-calls per /multi_call batch.
+func maxMultiCallCountFromEnv() int {
+	raw := os.Getenv("SCOPECACHE_MAX_MULTI_CALL_COUNT")
+	if raw == "" {
+		return scopecache.MaxMultiCallCount
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n <= 0 {
+		log.Printf("SCOPECACHE_MAX_MULTI_CALL_COUNT=%q is not a positive integer; using default %d", raw, scopecache.MaxMultiCallCount)
+		return scopecache.MaxMultiCallCount
+	}
+	return n
+}
+
 const shutdownGracePeriod = 5 * time.Second
 
 func listenUnixSocket(path string) (net.Listener, error) {
@@ -147,14 +180,16 @@ func listenUnixSocket(path string) (net.Listener, error) {
 
 func main() {
 	cfg := scopecache.Config{
-		ScopeMaxItems:    scopeMaxItemsFromEnv(),
-		MaxStoreBytes:    maxStoreBytesFromEnv(),
-		MaxItemBytes:     maxItemBytesFromEnv(),
-		MaxResponseBytes: maxResponseBytesFromEnv(),
+		ScopeMaxItems:     scopeMaxItemsFromEnv(),
+		MaxStoreBytes:     maxStoreBytesFromEnv(),
+		MaxItemBytes:      maxItemBytesFromEnv(),
+		MaxResponseBytes:  maxResponseBytesFromEnv(),
+		MaxMultiCallBytes: maxMultiCallBytesFromEnv(),
+		MaxMultiCallCount: maxMultiCallCountFromEnv(),
 	}
 	store := scopecache.NewStore(cfg)
 	api := scopecache.NewAPI(store)
-	log.Printf("scopecache capacity: %d items per scope, %d MiB store-wide, %d MiB per item, %d MiB per response", cfg.ScopeMaxItems, cfg.MaxStoreBytes>>20, cfg.MaxItemBytes>>20, cfg.MaxResponseBytes>>20)
+	log.Printf("scopecache capacity: %d items per scope, %d MiB store-wide, %d MiB per item, %d MiB per response, %d MiB per /multi_call body, %d sub-calls per /multi_call batch", cfg.ScopeMaxItems, cfg.MaxStoreBytes>>20, cfg.MaxItemBytes>>20, cfg.MaxResponseBytes>>20, cfg.MaxMultiCallBytes>>20, cfg.MaxMultiCallCount)
 
 	mux := http.NewServeMux()
 	api.RegisterRoutes(mux)

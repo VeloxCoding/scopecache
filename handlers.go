@@ -23,16 +23,25 @@ type API struct {
 	// singleRequestBytesFor so the HTTP guardrail always sits just above the
 	// semantic item-size limit enforced in the validator.
 	maxSingleBytes int64
+	// multiCallSpecs is the closed whitelist of paths /multi_call dispatches
+	// to, paired with their fixed HTTP method and raw handler. Built once in
+	// NewAPI; the handler reference is the un-wrapped API method (the
+	// dispatcher applies its own per-sub-call cap via cappedResponseWriter,
+	// so wrapping again on the way in would just buffer twice). See
+	// CLAUDE.md → Phase 4 design signals → /multi_call.
+	multiCallSpecs map[string]subCallSpec
 }
 
 // NewAPI wires the HTTP API to a Store and derives request caps that scale
 // with the store's configuration.
 func NewAPI(store *Store) *API {
-	return &API{
+	api := &API{
 		store:          store,
 		maxBulkBytes:   bulkRequestBytesFor(store.maxStoreBytes),
 		maxSingleBytes: singleRequestBytesFor(store.maxItemBytes),
 	}
+	api.multiCallSpecs = api.buildMultiCallSpecs()
+	return api
 }
 
 // decodeBody caps the request body at max bytes and decodes JSON into out.
@@ -1173,8 +1182,9 @@ RULES:
 - per-scope capacity is 100,000 items by default (override with SCOPECACHE_SCOPE_MAX_ITEMS); writes that would exceed the cap are rejected with 507 Insufficient Storage — nothing is silently evicted
 - /append past the cap returns 507 with the offending scope. /warm and /rebuild reject the entire batch with the full list of over-cap scopes; make room first with /delete-up-to or /delete-scope
 - store-wide byte cap is 100 MiB by default (override with SCOPECACHE_MAX_STORE_MB, integer MiB); writes that would push the aggregate approxItemSize past it are rejected with 507. The response carries approx_store_mb, added_mb, and max_store_mb; free room with /delete-scope or /delete-up-to
-- per-response byte cap is 25 MiB by default (override with SCOPECACHE_MAX_RESPONSE_MB, integer MiB); applied to /head, /tail and /ts_range whose response size scales with limit × per-item-cap. A response that would exceed the cap is rejected with 507 carrying approx_response_mb and max_response_mb; narrow with a smaller ?limit. Already-applied side effects are not rolled back — same as every other 507 in this cache.
-- per-request body cap for /warm and /rebuild scales with the store cap (~store + 10% + 16 MiB), so a full cache always fits in one bulk request. Single-item endpoints use a body cap derived from the per-item cap (item + 4 KiB).
+- per-response byte cap is 25 MiB by default (override with SCOPECACHE_MAX_RESPONSE_MB, integer MiB); applied to /head, /tail, /ts_range and /multi_call whose response size scales with limit × per-item-cap (or with batch fanout). A response that would exceed the cap is rejected with 507 carrying approx_response_mb and max_response_mb; narrow with a smaller ?limit (or fewer sub-calls). Already-applied side effects are not rolled back — same as every other 507 in this cache.
+- per-request body cap for /warm and /rebuild scales with the store cap (~store + 10% + 16 MiB), so a full cache always fits in one bulk request. Single-item endpoints use a body cap derived from the per-item cap (item + 4 KiB). /multi_call has its own input body cap of 16 MiB by default (override with SCOPECACHE_MAX_MULTI_CALL_MB, integer MiB).
+- /multi_call accepts at most 10 sub-calls per batch by default (override with SCOPECACHE_MAX_MULTI_CALL_COUNT, positive int)
 - every byte-ish field in JSON responses (approx_store_mb, max_store_mb, approx_scope_mb, added_mb) is expressed in MiB with 4 decimals — one unit across /stats, /delete-scope-candidates and 507 responses
 - the listening socket path defaults to /run/scopecache.sock on Linux and $TMPDIR/scopecache.sock on macOS/Windows; override with SCOPECACHE_SOCKET_PATH
 
@@ -1197,6 +1207,7 @@ GET  /get - get one item by scope + id or scope + seq
 GET  /render - serve one item's payload as raw bytes (no JSON envelope); miss returns 404; JSON-string payloads are decoded one layer so cached HTML/XML/text is served as-is; Content-Type is application/octet-stream — fronting proxy is expected to set the real type if browser-facing
 GET  /stats - show store stats and approximate store size
 GET  /delete-scope-candidates - list scope eviction candidates, sorted by oldest last_access_ts (response includes last_7d_read_count for client-side filtering/sorting)
+POST /multi_call - sequentially dispatch N independent sub-calls in one HTTP roundtrip; body is {"calls": [{"path": "/get|/append|...", "query": {...}, "body": {...}}, ...]}; allowed paths: /append, /get, /head, /tail, /ts_range, /update, /upsert, /counter_add, /delete, /delete-up-to, /delete-scope, /stats, /delete-scope-candidates; response is {ok, count, results: [{status, body}, ...], approx_response_mb, duration_us} in input order. No cross-call atomicity — a write at index 0 stays applied even if index 1 fails. Outer envelope honours the per-response cap (SCOPECACHE_MAX_RESPONSE_MB); slot bodies that would push the envelope past the cap are replaced with a minimal {"ok":true|false,"response_truncated":true} marker while the slot's status is preserved.
 
 NOTES:
 - /warm replaces only the scopes present in the request
@@ -1232,4 +1243,5 @@ func (api *API) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/stats", api.handleStats)
 	mux.HandleFunc("/help", api.handleHelp)
 	mux.HandleFunc("/delete-scope-candidates", api.handleDeleteScopeCandidates)
+	mux.HandleFunc("/multi_call", api.capResponse(api.handleMultiCall))
 }

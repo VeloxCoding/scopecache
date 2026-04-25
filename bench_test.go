@@ -16,7 +16,7 @@ func benchStore(b *testing.B, numScopes, itemsPerScope, payloadBytes int) (*Stor
 	b.Helper()
 
 	// Cap tall enough for the dataset: 1 GiB store, 1M items per scope.
-	store := NewStore(Config{ScopeMaxItems: 1_000_000, MaxStoreBytes: 1 << 30, MaxItemBytes: 1 << 20, MaxResponseBytes: 1 << 30})
+	store := NewStore(Config{ScopeMaxItems: 1_000_000, MaxStoreBytes: 1 << 30, MaxItemBytes: 1 << 20, MaxResponseBytes: 1 << 30, MaxMultiCallBytes: 16 << 20, MaxMultiCallCount: 10})
 
 	payloadFiller := make([]byte, payloadBytes)
 	for i := range payloadFiller {
@@ -136,7 +136,7 @@ func BenchmarkStore_Append(b *testing.B) {
 func benchTsScope(b *testing.B, n int) *ScopeBuffer {
 	b.Helper()
 
-	store := NewStore(Config{ScopeMaxItems: 1_000_000, MaxStoreBytes: 1 << 30, MaxItemBytes: 1 << 20, MaxResponseBytes: 1 << 30})
+	store := NewStore(Config{ScopeMaxItems: 1_000_000, MaxStoreBytes: 1 << 30, MaxItemBytes: 1 << 20, MaxResponseBytes: 1 << 30, MaxMultiCallBytes: 16 << 20, MaxMultiCallCount: 10})
 	buf, err := store.getOrCreateScope("bench_ts")
 	if err != nil {
 		b.Fatalf("getOrCreateScope: %v", err)

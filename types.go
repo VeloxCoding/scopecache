@@ -13,6 +13,8 @@ const (
 	MaxStoreMiB        = 100    // store-wide aggregate approxItemSize default in MiB; writes past this are rejected (507). Tuned for ~1 GB VPS footprints. Overridable via SCOPECACHE_MAX_STORE_MB
 	MaxItemBytes       = 1 << 20 // per-item cap default in bytes on approxItemSize (overhead + scope + id + payload). Overridable via SCOPECACHE_MAX_ITEM_MB (integer MiB)
 	MaxResponseMiB     = 25     // per-response cap default in MiB; applies to read endpoints whose response can grow with limit × per-item-cap (/tail, /head, /ts_range). Overridable via SCOPECACHE_MAX_RESPONSE_MB
+	MaxMultiCallMiB    = 16     // per-request body cap default for /multi_call in MiB. Overridable via SCOPECACHE_MAX_MULTI_CALL_MB
+	MaxMultiCallCount  = 10     // max sub-calls per /multi_call batch by default. Overridable via SCOPECACHE_MAX_MULTI_CALL_COUNT
 	MaxScopeBytes      = 128
 	MaxIDBytes         = 128
 
@@ -48,20 +50,24 @@ const (
 // single file instead of rippling through every adapter's call site.
 //
 // Fields:
-//   - ScopeMaxItems:    per-scope item cap; 507 on overflow. Default ScopeMaxItems (100_000).
-//   - MaxStoreBytes:    aggregate approxItemSize cap, in bytes. Default MaxStoreMiB << 20.
-//   - MaxItemBytes:     per-item approxItemSize cap, in bytes. Default MaxItemBytes (1 MiB).
-//   - MaxResponseBytes: per-response cap on read endpoints whose body can grow
-//                       with limit × per-item-cap. In bytes. Default MaxResponseMiB << 20.
+//   - ScopeMaxItems:     per-scope item cap; 507 on overflow. Default ScopeMaxItems (100_000).
+//   - MaxStoreBytes:     aggregate approxItemSize cap, in bytes. Default MaxStoreMiB << 20.
+//   - MaxItemBytes:      per-item approxItemSize cap, in bytes. Default MaxItemBytes (1 MiB).
+//   - MaxResponseBytes:  per-response cap on read endpoints whose body can grow
+//                        with limit × per-item-cap. In bytes. Default MaxResponseMiB << 20.
+//   - MaxMultiCallBytes: input body cap for /multi_call. In bytes. Default MaxMultiCallMiB << 20.
+//   - MaxMultiCallCount: max sub-calls per /multi_call batch. Default MaxMultiCallCount (10).
 //
 // Bytes (not MiB) are the core unit because admission control arithmetic
 // lives in bytes; adapters convert their MiB-facing configuration at the
 // boundary.
 type Config struct {
-	ScopeMaxItems    int
-	MaxStoreBytes    int64
-	MaxItemBytes     int64
-	MaxResponseBytes int64
+	ScopeMaxItems     int
+	MaxStoreBytes     int64
+	MaxItemBytes      int64
+	MaxResponseBytes  int64
+	MaxMultiCallBytes int64
+	MaxMultiCallCount int
 }
 
 // MB is an int64 byte count that serializes to JSON as a number in MiB with

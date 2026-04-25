@@ -1,0 +1,269 @@
+package scopecache
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"time"
+)
+
+// subCallSpec pairs an allowed /multi_call path with the HTTP method
+// and handler used to dispatch it. Each entry represents one slot in
+// the closed whitelist; paths missing from the spec map are rejected
+// with 400 for the whole batch.
+//
+// The handler reference here is the raw API method — NOT the
+// capResponse-wrapped variant registered on the public mux. The
+// dispatcher applies its own per-sub-call cap via cappedResponseWriter
+// inside the loop, so wrapping again on the way in would just buffer
+// twice.
+type subCallSpec struct {
+	method  string
+	handler http.HandlerFunc
+}
+
+// buildMultiCallSpecs returns the closed whitelist of paths /multi_call
+// dispatches to, paired with their fixed HTTP method and handler. The
+// excluded set (/warm, /rebuild, /wipe, /render, /help and /multi_call
+// itself) is documented in CLAUDE.md → Phase 4 design signals →
+// /multi_call → Allowed paths.
+func (api *API) buildMultiCallSpecs() map[string]subCallSpec {
+	return map[string]subCallSpec{
+		"/append":                  {http.MethodPost, api.handleAppend},
+		"/get":                     {http.MethodGet, api.handleGet},
+		"/head":                    {http.MethodGet, api.handleHead},
+		"/tail":                    {http.MethodGet, api.handleTail},
+		"/ts_range":                {http.MethodGet, api.handleTsRange},
+		"/update":                  {http.MethodPost, api.handleUpdate},
+		"/upsert":                  {http.MethodPost, api.handleUpsert},
+		"/counter_add":             {http.MethodPost, api.handleCounterAdd},
+		"/delete":                  {http.MethodPost, api.handleDelete},
+		"/delete-up-to":            {http.MethodPost, api.handleDeleteUpTo},
+		"/delete-scope":            {http.MethodPost, api.handleDeleteScope},
+		"/stats":                   {http.MethodGet, api.handleStats},
+		"/delete-scope-candidates": {http.MethodGet, api.handleDeleteScopeCandidates},
+	}
+}
+
+// multiCallEntry is one sub-call inside a /multi_call request body.
+// Path is required and must be in the whitelist. Query is used for
+// GET-style sub-calls and serialized to a URL query string; Body is
+// used for POSTs and forwarded verbatim. The dispatcher does no
+// pre-flight semantic validation — each handler validates its own
+// input, and whatever status/body it produces lands in the slot.
+type multiCallEntry struct {
+	Path  string                     `json:"path"`
+	Query map[string]json.RawMessage `json:"query,omitempty"`
+	Body  json.RawMessage            `json:"body,omitempty"`
+}
+
+// multiCallRequest is the top-level body for /multi_call. Calls is a
+// pointer-to-slice so the dispatcher can distinguish "field absent"
+// (nil → 400) from "explicitly empty" (non-nil empty → 200 with empty
+// results), per the design contract.
+type multiCallRequest struct {
+	Calls *[]multiCallEntry `json:"calls"`
+}
+
+// multiCallResult is one slot in the outer envelope's results array.
+// Status is the HTTP status code the standalone endpoint produced;
+// Body is the literal JSON the standalone endpoint wrote. Body lives
+// as json.RawMessage so the outer envelope nests it without
+// re-marshalling.
+type multiCallResult struct {
+	Status int             `json:"status"`
+	Body   json.RawMessage `json:"body"`
+}
+
+// multiCallSuccessTrim is substituted for a 2xx slot whose own body
+// fits but whose inclusion would push the outer envelope past the
+// per-response cap. The status stays 2xx — the operation actually
+// succeeded; only the metadata response is truncated.
+var multiCallSuccessTrim = json.RawMessage(`{"ok":true,"response_truncated":true}`)
+
+// multiCallErrorTrim is the non-2xx counterpart to multiCallSuccessTrim:
+// the sub-call failed, the failure body is too big to fit alongside
+// what's already accumulated, so we replace it with a minimal marker.
+// The status stays whatever the handler produced (4xx/5xx); the caller
+// at least knows it failed and that the body was trimmed.
+var multiCallErrorTrim = json.RawMessage(`{"ok":false,"response_truncated":true}`)
+
+// rawToQueryValue converts a JSON value to its URL-query string form.
+// JSON strings are unwrapped (so "thread:900" becomes thread:900).
+// Numbers and booleans use their raw JSON literal verbatim
+// (10, true). null and empty raw yield "". Objects/arrays are rejected
+// — a multi-value field doesn't compose with a flat query string and
+// would silently lose the inner shape.
+func rawToQueryValue(raw json.RawMessage) (string, error) {
+	s := bytes.TrimSpace(raw)
+	if len(s) == 0 || string(s) == "null" {
+		return "", nil
+	}
+	switch s[0] {
+	case '"':
+		var v string
+		if err := json.Unmarshal(s, &v); err != nil {
+			return "", err
+		}
+		return v, nil
+	case '{', '[':
+		return "", fmt.Errorf("nested object/array is not supported as a query value")
+	default:
+		return string(s), nil
+	}
+}
+
+// buildSubURL assembles `path` + optional `?query` for a sub-call.
+// Returns the path unchanged when no query is present so the URL is
+// minimal on the recorder request side.
+func buildSubURL(path string, query map[string]json.RawMessage) (string, error) {
+	if len(query) == 0 {
+		return path, nil
+	}
+	vals := url.Values{}
+	for k, raw := range query {
+		s, err := rawToQueryValue(raw)
+		if err != nil {
+			return "", fmt.Errorf("invalid query value for %s.%s: %s", path, k, err)
+		}
+		vals.Set(k, s)
+	}
+	return path + "?" + vals.Encode(), nil
+}
+
+// envelope-budgeting constants. multiCallEnvelopeOverhead covers the
+// outer JSON frame (`{"ok":true,"count":N,"approx_response_mb":...,
+// "duration_us":...,"results":[]}`) plus a couple of brackets and
+// commas; multiCallSlotOverhead covers per-slot framing
+// (`{"status":NNN,"body":...},`). Both err on the conservative side so
+// the trim path engages slightly earlier than strictly necessary —
+// slack is preferable to overshoot.
+const (
+	multiCallEnvelopeOverhead = 256
+	multiCallSlotOverhead     = 32
+)
+
+// handleMultiCall dispatches N self-contained sub-calls through the
+// existing API handlers and assembles the outer JSON envelope. See
+// CLAUDE.md → Phase 4 design signals → /multi_call for the design
+// contract this implements.
+func (api *API) handleMultiCall(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
+
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, started)
+		return
+	}
+
+	var req multiCallRequest
+	if err := decodeBody(w, r, api.store.maxMultiCallBytes, &req); err != nil {
+		badRequest(w, started, err.Error())
+		return
+	}
+	if req.Calls == nil {
+		badRequest(w, started, "the 'calls' field is required")
+		return
+	}
+	calls := *req.Calls
+	if len(calls) > api.store.maxMultiCallCount {
+		badRequest(w, started, fmt.Sprintf("the 'calls' array has %d entries; the maximum is %d", len(calls), api.store.maxMultiCallCount))
+		return
+	}
+
+	// Pre-validate the whitelist so a typo in any one path rejects the
+	// whole batch before any side effect lands. Matches the existing
+	// "malformed input rejects the whole request" stance — different
+	// from the "no cross-call atomicity" guarantee, which only applies
+	// to handler-level errors after dispatch begins.
+	for i, call := range calls {
+		if _, ok := api.multiCallSpecs[call.Path]; !ok {
+			badRequest(w, started, fmt.Sprintf("path '%s' (calls[%d]) is not allowed in /multi_call", call.Path, i))
+			return
+		}
+	}
+
+	respCap := api.store.maxResponseBytes
+	bodyBudget := respCap - multiCallEnvelopeOverhead - int64(len(calls))*multiCallSlotOverhead
+	if bodyBudget < 0 {
+		bodyBudget = 0
+	}
+
+	results := make([]multiCallResult, 0, len(calls))
+	var bodyBytesUsed int64
+
+	for _, call := range calls {
+		spec := api.multiCallSpecs[call.Path]
+
+		subURL, err := buildSubURL(call.Path, call.Query)
+		if err != nil {
+			// rawToQueryValue rejects nested objects/arrays. The whole
+			// batch fails — no useful semantics for "skip this slot,
+			// continue" when the input itself is malformed.
+			badRequest(w, started, err.Error())
+			return
+		}
+
+		var subReq *http.Request
+		if spec.method == http.MethodGet {
+			subReq = httptest.NewRequest(spec.method, subURL, nil)
+		} else {
+			body := []byte(call.Body)
+			if len(body) == 0 {
+				// Handlers expect a JSON body; an empty body would
+				// produce a parse error with a misleading message.
+				// Sending {} lets the handler's own validator return
+				// the right "missing scope/payload" message.
+				body = []byte("{}")
+			}
+			subReq = httptest.NewRequest(spec.method, subURL, bytes.NewReader(body))
+			subReq.Header.Set("Content-Type", "application/json")
+		}
+
+		// Wrap the per-call recorder with cappedResponseWriter so a
+		// pathological sub-call response is bounded in memory and
+		// reported to the slot as 507 instead of being buffered in
+		// full. crw.flush replays into rec, so rec.Body holds the
+		// finalised slot body either way.
+		rec := httptest.NewRecorder()
+		crw := newCappedResponseWriter(rec, respCap, time.Now())
+		spec.handler(crw, subReq)
+		crw.flush()
+
+		status := rec.Code
+		// Strip the trailing newline that json.Encoder emits — keeps
+		// the nested JSON tidy inside the outer results array.
+		bodyBytes := bytes.TrimRight(rec.Body.Bytes(), "\n")
+
+		// Outer-envelope cap: would including this slot push the
+		// running body total past the conservative budget? If so, trim
+		// asymmetrically — 2xx keeps its status with a success
+		// truncation marker, non-2xx keeps its status with an error
+		// truncation marker. The 507 sub-calls produced just above
+		// take the error branch.
+		if bodyBytesUsed+int64(len(bodyBytes)) > bodyBudget {
+			if status >= 200 && status < 300 {
+				bodyBytes = []byte(multiCallSuccessTrim)
+			} else {
+				bodyBytes = []byte(multiCallErrorTrim)
+			}
+		}
+		bodyBytesUsed += int64(len(bodyBytes))
+
+		// Defensive copy — rec.Body's underlying slice would otherwise
+		// be the same buffer the next iteration's recorder writes
+		// into. (httptest allocates a new recorder per call here, so
+		// this is precaution rather than necessity, but it's cheap.)
+		slot := make([]byte, len(bodyBytes))
+		copy(slot, bodyBytes)
+		results = append(results, multiCallResult{Status: status, Body: slot})
+	}
+
+	writeJSONWithMeta(w, http.StatusOK, orderedFields{
+		{"ok", true},
+		{"count", len(results)},
+		{"results", results},
+	}, started)
+}
