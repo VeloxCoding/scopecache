@@ -103,6 +103,60 @@ func writeJSONWithDuration(w http.ResponseWriter, code int, payload orderedField
 	_ = json.NewEncoder(w).Encode(payload)
 }
 
+// writeJSONWithMeta is writeJSONWithDuration plus an approx_response_mb field
+// that reports the body's own byte length back to the client. Used on every
+// read-item endpoint (/head, /tail, /ts_range, /get) so the read family
+// produces a uniform response shape — duration_us, count, approx_response_mb
+// regardless of item count. On the limit-scaled endpoints (/head, /tail,
+// /ts_range) it also lets callers see how close they sit to the per-response
+// cap and narrow their query before they hit a 507.
+//
+// Single-marshal + patch: marshal the body once, then splice in the size
+// field just before the closing '}'. Self-referential — the size includes
+// the field's own bytes — but converges in 1-2 iterations because MB has
+// 4-decimal precision (0.0001 MiB = ~104 bytes), and the patch only adds
+// ~30 bytes total. Cost over writeJSONWithDuration is a single
+// json.Marshal of the MB value plus a few slice appends: well under 100 µs
+// even for multi-MiB responses.
+func writeJSONWithMeta(w http.ResponseWriter, code int, payload orderedFields, started time.Time) {
+	payload = append(payload, kv{"duration_us", time.Since(started).Microseconds()})
+	bodyBytes, err := json.Marshal(payload)
+	if err != nil {
+		// orderedFields encoding cannot fail in practice (we control every
+		// value type); fall through to the simpler writer if it ever does.
+		writeJSONWithDuration(w, code, payload[:len(payload)-1], started)
+		return
+	}
+
+	// bodyBytes ends in '}'. Strip it, append `,"approx_response_mb":N.NNNN}`.
+	// Iterate so the reported size includes the bytes we are about to add.
+	const fieldKey = `,"approx_response_mb":`
+	finalSize := len(bodyBytes) + len(fieldKey) + 8 // initial guess: 8-byte value
+	var valueBytes []byte
+	for i := 0; i < 3; i++ {
+		v, mErr := json.Marshal(MB(finalSize))
+		if mErr != nil {
+			break
+		}
+		valueBytes = v
+		candidate := len(bodyBytes) - 1 + len(fieldKey) + len(valueBytes) + 1
+		if candidate == finalSize {
+			break
+		}
+		finalSize = candidate
+	}
+
+	out := make([]byte, 0, finalSize+1)
+	out = append(out, bodyBytes[:len(bodyBytes)-1]...)
+	out = append(out, fieldKey...)
+	out = append(out, valueBytes...)
+	out = append(out, '}', '\n')
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(code)
+	_, _ = w.Write(out)
+}
+
 func badRequest(w http.ResponseWriter, started time.Time, message string) {
 	writeJSONWithDuration(w, http.StatusBadRequest, orderedFields{
 		{"ok", false},
@@ -726,7 +780,7 @@ func (api *API) handleHead(w http.ResponseWriter, r *http.Request) {
 
 	buf, ok := api.store.getScope(q.Scope)
 	if !ok {
-		writeJSONWithDuration(w, http.StatusOK, orderedFields{
+		writeJSONWithMeta(w, http.StatusOK, orderedFields{
 			{"ok", true},
 			{"hit", false},
 			{"count", 0},
@@ -743,7 +797,7 @@ func (api *API) handleHead(w http.ResponseWriter, r *http.Request) {
 		buf.recordRead(nowUnixMicro())
 	}
 
-	writeJSONWithDuration(w, http.StatusOK, orderedFields{
+	writeJSONWithMeta(w, http.StatusOK, orderedFields{
 		{"ok", true},
 		{"hit", len(items) > 0},
 		{"count", len(items)},
@@ -773,7 +827,7 @@ func (api *API) handleTail(w http.ResponseWriter, r *http.Request) {
 
 	buf, ok := api.store.getScope(q.Scope)
 	if !ok {
-		writeJSONWithDuration(w, http.StatusOK, orderedFields{
+		writeJSONWithMeta(w, http.StatusOK, orderedFields{
 			{"ok", true},
 			{"hit", false},
 			{"count", 0},
@@ -789,7 +843,7 @@ func (api *API) handleTail(w http.ResponseWriter, r *http.Request) {
 		buf.recordRead(nowUnixMicro())
 	}
 
-	writeJSONWithDuration(w, http.StatusOK, orderedFields{
+	writeJSONWithMeta(w, http.StatusOK, orderedFields{
 		{"ok", true},
 		{"hit", len(items) > 0},
 		{"count", len(items)},
@@ -838,7 +892,7 @@ func (api *API) handleTsRange(w http.ResponseWriter, r *http.Request) {
 
 	buf, ok := api.store.getScope(q.Scope)
 	if !ok {
-		writeJSONWithDuration(w, http.StatusOK, orderedFields{
+		writeJSONWithMeta(w, http.StatusOK, orderedFields{
 			{"ok", true},
 			{"hit", false},
 			{"count", 0},
@@ -853,7 +907,7 @@ func (api *API) handleTsRange(w http.ResponseWriter, r *http.Request) {
 		buf.recordRead(nowUnixMicro())
 	}
 
-	writeJSONWithDuration(w, http.StatusOK, orderedFields{
+	writeJSONWithMeta(w, http.StatusOK, orderedFields{
 		{"ok", true},
 		{"hit", len(items) > 0},
 		{"count", len(items)},
@@ -877,9 +931,10 @@ func (api *API) handleGet(w http.ResponseWriter, r *http.Request) {
 	}
 
 	miss := func() {
-		writeJSONWithDuration(w, http.StatusOK, orderedFields{
+		writeJSONWithMeta(w, http.StatusOK, orderedFields{
 			{"ok", true},
 			{"hit", false},
+			{"count", 0},
 			{"item", nil},
 		}, started)
 	}
@@ -907,9 +962,10 @@ func (api *API) handleGet(w http.ResponseWriter, r *http.Request) {
 	// on /delete-scope-candidates for client-side eviction decisions.
 	buf.recordRead(nowUnixMicro())
 
-	writeJSONWithDuration(w, http.StatusOK, orderedFields{
+	writeJSONWithMeta(w, http.StatusOK, orderedFields{
 		{"ok", true},
 		{"hit", true},
+		{"count", 1},
 		{"item", item},
 	}, started)
 }
@@ -1110,12 +1166,14 @@ RULES:
 - /ts_range filters by the ts window; items without a ts are always excluded from ts-filtered reads
 - read endpoints use a default limit of 1,000 when ?limit is omitted, and a maximum of 10,000 (higher values are clamped, not rejected)
 - /head, /tail and /ts_range responses carry a "truncated" boolean: true when more matching items exist beyond the returned window
+- /head, /tail, /ts_range and /get responses carry "count" and "approx_response_mb" fields alongside duration_us so the read family produces a uniform response shape; on /head, /tail and /ts_range approx_response_mb also lets clients see how close they sit to the per-response cap (see below) without having to measure the body themselves
 - id is optional
 - if id is present, it must be unique within its scope
 - write operations reject duplicates for the same scope + id
 - per-scope capacity is 100,000 items by default (override with SCOPECACHE_SCOPE_MAX_ITEMS); writes that would exceed the cap are rejected with 507 Insufficient Storage — nothing is silently evicted
 - /append past the cap returns 507 with the offending scope. /warm and /rebuild reject the entire batch with the full list of over-cap scopes; make room first with /delete-up-to or /delete-scope
 - store-wide byte cap is 100 MiB by default (override with SCOPECACHE_MAX_STORE_MB, integer MiB); writes that would push the aggregate approxItemSize past it are rejected with 507. The response carries approx_store_mb, added_mb, and max_store_mb; free room with /delete-scope or /delete-up-to
+- per-response byte cap is 25 MiB by default (override with SCOPECACHE_MAX_RESPONSE_MB, integer MiB); applied to /head, /tail and /ts_range whose response size scales with limit × per-item-cap. A response that would exceed the cap is rejected with 507 carrying approx_response_mb and max_response_mb; narrow with a smaller ?limit. Already-applied side effects are not rolled back — same as every other 507 in this cache.
 - per-request body cap for /warm and /rebuild scales with the store cap (~store + 10% + 16 MiB), so a full cache always fits in one bulk request. Single-item endpoints use a body cap derived from the per-item cap (item + 4 KiB).
 - every byte-ish field in JSON responses (approx_store_mb, max_store_mb, approx_scope_mb, added_mb) is expressed in MiB with 4 decimals — one unit across /stats, /delete-scope-candidates and 507 responses
 - the listening socket path defaults to /run/scopecache.sock on Linux and $TMPDIR/scopecache.sock on macOS/Windows; override with SCOPECACHE_SOCKET_PATH
@@ -1166,9 +1224,9 @@ func (api *API) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/delete-up-to", api.handleDeleteUpTo)
 	mux.HandleFunc("/delete-scope", api.handleDeleteScope)
 	mux.HandleFunc("/wipe", api.handleWipe)
-	mux.HandleFunc("/head", api.handleHead)
-	mux.HandleFunc("/tail", api.handleTail)
-	mux.HandleFunc("/ts_range", api.handleTsRange)
+	mux.HandleFunc("/head", api.capResponse(api.handleHead))
+	mux.HandleFunc("/tail", api.capResponse(api.handleTail))
+	mux.HandleFunc("/ts_range", api.capResponse(api.handleTsRange))
 	mux.HandleFunc("/get", api.handleGet)
 	mux.HandleFunc("/render", api.handleRender)
 	mux.HandleFunc("/stats", api.handleStats)

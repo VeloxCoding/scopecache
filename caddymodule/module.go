@@ -40,6 +40,9 @@ type Handler struct {
 	MaxStoreMB int `json:"max_store_mb,omitempty"`
 	// MaxItemMB caps a single item's approxItemSize in MiB. 0 = use scopecache.MaxItemBytes.
 	MaxItemMB int `json:"max_item_mb,omitempty"`
+	// MaxResponseMB caps the byte size of /head, /tail and /ts_range responses
+	// in MiB. 0 = use scopecache.MaxResponseMiB.
+	MaxResponseMB int `json:"max_response_mb,omitempty"`
 
 	api *scopecache.API
 	mux *http.ServeMux
@@ -59,9 +62,10 @@ func (Handler) CaddyModule() caddy.ModuleInfo {
 // internal mux. Called once per module instance at Caddy start / config reload.
 func (h *Handler) Provision(_ caddy.Context) error {
 	cfg := scopecache.Config{
-		ScopeMaxItems: h.ScopeMaxItems,
-		MaxStoreBytes: int64(h.MaxStoreMB) << 20,
-		MaxItemBytes:  int64(h.MaxItemMB) << 20,
+		ScopeMaxItems:    h.ScopeMaxItems,
+		MaxStoreBytes:    int64(h.MaxStoreMB) << 20,
+		MaxItemBytes:     int64(h.MaxItemMB) << 20,
+		MaxResponseBytes: int64(h.MaxResponseMB) << 20,
 	}
 	if cfg.ScopeMaxItems == 0 {
 		cfg.ScopeMaxItems = scopecache.ScopeMaxItems
@@ -71,6 +75,9 @@ func (h *Handler) Provision(_ caddy.Context) error {
 	}
 	if cfg.MaxItemBytes == 0 {
 		cfg.MaxItemBytes = int64(scopecache.MaxItemBytes)
+	}
+	if cfg.MaxResponseBytes == 0 {
+		cfg.MaxResponseBytes = int64(scopecache.MaxResponseMiB) << 20
 	}
 
 	store := scopecache.NewStore(cfg)
@@ -92,14 +99,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	return next.ServeHTTP(w, r)
 }
 
-// UnmarshalCaddyfile parses the `scopecache` handler directive. All three
+// UnmarshalCaddyfile parses the `scopecache` handler directive. All four
 // subdirectives are optional; an unset value falls back to the core default
 // inside Provision. Example:
 //
 //	scopecache {
-//	    scope_max_items 100000
-//	    max_store_mb    100
-//	    max_item_mb     1
+//	    scope_max_items  100000
+//	    max_store_mb     100
+//	    max_item_mb      1
+//	    max_response_mb  25
 //	}
 //
 // Integer-only — these are capacity knobs, not byte strings, so we keep the
@@ -126,6 +134,8 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				h.MaxStoreMB = n
 			case "max_item_mb":
 				h.MaxItemMB = n
+			case "max_response_mb":
+				h.MaxResponseMB = n
 			default:
 				return d.Errf("unrecognized option: %s", key)
 			}

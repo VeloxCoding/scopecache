@@ -831,6 +831,13 @@ type Store struct {
 	defaultMaxItems int
 	maxStoreBytes   int64
 	maxItemBytes    int64
+	// maxResponseBytes caps the byte size of responses on read endpoints
+	// whose body can grow with limit × per-item-cap (/tail, /head,
+	// /ts_range). Enforced at the response-writer layer. Conceptually an
+	// HTTP-layer concern, but lives here so the existing pattern
+	// (NewStore takes the whole Config; NewAPI reads from Store) holds for
+	// every adapter. Surfaced (in MiB) on /help and inside 507 bodies.
+	maxResponseBytes int64
 	// totalBytes tracks the running sum of approxItemSize across every item
 	// in every scope. Kept in an atomic so /append can reserve against it
 	// without touching the store-level mutex; writes that would push it past
@@ -846,10 +853,11 @@ type Store struct {
 
 func NewStore(c Config) *Store {
 	return &Store{
-		scopes:          make(map[string]*ScopeBuffer),
-		defaultMaxItems: c.ScopeMaxItems,
-		maxStoreBytes:   c.MaxStoreBytes,
-		maxItemBytes:    c.MaxItemBytes,
+		scopes:           make(map[string]*ScopeBuffer),
+		defaultMaxItems:  c.ScopeMaxItems,
+		maxStoreBytes:    c.MaxStoreBytes,
+		maxItemBytes:     c.MaxItemBytes,
+		maxResponseBytes: c.MaxResponseBytes,
 	}
 }
 

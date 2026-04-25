@@ -95,6 +95,26 @@ func maxItemBytesFromEnv() int64 {
 	return int64(n) << 20
 }
 
+// maxResponseBytesFromEnv returns SCOPECACHE_MAX_RESPONSE_MB (in MiB,
+// converted to bytes) if set to a positive integer, otherwise the
+// compile-time default. Caps the byte size of /head, /tail, and /ts_range
+// responses; values past the cap are rejected with 507 Insufficient
+// Storage rather than streamed truncated. Same lenient policy as the
+// other env helpers: malformed or non-positive values log a warning and
+// the server keeps running on the default.
+func maxResponseBytesFromEnv() int64 {
+	raw := os.Getenv("SCOPECACHE_MAX_RESPONSE_MB")
+	if raw == "" {
+		return int64(scopecache.MaxResponseMiB) << 20
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n <= 0 {
+		log.Printf("SCOPECACHE_MAX_RESPONSE_MB=%q is not a positive integer; using default %d MiB", raw, scopecache.MaxResponseMiB)
+		return int64(scopecache.MaxResponseMiB) << 20
+	}
+	return int64(n) << 20
+}
+
 const shutdownGracePeriod = 5 * time.Second
 
 func listenUnixSocket(path string) (net.Listener, error) {
@@ -127,13 +147,14 @@ func listenUnixSocket(path string) (net.Listener, error) {
 
 func main() {
 	cfg := scopecache.Config{
-		ScopeMaxItems: scopeMaxItemsFromEnv(),
-		MaxStoreBytes: maxStoreBytesFromEnv(),
-		MaxItemBytes:  maxItemBytesFromEnv(),
+		ScopeMaxItems:    scopeMaxItemsFromEnv(),
+		MaxStoreBytes:    maxStoreBytesFromEnv(),
+		MaxItemBytes:     maxItemBytesFromEnv(),
+		MaxResponseBytes: maxResponseBytesFromEnv(),
 	}
 	store := scopecache.NewStore(cfg)
 	api := scopecache.NewAPI(store)
-	log.Printf("scopecache capacity: %d items per scope, %d MiB store-wide, %d MiB per item", cfg.ScopeMaxItems, cfg.MaxStoreBytes>>20, cfg.MaxItemBytes>>20)
+	log.Printf("scopecache capacity: %d items per scope, %d MiB store-wide, %d MiB per item, %d MiB per response", cfg.ScopeMaxItems, cfg.MaxStoreBytes>>20, cfg.MaxItemBytes>>20, cfg.MaxResponseBytes>>20)
 
 	mux := http.NewServeMux()
 	api.RegisterRoutes(mux)
