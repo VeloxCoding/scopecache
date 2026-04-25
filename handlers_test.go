@@ -1439,7 +1439,7 @@ func TestRace_ParallelMixedWorkload(t *testing.T) {
 						}
 					}
 				default:
-					// Delete-up-to with a small max_seq. Targets the oldest
+					// Delete_up_to with a small max_seq. Targets the oldest
 					// slice of each scope so the prefix drain path is hammered
 					// while appends are still extending the tail.
 					maxSeq := rng.Intn(50) + 1

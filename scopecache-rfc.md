@@ -1029,7 +1029,7 @@ Response:
 
 A miss returns `200` with `hit: false` and `deleted_count: 0`.
 
-### 13.16 Delete-up-to (write-buffer drain)
+### 13.16 Delete_up_to (write-buffer drain)
 
 ```bash
 curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/delete_up_to \
@@ -1053,7 +1053,7 @@ Response:
 
 `deleted_count` is the number of items whose `seq <= max_seq` that were removed. Items past `max_seq` are untouched, so writes that arrived during the drain are preserved for the next round.
 
-### 13.17 Delete-scope
+### 13.17 Delete_scope
 
 ```bash
 curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/delete_scope \
@@ -1075,7 +1075,7 @@ Response:
 
 `hit: false`, `deleted_scope: false`, `deleted_items: 0` when the scope did not exist.
 
-### 13.18 Delete-scope-candidates
+### 13.18 Delete_scope_candidates
 
 ```bash
 curl -s --unix-socket /run/scopecache.sock "http://localhost/delete_scope_candidates?limit=10&hours=3"
