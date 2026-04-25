@@ -95,6 +95,24 @@ Three layers with clear boundaries:
 
 The rule: new **cache features** go into the core. **Cross-cutting concerns** (auth, identity, per-tenant policy) go into an adapter. This keeps the core small and refactorable, keeps both adapters symmetrical, and means cache semantics cannot drift between standalone and Caddy deployments.
 
+## Authorization
+
+Scopecache itself does not interpret authentication, validate credentials, or rewrite scope names — scopes are opaque strings the cache stores and serves verbatim. Access control is defined entirely by the integrating application or reverse proxy, through naming conventions on scope strings combined with which endpoints are exposed externally. Possession of a scope name (or of a token an integrator translates into a scope prefix) *is* the capability. This pattern is **application-defined capability namespaces** — also called **authorization-by-naming-convention at the integration layer**.
+
+A typical deployment: the application server issues a bearer token to a client; the client returns it on each request; Caddy rewrites the scope to prepend the token before forwarding to scopecache. A client `GET /render?scope=privatethread:432` carrying `Authorization: Bearer aaa-bbb-ccc` reaches scopecache as `GET /render?scope=aaa-bbb-ccc:privatethread:432`. The token never appears in the cache's logic — only in the integrator's rewrite step.
+
+## Helpers (optional Caddy middleware)
+
+scopecache's core stays minimal — append, read, address, update, delete, replace. Some patterns sit one layer above that ("read this scope using the bearer token as a prefix", "drain this scope and remove what was read"), and instead of building those into the cache or shipping a second `xcaddy --with` line, they live as **separate Caddy middleware modules in the same `caddymodule/` Go submodule**. Each helper has its own Caddyfile directive, opts in only where you use it, and the main `scopecache` handler stays untouched.
+
+Concrete examples:
+
+- **`scopecache_bearer_prefix`** — reads `Authorization: Bearer <token>` and prepends `<token>:` to the scope, so an authenticated client's `privatethread:432` becomes `aaa-bbb-ccc:privatethread:432` before reaching scopecache (the pattern from *Authorization* above).
+- **`scopecache_pop`** — read-and-delete in one Caddyfile directive for write-buffer drain workers, combining `/tail` and `/delete-up-to`.
+- **`scopecache_scope_rewrite`** — generic scope templating from Caddy placeholders (`{remote_host}`, cookie values, header values, …); the bearer-prefix helper is a special case.
+
+The same `xcaddy --with github.com/VeloxCoding/scopecache/caddymodule@vX.Y.Z` build pulls everything in; helpers do nothing until their directive appears in your Caddyfile. Helpers are Caddy-only — the standalone binary expects integrators to do request-shaping at their own proxy layer.
+
 ## Status
 
 Phase 3 — core in `package scopecache` (repo root), standalone binary in `cmd/scopecache/`, Caddy adapter in `caddymodule/` (its own Go module so the core stays stdlib-only for non-Caddy consumers).
