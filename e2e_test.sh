@@ -76,9 +76,99 @@ call() {
     LAST_BODY=$_bod
 }
 
+# admin_call: dispatches a single sub-call through /admin's envelope and
+# returns the SLOT's status + body. Used for /wipe, /warm, /rebuild,
+# /delete_scope which are no longer reachable on the public mux. The
+# envelope itself always returns 200; what the test cares about is the
+# slot result. See guardedflow.md §J, §K.
+admin_call() {
+    _label=$1; _want=$2; _path=$3; _subbody=${4:-}
+    if [ -n "$_subbody" ]; then
+        _envelope="{\"calls\":[{\"path\":\"$_path\",\"body\":$_subbody}]}"
+    else
+        _envelope="{\"calls\":[{\"path\":\"$_path\"}]}"
+    fi
+    _out=$(req POST /admin "$_envelope")
+    _status=$(printf '%s' "$_out" | head -n1)
+    _bod=$(printf '%s' "$_out" | tail -n +2)
+    if [ "$_status" != "200" ]; then
+        bad "$_label admin envelope failed: $_status"
+        printf '       body: %s\n' "$_bod"
+        return
+    fi
+    _slotStatus=$(printf '%s' "$_bod" | jq -r '.results[0].status')
+    _slotBody=$(printf '%s' "$_bod" | jq -c '.results[0].body')
+    expect "$_label" "$_want" "$_slotStatus" "$_slotBody"
+    LAST_BODY=$_slotBody
+}
+
+# guarded_call: dispatches a single sub-call through /guarded's envelope.
+# Same shape as admin_call but with a token in the request body.
+guarded_call() {
+    _label=$1; _want=$2; _token=$3; _path=$4; _subbody=${5:-}
+    if [ -n "$_subbody" ]; then
+        _envelope="{\"token\":\"$_token\",\"calls\":[{\"path\":\"$_path\",\"body\":$_subbody}]}"
+    else
+        _envelope="{\"token\":\"$_token\",\"calls\":[{\"path\":\"$_path\"}]}"
+    fi
+    _out=$(req POST /guarded "$_envelope")
+    _status=$(printf '%s' "$_out" | head -n1)
+    _bod=$(printf '%s' "$_out" | tail -n +2)
+    if [ "$_status" != "200" ]; then
+        # Envelope-level failure (e.g. 401 missing_token, 400
+        # scope_not_provisioned). Treat the envelope status as the
+        # comparable.
+        expect "$_label" "$_want" "$_status" "$_bod"
+        LAST_BODY=$_bod
+        return
+    fi
+    _slotStatus=$(printf '%s' "$_bod" | jq -r '.results[0].status')
+    _slotBody=$(printf '%s' "$_bod" | jq -c '.results[0].body')
+    expect "$_label" "$_want" "$_slotStatus" "$_slotBody"
+    LAST_BODY=$_slotBody
+}
+
+# admin_call_query: like admin_call but for GET-style sub-calls (head,
+# tail, get, ts_range, render, stats) that take a query map instead of
+# a body. The query argument is a JSON object string.
+admin_call_query() {
+    _label=$1; _want=$2; _path=$3; _query=$4
+    _envelope="{\"calls\":[{\"path\":\"$_path\",\"query\":$_query}]}"
+    _out=$(req POST /admin "$_envelope")
+    _status=$(printf '%s' "$_out" | head -n1)
+    _bod=$(printf '%s' "$_out" | tail -n +2)
+    if [ "$_status" != "200" ]; then
+        bad "$_label admin envelope failed: $_status"
+        printf '       body: %s\n' "$_bod"
+        return
+    fi
+    _slotStatus=$(printf '%s' "$_bod" | jq -r '.results[0].status')
+    _slotBody=$(printf '%s' "$_bod" | jq -c '.results[0].body')
+    expect "$_label" "$_want" "$_slotStatus" "$_slotBody"
+    LAST_BODY=$_slotBody
+}
+
+# guarded_call_query: like guarded_call but for GET-style sub-calls.
+guarded_call_query() {
+    _label=$1; _want=$2; _token=$3; _path=$4; _query=$5
+    _envelope="{\"token\":\"$_token\",\"calls\":[{\"path\":\"$_path\",\"query\":$_query}]}"
+    _out=$(req POST /guarded "$_envelope")
+    _status=$(printf '%s' "$_out" | head -n1)
+    _bod=$(printf '%s' "$_out" | tail -n +2)
+    if [ "$_status" != "200" ]; then
+        expect "$_label" "$_want" "$_status" "$_bod"
+        LAST_BODY=$_bod
+        return
+    fi
+    _slotStatus=$(printf '%s' "$_bod" | jq -r '.results[0].status')
+    _slotBody=$(printf '%s' "$_bod" | jq -c '.results[0].body')
+    expect "$_label" "$_want" "$_slotStatus" "$_slotBody"
+    LAST_BODY=$_slotBody
+}
+
 # --- start clean ---------------------------------------------------------------
 say '== wipe for clean slate =='
-call 'wipe initial'                     200 POST   /wipe
+admin_call 'wipe initial'               200 /wipe
 
 # --- help / stats / unknown routes --------------------------------------------
 say '== introspection =='
@@ -120,8 +210,8 @@ call 'render miss'                      404 GET    '/render?scope=s&id=missing'
 
 # --- warm / rebuild -----------------------------------------------------------
 say '== bulk =='
-call 'warm'  200 POST /warm '{"items":[{"scope":"warm1","id":"a","payload":"A"},{"scope":"warm1","id":"b","payload":"B"},{"scope":"warm2","payload":1}]}'
-call 'rebuild' 200 POST /rebuild '{"items":[{"scope":"only","id":"one","payload":{"k":"v"}}]}'
+admin_call 'warm'    200 /warm    '{"items":[{"scope":"warm1","id":"a","payload":"A"},{"scope":"warm1","id":"b","payload":"B"},{"scope":"warm2","payload":1}]}'
+admin_call 'rebuild' 200 /rebuild '{"items":[{"scope":"only","id":"one","payload":{"k":"v"}}]}'
 
 # After /rebuild the previous scopes are gone. /get still envelopes misses in
 # a 200 with "hit":false (only /render returns 404).
@@ -150,7 +240,7 @@ case $LAST_BODY in
     *'"hit":false'*) okmsg 'delete miss has "hit":false' ;;
     *) bad "delete miss body: $LAST_BODY" ;;
 esac
-call 'delete_scope'                     200 POST   /delete_scope '{"scope":"trim"}'
+admin_call 'delete_scope'               200 /delete_scope '{"scope":"trim"}'
 call 'delete_scope_candidates'          200 GET    /delete_scope_candidates
 
 # --- validation errors (400) --------------------------------------------------
@@ -400,7 +490,7 @@ call 'ts_range: non-integer until_ts'   400 GET    '/ts_range?scope=tsr&until_ts
 say '== multi_call =='
 
 # Wipe so /stats inside the batch sees a deterministic shape.
-call 'mc: wipe for clean slate'         200 POST   /wipe
+admin_call 'mc: wipe for clean slate'   200 /wipe
 
 # Happy path: write, then read it back inside the same batch, then aggregate.
 # The /get at index 1 must see the /append from index 0 — proves sequential
@@ -503,9 +593,124 @@ esac
 call 'mc: nested query value rejected'  400 POST   /multi_call \
     '{"calls":[{"path":"/get","query":{"scope":{"nested":true}}}]}'
 
+# --- /admin -------------------------------------------------------------------
+# Operator-elevated multi-call gateway. No body-level auth — gated by
+# socket access + Caddyfile (the e2e harness reaches the listener
+# directly, mimicking PHP/cron). Public counterparts of /wipe, /warm,
+# /rebuild, /delete_scope are 404; /admin reaches the same handler
+# functions through its dispatcher. See guardedflow.md §J, §K.
+say '== admin =='
+
+# Public route to admin-only paths returns 404.
+call 'admin: public /wipe is 404'        404 POST   /wipe
+call 'admin: public /warm is 404'        404 POST   /warm '{"items":[]}'
+call 'admin: public /rebuild is 404'     404 POST   /rebuild '{"items":[{"scope":"x","payload":1}]}'
+call 'admin: public /delete_scope 404'   404 POST   /delete_scope '{"scope":"x"}'
+
+# /admin can write to reserved scopes (provisions a tenant namespace).
+admin_call 'admin: provision tenant scope' 200 /upsert '{"scope":"_guarded:capX:events","id":"_provisioned","payload":{"t":1}}'
+
+# /admin /stats sees the provisioned scope.
+admin_call 'admin: stats sees provisioned' 200 /stats
+case $LAST_BODY in
+    *'_guarded:capX:events'*) okmsg 'admin: provisioned scope visible in stats' ;;
+    *) bad "admin stats body missing scope: $LAST_BODY" ;;
+esac
+
+# /admin's whitelist excludes self-reference, /multi_call, /guarded, /help.
+call 'admin: rejects /admin in calls' 400 POST /admin '{"calls":[{"path":"/admin"}]}'
+call 'admin: rejects /multi_call'     400 POST /admin '{"calls":[{"path":"/multi_call","body":{"calls":[]}}]}'
+call 'admin: rejects /guarded'        400 POST /admin '{"calls":[{"path":"/guarded","body":{"token":"x","calls":[]}}]}'
+call 'admin: rejects /help'           400 POST /admin '{"calls":[{"path":"/help"}]}'
+
+# Malformed admin envelope → 400.
+call 'admin: malformed body'          400 POST /admin '{not-json'
+call 'admin: missing calls field'     400 POST /admin '{}'
+
+# /admin GET → 405.
+call 'admin: GET rejected'            405 GET  /admin
+
+# /admin /wipe with `include_reserved=true` query is irrelevant in this
+# model (admin /wipe always wipes everything). Confirm it succeeds.
+admin_call 'admin: full wipe'          200 /wipe
+
+# --- /guarded -----------------------------------------------------------------
+# Tenant-facing gateway. Token in body derives capability_id; sub-calls
+# operate only on operator-provisioned `_guarded:<capId>:*` scopes.
+# See guardedflow.md §F.
+say '== guarded =='
+
+# Reset and provision two tenants. capability_id values below are
+# precomputed via:  hex(HMAC_SHA256(server_secret, token)).
+# The standalone test binary uses SCOPECACHE_SERVER_SECRET="test-secret".
+TENANT_A_TOKEN="tenant-A-token"
+TENANT_B_TOKEN="tenant-B-token"
+TENANT_A_CAP=$(printf '%s' "$TENANT_A_TOKEN" | openssl dgst -sha256 -hmac "test-secret" -hex | sed 's/^.*= //')
+TENANT_B_CAP=$(printf '%s' "$TENANT_B_TOKEN" | openssl dgst -sha256 -hmac "test-secret" -hex | sed 's/^.*= //')
+
+admin_call 'gd: provision tenant A scope' 200 /upsert "{\"scope\":\"_guarded:${TENANT_A_CAP}:events\",\"id\":\"_provisioned\",\"payload\":{\"t\":1}}"
+admin_call 'gd: provision tenant B scope' 200 /upsert "{\"scope\":\"_guarded:${TENANT_B_CAP}:events\",\"id\":\"_provisioned\",\"payload\":{\"t\":1}}"
+
+# Happy path: tenant A appends to their own events scope.
+guarded_call 'gd: tenant A append'        200 "$TENANT_A_TOKEN" /append '{"scope":"events","id":"e1","payload":{"v":1}}'
+
+# Response stripping: client sees `scope: "events"`, never the
+# rewritten `_guarded:<capId>:events` form.
+guarded_call_query 'gd: tenant A read back' 200 "$TENANT_A_TOKEN" /get '{"scope":"events","id":"e1"}'
+case $LAST_BODY in
+    *'"scope":"events"'*) okmsg 'gd: response prefix stripped (client sees "events")' ;;
+    *) bad "gd: prefix not stripped: $LAST_BODY" ;;
+esac
+case $LAST_BODY in
+    *'_guarded:'*) bad "gd: response leaked internal prefix: $LAST_BODY" ;;
+    *) okmsg 'gd: no _guarded: prefix in response body' ;;
+esac
+
+# Random-token attack: forged token's HMAC names a non-existent scope →
+# whole-batch reject with scope_not_provisioned.
+call 'gd: random token rejected'         400 POST /guarded \
+    '{"token":"random-attacker","calls":[{"path":"/append","body":{"scope":"events","payload":"junk"}}]}'
+case $LAST_BODY in
+    *'not provisioned'*) okmsg 'gd: scope_not_provisioned error returned' ;;
+    *) bad "gd: expected scope_not_provisioned: $LAST_BODY" ;;
+esac
+
+# Whitelist enforcement: /wipe inside /guarded is rejected.
+call 'gd: rejects /wipe sub-call'         400 POST /guarded \
+    "{\"token\":\"${TENANT_A_TOKEN}\",\"calls\":[{\"path\":\"/wipe\"}]}"
+
+# Whitelist enforcement: /delete_scope inside /guarded is rejected.
+call 'gd: rejects /delete_scope sub-call' 400 POST /guarded \
+    "{\"token\":\"${TENANT_A_TOKEN}\",\"calls\":[{\"path\":\"/delete_scope\",\"body\":{\"scope\":\"events\"}}]}"
+
+# Two-tenant isolation: tenant B reads events and sees nothing of A's data.
+guarded_call_query 'gd: tenant B isolated read' 200 "$TENANT_B_TOKEN" /get '{"scope":"events","id":"e1"}'
+case $LAST_BODY in
+    *'"hit":false'*) okmsg 'gd: tenant B sees no leaked tenant A data' ;;
+    *) bad "gd: tenant isolation broken: $LAST_BODY" ;;
+esac
+
+# Counter auto-create: after the appends above, _counters_count_calls
+# should have at least one item per active capability_id.
+admin_call_query 'gd: counters auto-created' 200 /tail '{"scope":"_counters_count_calls"}'
+case $LAST_BODY in
+    *"\"id\":\"${TENANT_A_CAP}\""*) okmsg 'gd: tenant A counter created' ;;
+    *) bad "gd: tenant A counter missing: $LAST_BODY" ;;
+esac
+
+# Missing token → 401.
+call 'gd: missing token'                 401 POST /guarded \
+    '{"calls":[{"path":"/get","query":{"scope":"events","id":"x"}}]}'
+
+# GET /guarded → 405.
+call 'gd: GET rejected'                  405 GET /guarded
+
+# Malformed body → 400.
+call 'gd: malformed body'                400 POST /guarded '{not-json'
+
 # --- wipe at end --------------------------------------------------------------
 say '== final wipe =='
-call 'wipe'                             200 POST   /wipe
+admin_call 'wipe'                       200 /wipe
 # Body should report the scopes and items that existed just before wipe.
 if printf '%s' "$LAST_BODY" | grep -q '"deleted_scopes"'; then
     okmsg 'wipe body has deleted_scopes'; pass=$((pass+1))

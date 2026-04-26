@@ -49,6 +49,12 @@ type Handler struct {
 	// MaxMultiCallCount caps the number of sub-calls per /multi_call batch.
 	// 0 = use scopecache.MaxMultiCallCount.
 	MaxMultiCallCount int `json:"max_multi_call_count,omitempty"`
+	// ServerSecret is the HMAC key for /guarded. Empty (or unset) disables
+	// /guarded entirely — the route is not registered, public callers
+	// receive 404. When non-empty, both scopecache and the application
+	// using it (PHP/workers computing capability_ids) must see the same
+	// value. See guardedflow.md §I.
+	ServerSecret string `json:"server_secret,omitempty"`
 
 	api *scopecache.API
 	mux *http.ServeMux
@@ -74,6 +80,7 @@ func (h *Handler) Provision(_ caddy.Context) error {
 		MaxResponseBytes:  int64(h.MaxResponseMB) << 20,
 		MaxMultiCallBytes: int64(h.MaxMultiCallMB) << 20,
 		MaxMultiCallCount: h.MaxMultiCallCount,
+		ServerSecret:      h.ServerSecret,
 	}
 	if cfg.ScopeMaxItems == 0 {
 		cfg.ScopeMaxItems = scopecache.ScopeMaxItems
@@ -124,11 +131,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 //	    max_response_mb        25
 //	    max_multi_call_mb      16
 //	    max_multi_call_count   10
+//	    server_secret          {$SCOPECACHE_SERVER_SECRET}
 //	}
 //
-// Integer-only — these are capacity knobs, not byte strings, so we keep the
-// Caddyfile surface narrow rather than inventing size-unit parsing that does
-// not map cleanly onto the core's MiB/int16 shape.
+// Numeric capacity knobs are integer; `server_secret` is a string that
+// can be either a literal value or — recommended — a `{$VAR}`
+// substitution of an env-var. See guardedflow.md §I.
 func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	for d.Next() {
 		if d.NextArg() {
@@ -139,7 +147,17 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			if !d.NextArg() {
 				return d.ArgErr()
 			}
-			n, err := strconv.Atoi(d.Val())
+			value := d.Val()
+
+			// String-valued directives.
+			switch key {
+			case "server_secret":
+				h.ServerSecret = value
+				continue
+			}
+
+			// Integer-valued directives.
+			n, err := strconv.Atoi(value)
 			if err != nil {
 				return d.Errf("%s: %v", key, err)
 			}

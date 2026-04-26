@@ -68,6 +68,13 @@ type Config struct {
 	MaxResponseBytes  int64
 	MaxMultiCallBytes int64
 	MaxMultiCallCount int
+	// ServerSecret is the HMAC key for /guarded. Empty string disables
+	// /guarded entirely — the route is not registered, public callers get
+	// 404. When non-empty, both scopecache (validating tokens) and the
+	// application using it (PHP/workers computing capability_ids) must
+	// see the same value via their own configuration. See guardedflow.md
+	// §I.
+	ServerSecret string
 }
 
 // MB is an int64 byte count that serializes to JSON as a number in MiB with

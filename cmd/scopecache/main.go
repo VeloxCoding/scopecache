@@ -186,10 +186,17 @@ func main() {
 		MaxResponseBytes:  maxResponseBytesFromEnv(),
 		MaxMultiCallBytes: maxMultiCallBytesFromEnv(),
 		MaxMultiCallCount: maxMultiCallCountFromEnv(),
+		ServerSecret:      os.Getenv("SCOPECACHE_SERVER_SECRET"),
 	}
 	store := scopecache.NewStore(cfg)
 	api := scopecache.NewAPI(store)
+
+	guardedStatus := "DISABLED (SCOPECACHE_SERVER_SECRET unset)"
+	if cfg.ServerSecret != "" {
+		guardedStatus = "enabled"
+	}
 	log.Printf("scopecache capacity: %d items per scope, %d MiB store-wide, %d MiB per item, %d MiB per response, %d MiB per /multi_call body, %d sub-calls per /multi_call batch", cfg.ScopeMaxItems, cfg.MaxStoreBytes>>20, cfg.MaxItemBytes>>20, cfg.MaxResponseBytes>>20, cfg.MaxMultiCallBytes>>20, cfg.MaxMultiCallCount)
+	log.Printf("scopecache features: /admin enabled (socket-permission-based auth); /guarded %s", guardedStatus)
 
 	mux := http.NewServeMux()
 	api.RegisterRoutes(mux)

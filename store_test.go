@@ -888,6 +888,77 @@ func TestStore_GetScope_Miss(t *testing.T) {
 	}
 }
 
+func TestStore_EnsureScope_CreatesEmpty(t *testing.T) {
+	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+	buf := s.ensureScope("_counters_count_calls")
+	if buf == nil {
+		t.Fatal("ensureScope returned nil")
+	}
+	if got, ok := s.getScope("_counters_count_calls"); !ok || got != buf {
+		t.Fatal("scope not registered or different buffer returned")
+	}
+	if n := len(buf.items); n != 0 {
+		t.Errorf("new scope should be empty, got %d items", n)
+	}
+}
+
+func TestStore_EnsureScope_Idempotent(t *testing.T) {
+	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+	b1 := s.ensureScope("_counters_count_calls")
+	b2 := s.ensureScope("_counters_count_calls")
+	if b1 != b2 {
+		t.Fatal("repeat ensureScope should return same buffer")
+	}
+}
+
+// ensureScope under concurrent access must not double-create or panic.
+func TestStore_EnsureScope_Concurrent(t *testing.T) {
+	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+
+	const N = 50
+	bufs := make([]*ScopeBuffer, N)
+	var wg sync.WaitGroup
+	wg.Add(N)
+	for i := 0; i < N; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			bufs[idx] = s.ensureScope("_counters_count_calls")
+		}(i)
+	}
+	wg.Wait()
+
+	first := bufs[0]
+	for i, b := range bufs {
+		if b != first {
+			t.Errorf("ensureScope returned different buffer at idx %d", i)
+		}
+	}
+}
+
+// ensureScope on already-existing scope must not wipe its items.
+func TestStore_EnsureScope_PreservesExisting(t *testing.T) {
+	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+	buf, _ := s.getOrCreateScope("_counters_count_calls")
+	if _, _, err := buf.counterAdd("_counters_count_calls", "cap1", 42); err != nil {
+		t.Fatalf("counterAdd: %v", err)
+	}
+	again := s.ensureScope("_counters_count_calls")
+	if again != buf {
+		t.Fatal("ensureScope returned different buffer")
+	}
+	if got, _, err := again.counterAdd("_counters_count_calls", "cap1", 0); err != nil {
+		// counterAdd with by=0 isn't allowed by /counter_add validation, but at
+		// the buffer level it should still let us read the existing value via
+		// a noop add — except that the buffer rejects zero too. So instead
+		// just check items length.
+		_ = got
+		_ = err
+	}
+	if n := len(again.items); n != 1 {
+		t.Errorf("expected 1 existing item preserved, got %d", n)
+	}
+}
+
 func TestStore_DeleteScope(t *testing.T) {
 	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
 	buf, _ := s.getOrCreateScope("x")

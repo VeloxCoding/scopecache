@@ -1,0 +1,373 @@
+package scopecache
+
+import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"strings"
+	"testing"
+)
+
+// computeCapForTest mirrors the cache's HMAC computation so tests can
+// build the prefixed scope name PHP-side would produce.
+func computeCapForTest(serverSecret, token string) string {
+	h := hmac.New(sha256.New, []byte(serverSecret))
+	h.Write([]byte(token))
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+const testServerSecret = "test-secret"
+
+// provisionTenantScope creates a `_guarded:<capId>:<name>` scope via
+// /admin so subsequent /guarded calls' scope-existence check passes.
+// Equivalent to PHP's sc_admin_calls([['/upsert', sentinel item]]) at
+// token issuance.
+func provisionTenantScope(t *testing.T, h http.Handler, token, name string) string {
+	t.Helper()
+	capID := computeCapForTest(testServerSecret, token)
+	scope := "_guarded:" + capID + ":" + name
+	body := fmt.Sprintf(`{"calls":[{"path":"/upsert","body":{"scope":"%s","id":"_provisioned","payload":{"t":1}}}]}`, scope)
+	code, _, raw := doRequest(t, h, "POST", "/admin", body)
+	if code != 200 {
+		t.Fatalf("provisionTenantScope: code=%d body=%s", code, raw)
+	}
+	return scope
+}
+
+// guardedSlot extracts the [first] result slot from a /guarded response.
+func guardedSlot(t *testing.T, out map[string]interface{}, idx int) (int, map[string]interface{}) {
+	t.Helper()
+	results, ok := out["results"].([]interface{})
+	if !ok || idx >= len(results) {
+		t.Fatalf("results[%d] missing: %+v", idx, out)
+	}
+	slot := results[idx].(map[string]interface{})
+	status := int(slot["status"].(float64))
+	body, _ := slot["body"].(map[string]interface{})
+	return status, body
+}
+
+// --- happy path ---------------------------------------------------------------
+
+func TestGuarded_HappyPath(t *testing.T) {
+	h, _ := newTestHandler(100)
+	provisionTenantScope(t, h, "tenant-A-token", "events")
+
+	body := `{"token":"tenant-A-token","calls":[{"path":"/append","body":{"scope":"events","payload":{"e":"signup"}}}]}`
+	code, out, raw := doRequest(t, h, "POST", "/guarded", body)
+	if code != 200 {
+		t.Fatalf("code=%d body=%s", code, raw)
+	}
+	status, slotBody := guardedSlot(t, out, 0)
+	if status != 200 {
+		t.Errorf("slot status=%d want 200, body=%s", status, raw)
+	}
+	if ok, _ := slotBody["ok"].(bool); !ok {
+		t.Errorf("slot body ok=false: %v", slotBody)
+	}
+}
+
+// Prefix stripping: tenant sends `scope: "events"`, gets `scope:
+// "events"` back, never the rewritten _guarded:<HMAC>:events form.
+func TestGuarded_ResponseStripping_Append(t *testing.T) {
+	h, _ := newTestHandler(100)
+	provisionTenantScope(t, h, "tok-strip", "events")
+
+	body := `{"token":"tok-strip","calls":[{"path":"/append","body":{"scope":"events","id":"item1","payload":{"v":1}}}]}`
+	code, out, raw := doRequest(t, h, "POST", "/guarded", body)
+	if code != 200 {
+		t.Fatalf("code=%d body=%s", code, raw)
+	}
+	_, slotBody := guardedSlot(t, out, 0)
+	item, ok := slotBody["item"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("missing item in response: %v", slotBody)
+	}
+	scope, _ := item["scope"].(string)
+	if scope != "events" {
+		t.Errorf("got scope=%q want %q (prefix should be stripped)", scope, "events")
+	}
+	// Verify the prefix was actually present internally — sanity check
+	// of the test setup, not strictly necessary.
+	if strings.HasPrefix(scope, "_guarded:") {
+		t.Errorf("response leaked internal prefix: %q", scope)
+	}
+}
+
+func TestGuarded_ResponseStripping_Tail(t *testing.T) {
+	h, _ := newTestHandler(100)
+	provisionTenantScope(t, h, "tok-tail", "events")
+
+	// Append two items first.
+	for i := 0; i < 2; i++ {
+		body := fmt.Sprintf(`{"token":"tok-tail","calls":[{"path":"/append","body":{"scope":"events","id":"i%d","payload":{"n":%d}}}]}`, i, i)
+		if code, _, raw := doRequest(t, h, "POST", "/guarded", body); code != 200 {
+			t.Fatalf("seed append %d: code=%d body=%s", i, code, raw)
+		}
+	}
+
+	// Tail and check stripping in items[].
+	body := `{"token":"tok-tail","calls":[{"path":"/tail","query":{"scope":"events","limit":10}}]}`
+	code, out, raw := doRequest(t, h, "POST", "/guarded", body)
+	if code != 200 {
+		t.Fatalf("tail code=%d body=%s", code, raw)
+	}
+	_, slotBody := guardedSlot(t, out, 0)
+	items, ok := slotBody["items"].([]interface{})
+	if !ok {
+		t.Fatalf("missing items in tail response: %v", slotBody)
+	}
+	for _, raw := range items {
+		item := raw.(map[string]interface{})
+		s, _ := item["scope"].(string)
+		// /tail items omit scope when it equals the queried scope (Item
+		// has scope as omitempty), so we accept either "events" or
+		// empty — both indicate no leak.
+		if s != "" && s != "events" {
+			t.Errorf("tail item scope=%q want %q (stripped)", s, "events")
+		}
+		if strings.HasPrefix(s, "_guarded:") {
+			t.Errorf("tail item leaked prefix: %q", s)
+		}
+	}
+}
+
+// --- token validation ---------------------------------------------------------
+
+func TestGuarded_MissingToken(t *testing.T) {
+	h, _ := newTestHandler(10)
+	body := `{"calls":[{"path":"/get","query":{"scope":"x","id":"a"}}]}`
+	code, out, _ := doRequest(t, h, "POST", "/guarded", body)
+	if code != 401 {
+		t.Fatalf("code=%d want 401", code)
+	}
+	if mustBool(t, out, "ok") {
+		t.Error("ok=true on missing token")
+	}
+}
+
+// --- scope-not-provisioned ----------------------------------------------------
+
+// A random/forged token's HMAC names a scope that was never
+// provisioned, so the existence check fails. No state mutated.
+func TestGuarded_RandomTokenRejected(t *testing.T) {
+	h, _ := newTestHandler(10)
+
+	body := `{"token":"random-attacker","calls":[{"path":"/append","body":{"scope":"x","payload":"junk"}}]}`
+	code, out, raw := doRequest(t, h, "POST", "/guarded", body)
+	if code != 400 {
+		t.Fatalf("code=%d want 400 (scope_not_provisioned), body=%s", code, raw)
+	}
+	if mustBool(t, out, "ok") {
+		t.Error("ok=true on scope_not_provisioned")
+	}
+	if !strings.Contains(raw, "not provisioned") {
+		t.Errorf("expected 'not provisioned' in error, got: %s", raw)
+	}
+}
+
+// Tenant tries to escape into another scope by sending a literal
+// `_guarded:other:X` — gets rewritten to `_guarded:<myHMAC>:_guarded:
+// other:X`, which doesn't exist. Rejected.
+func TestGuarded_PrefixInjectionAttempt(t *testing.T) {
+	h, _ := newTestHandler(10)
+	provisionTenantScope(t, h, "tok-inj", "events")
+
+	body := `{"token":"tok-inj","calls":[{"path":"/get","query":{"scope":"_guarded:other_capId:events","id":"x"}}]}`
+	code, _, raw := doRequest(t, h, "POST", "/guarded", body)
+	if code != 400 {
+		t.Fatalf("code=%d want 400, body=%s", code, raw)
+	}
+	if !strings.Contains(raw, "not provisioned") {
+		t.Errorf("expected scope_not_provisioned, got: %s", raw)
+	}
+}
+
+// --- whitelist enforcement ----------------------------------------------------
+
+func TestGuarded_WhitelistMiss(t *testing.T) {
+	h, _ := newTestHandler(10)
+	provisionTenantScope(t, h, "tok-wl", "events")
+
+	body := `{"token":"tok-wl","calls":[{"path":"/wipe"}]}`
+	code, _, raw := doRequest(t, h, "POST", "/guarded", body)
+	if code != 400 {
+		t.Fatalf("code=%d want 400 (not_in_guarded_whitelist), body=%s", code, raw)
+	}
+	if !strings.Contains(raw, "not allowed") {
+		t.Errorf("expected 'not allowed' in error, got: %s", raw)
+	}
+}
+
+func TestGuarded_BlocksDeleteScope(t *testing.T) {
+	h, _ := newTestHandler(10)
+	provisionTenantScope(t, h, "tok-ds", "events")
+
+	body := `{"token":"tok-ds","calls":[{"path":"/delete_scope","body":{"scope":"events"}}]}`
+	code, _, _ := doRequest(t, h, "POST", "/guarded", body)
+	if code != 400 {
+		t.Fatalf("code=%d want 400 (delete_scope not in /guarded whitelist)", code)
+	}
+}
+
+// --- counter auto-create on first call ----------------------------------------
+
+func TestGuarded_CounterAutoCreate(t *testing.T) {
+	h, _ := newTestHandler(100)
+	provisionTenantScope(t, h, "tok-counter", "events")
+	capID := computeCapForTest(testServerSecret, "tok-counter")
+
+	// First /guarded call from a brand-new capability_id.
+	body := `{"token":"tok-counter","calls":[{"path":"/append","body":{"scope":"events","payload":{"v":1}}}]}`
+	if code, _, raw := doRequest(t, h, "POST", "/guarded", body); code != 200 {
+		t.Fatalf("first /guarded code=%d body=%s", code, raw)
+	}
+
+	// /admin /tail _counters_count_calls should now show one item with
+	// our capID.
+	tailBody := `{"calls":[{"path":"/tail","query":{"scope":"_counters_count_calls","limit":10}}]}`
+	code, out, raw := doRequest(t, h, "POST", "/admin", tailBody)
+	if code != 200 {
+		t.Fatalf("admin tail code=%d body=%s", code, raw)
+	}
+	results := out["results"].([]interface{})
+	tailResp := results[0].(map[string]interface{})["body"].(map[string]interface{})
+	items, _ := tailResp["items"].([]interface{})
+	if len(items) != 1 {
+		t.Fatalf("expected 1 counter item, got %d (body=%s)", len(items), raw)
+	}
+	first := items[0].(map[string]interface{})
+	if id, _ := first["id"].(string); id != capID {
+		t.Errorf("counter id=%q want %q", id, capID)
+	}
+	if v, _ := first["payload"].(float64); int64(v) != 1 {
+		t.Errorf("counter value=%v want 1 (one call)", v)
+	}
+}
+
+// After /wipe the counter scopes are gone. The next /guarded call must
+// re-provision them via ensureScope.
+func TestGuarded_CountersSelfHealAfterWipe(t *testing.T) {
+	h, _ := newTestHandler(100)
+	provisionTenantScope(t, h, "tok-heal", "events")
+
+	// First call creates counter scope.
+	doRequest(t, h, "POST", "/guarded", `{"token":"tok-heal","calls":[{"path":"/append","body":{"scope":"events","payload":{"v":1}}}]}`)
+
+	// /admin /wipe clears everything including counters.
+	if code, _, raw := doRequest(t, h, "POST", "/admin", `{"calls":[{"path":"/wipe"}]}`); code != 200 {
+		t.Fatalf("wipe code=%d body=%s", code, raw)
+	}
+
+	// Re-provision tenant scope (was wiped too).
+	provisionTenantScope(t, h, "tok-heal", "events")
+
+	// Next /guarded call: counter scopes should be re-created automatically.
+	if code, _, raw := doRequest(t, h, "POST", "/guarded", `{"token":"tok-heal","calls":[{"path":"/append","body":{"scope":"events","payload":{"v":2}}}]}`); code != 200 {
+		t.Fatalf("post-wipe /guarded code=%d body=%s", code, raw)
+	}
+
+	// Verify counter scopes re-exist.
+	code, out, _ := doRequest(t, h, "POST", "/admin", `{"calls":[{"path":"/stats"}]}`)
+	if code != 200 {
+		t.Fatalf("stats code=%d", code)
+	}
+	results := out["results"].([]interface{})
+	statsBody := results[0].(map[string]interface{})["body"].(map[string]interface{})
+	scopes := statsBody["scopes"].(map[string]interface{})
+	if _, ok := scopes["_counters_count_calls"]; !ok {
+		t.Errorf("_counters_count_calls missing after self-heal")
+	}
+}
+
+// --- input shape --------------------------------------------------------------
+
+func TestGuarded_GETRejected(t *testing.T) {
+	h, _ := newTestHandler(10)
+	code, _, _ := doRequest(t, h, "GET", "/guarded", "")
+	if code != http.StatusMethodNotAllowed {
+		t.Fatalf("code=%d want 405", code)
+	}
+}
+
+func TestGuarded_MalformedBody(t *testing.T) {
+	h, _ := newTestHandler(10)
+	code, _, _ := doRequest(t, h, "POST", "/guarded", `{not-json`)
+	if code != 400 {
+		t.Fatalf("code=%d want 400", code)
+	}
+}
+
+func TestGuarded_MissingCallsField(t *testing.T) {
+	h, _ := newTestHandler(10)
+	code, _, _ := doRequest(t, h, "POST", "/guarded", `{"token":"x"}`)
+	if code != 400 {
+		t.Fatalf("code=%d want 400", code)
+	}
+}
+
+// --- two-tenant isolation -----------------------------------------------------
+
+// Tenant A's /append lands in A's namespace; tenant B (with a different
+// token) reads B's namespace and sees nothing of A's.
+func TestGuarded_TenantIsolation(t *testing.T) {
+	h, _ := newTestHandler(100)
+	provisionTenantScope(t, h, "tenant-A", "events")
+	provisionTenantScope(t, h, "tenant-B", "events")
+
+	// Tenant A appends.
+	doRequest(t, h, "POST", "/guarded", `{"token":"tenant-A","calls":[{"path":"/append","body":{"scope":"events","id":"a-only","payload":{"v":1}}}]}`)
+
+	// Tenant B reads — should see nothing.
+	code, out, raw := doRequest(t, h, "POST", "/guarded", `{"token":"tenant-B","calls":[{"path":"/get","query":{"scope":"events","id":"a-only"}}]}`)
+	if code != 200 {
+		t.Fatalf("B get code=%d body=%s", code, raw)
+	}
+	_, slotBody := guardedSlot(t, out, 0)
+	if hit, _ := slotBody["hit"].(bool); hit {
+		t.Errorf("tenant B saw tenant A's data: %v", slotBody)
+	}
+}
+
+// --- /guarded disabled when SERVER_SECRET unset -------------------------------
+
+func TestGuarded_NotRegisteredWithoutSecret(t *testing.T) {
+	api := NewAPI(NewStore(Config{
+		ScopeMaxItems:     10,
+		MaxStoreBytes:     100 << 20,
+		MaxItemBytes:      1 << 20,
+		MaxResponseBytes:  25 << 20,
+		MaxMultiCallBytes: 16 << 20,
+		MaxMultiCallCount: 10,
+		// ServerSecret deliberately empty.
+	}))
+	mux := http.NewServeMux()
+	api.RegisterRoutes(mux)
+
+	code, _, _ := doRequest(t, mux, "POST", "/guarded", `{"token":"x","calls":[]}`)
+	if code != 404 {
+		t.Fatalf("code=%d want 404 (no SERVER_SECRET, /guarded should not be registered)", code)
+	}
+}
+
+// --- routing self-check -------------------------------------------------------
+
+func TestGuarded_HandlerReachableViaMux(t *testing.T) {
+	h, _ := newTestHandler(10)
+	provisionTenantScope(t, h, "tok-mux", "events")
+	body := `{"token":"tok-mux","calls":[{"path":"/get","query":{"scope":"events","id":"missing"}}]}`
+	code, _, raw := doRequest(t, h, "POST", "/guarded", body)
+	if code != 200 {
+		t.Fatalf("code=%d want 200, body=%s", code, raw)
+	}
+	var out map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		t.Fatalf("non-JSON body: %s", raw)
+	}
+	if _, ok := out["results"]; !ok {
+		t.Errorf("missing results: %s", raw)
+	}
+}

@@ -2,6 +2,7 @@ package scopecache
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -10,6 +11,41 @@ import (
 	"strconv"
 	"time"
 )
+
+// adminCtxKey marks a synthetic sub-request as originating from /admin's
+// dispatcher. Public-mux handlers check this via isAdminContext to
+// decide whether to enforce the reserved-prefix block on incoming
+// scopes — admin can write to `_guarded:*` and `_counters_*`, public
+// callers cannot. See guardedflow.md §B, §K.
+type adminCtxKey struct{}
+
+func withAdminContext(r *http.Request) *http.Request {
+	return r.WithContext(contextWithAdmin(r.Context()))
+}
+
+func contextWithAdmin(ctx context.Context) context.Context {
+	return context.WithValue(ctx, adminCtxKey{}, true)
+}
+
+func isAdminContext(ctx context.Context) bool {
+	v, _ := ctx.Value(adminCtxKey{}).(bool)
+	return v
+}
+
+// rejectReservedScope rejects requests whose scope begins with the
+// reserved '_' prefix UNLESS the request was dispatched via /admin.
+// Helper called at the top of every scope-bearing public handler.
+// Returns true when the handler should write a 400 and stop.
+func rejectReservedScope(r *http.Request, w http.ResponseWriter, started time.Time, scope string) bool {
+	if isAdminContext(r.Context()) {
+		return false
+	}
+	if hasReservedPrefix(scope) {
+		badRequest(w, started, "the 'scope' field must not begin with '_' (reserved prefix)")
+		return true
+	}
+	return false
+}
 
 type API struct {
 	store *Store
@@ -30,6 +66,14 @@ type API struct {
 	// so wrapping again on the way in would just buffer twice). See
 	// CLAUDE.md → Phase 4 design signals → /multi_call.
 	multiCallSpecs map[string]subCallSpec
+	// adminCallSpecs is the wider whitelist used by /admin. Includes
+	// operator-only operations (/warm, /rebuild, /wipe, /stats,
+	// /delete_scope_candidates, /delete_scope) that are removed from the
+	// public mux — only /admin reaches them. See guardedflow.md §K.
+	adminCallSpecs map[string]subCallSpec
+	// guardedCallSpecs is the narrower whitelist used by /guarded — 11
+	// per-scope tenant-safe operations. See guardedflow.md §E.
+	guardedCallSpecs map[string]subCallSpec
 }
 
 // NewAPI wires the HTTP API to a Store and derives request caps that scale
@@ -41,6 +85,8 @@ func NewAPI(store *Store) *API {
 		maxSingleBytes: singleRequestBytesFor(store.maxItemBytes),
 	}
 	api.multiCallSpecs = api.buildMultiCallSpecs()
+	api.adminCallSpecs = api.buildAdminCallSpecs()
+	api.guardedCallSpecs = api.buildGuardedCallSpecs()
 	return api
 }
 
@@ -239,6 +285,9 @@ func parseLookupTarget(r *http.Request, endpoint string) (lookupTarget, error) {
 	if err := validateScope(scope, endpoint); err != nil {
 		return lookupTarget{}, err
 	}
+	if !isAdminContext(r.Context()) && hasReservedPrefix(scope) {
+		return lookupTarget{}, errors.New("the 'scope' field must not begin with '_' (reserved prefix)")
+	}
 
 	hasID := id != ""
 	hasSeq := seqStr != ""
@@ -278,6 +327,9 @@ func parseScopeLimit(r *http.Request, endpoint string) (scopeLimit, error) {
 	if err := validateScope(scope, endpoint); err != nil {
 		return scopeLimit{}, err
 	}
+	if !isAdminContext(r.Context()) && hasReservedPrefix(scope) {
+		return scopeLimit{}, errors.New("the 'scope' field must not begin with '_' (reserved prefix)")
+	}
 	limit, err := normalizeLimit(query.Get("limit"))
 	if err != nil {
 		return scopeLimit{}, err
@@ -301,6 +353,9 @@ func (api *API) handleAppend(w http.ResponseWriter, r *http.Request) {
 
 	if err := validateWriteItem(item, "/append", api.store.maxItemBytes); err != nil {
 		badRequest(w, started, err.Error())
+		return
+	}
+	if rejectReservedScope(r, w, started, item.Scope) {
 		return
 	}
 
@@ -458,6 +513,9 @@ func (api *API) handleUpsert(w http.ResponseWriter, r *http.Request) {
 		badRequest(w, started, err.Error())
 		return
 	}
+	if rejectReservedScope(r, w, started, item.Scope) {
+		return
+	}
 
 	buf, err := api.store.getOrCreateScope(item.Scope)
 	if err != nil {
@@ -513,6 +571,9 @@ func (api *API) handleCounterAdd(w http.ResponseWriter, r *http.Request) {
 	by, err := validateCounterAddRequest(req)
 	if err != nil {
 		badRequest(w, started, err.Error())
+		return
+	}
+	if rejectReservedScope(r, w, started, req.Scope) {
 		return
 	}
 
@@ -576,6 +637,9 @@ func (api *API) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		badRequest(w, started, err.Error())
 		return
 	}
+	if rejectReservedScope(r, w, started, item.Scope) {
+		return
+	}
 
 	buf, ok := api.store.getScope(item.Scope)
 	if !ok {
@@ -629,6 +693,9 @@ func (api *API) handleDelete(w http.ResponseWriter, r *http.Request) {
 		badRequest(w, started, err.Error())
 		return
 	}
+	if rejectReservedScope(r, w, started, req.Scope) {
+		return
+	}
 
 	buf, ok := api.store.getScope(req.Scope)
 	if !ok {
@@ -670,6 +737,9 @@ func (api *API) handleDeleteUpTo(w http.ResponseWriter, r *http.Request) {
 
 	if err := validateDeleteUpToRequest(req); err != nil {
 		badRequest(w, started, err.Error())
+		return
+	}
+	if rejectReservedScope(r, w, started, req.Scope) {
 		return
 	}
 
@@ -1226,15 +1296,11 @@ NOTES:
 
 func (api *API) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/append", api.handleAppend)
-	mux.HandleFunc("/warm", api.handleWarm)
-	mux.HandleFunc("/rebuild", api.handleRebuild)
 	mux.HandleFunc("/update", api.handleUpdate)
 	mux.HandleFunc("/upsert", api.handleUpsert)
 	mux.HandleFunc("/counter_add", api.handleCounterAdd)
 	mux.HandleFunc("/delete", api.handleDelete)
 	mux.HandleFunc("/delete_up_to", api.handleDeleteUpTo)
-	mux.HandleFunc("/delete_scope", api.handleDeleteScope)
-	mux.HandleFunc("/wipe", api.handleWipe)
 	mux.HandleFunc("/head", api.capResponse(api.handleHead))
 	mux.HandleFunc("/tail", api.capResponse(api.handleTail))
 	mux.HandleFunc("/ts_range", api.capResponse(api.handleTsRange))
@@ -1244,4 +1310,22 @@ func (api *API) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/help", api.handleHelp)
 	mux.HandleFunc("/delete_scope_candidates", api.handleDeleteScopeCandidates)
 	mux.HandleFunc("/multi_call", api.capResponse(api.handleMultiCall))
+	// Admin-elevated endpoint. /wipe, /warm, /rebuild, /delete_scope are
+	// reachable only via /admin (their handler functions still exist;
+	// they're removed from the public mux). See guardedflow.md §J, §K.
+	mux.HandleFunc("/admin", api.capResponse(api.handleAdmin))
+	// Tenant-facing /guarded gateway. Registered only when the operator
+	// configured a server secret — without one, HMAC computation would
+	// produce identical capability_ids for every token, defeating
+	// isolation. Empty secret → /guarded route not registered, public
+	// callers get 404. See guardedflow.md §I.
+	//
+	// Counter scopes (`_counters_count_calls`, `_counters_count_kb`) are
+	// NOT eagerly provisioned here — the first /guarded call creates
+	// them via ensureScope, and they self-heal after a /wipe the same
+	// way. Eager provisioning would clutter `/stats` for operators who
+	// haven't yet seen any /guarded traffic.
+	if api.store.serverSecret != "" {
+		mux.HandleFunc("/guarded", api.capResponse(api.handleGuarded))
+	}
 }

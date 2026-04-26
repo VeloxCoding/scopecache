@@ -301,7 +301,7 @@ func TestWarm_PreservesTs(t *testing.T) {
 		`{"scope":"s","id":"a","ts":1000,"payload":{"v":1}},` +
 		`{"scope":"s","id":"b","payload":{"v":2}}` +
 		`]}`
-	_, _, _ = doRequest(t, h, "POST", "/warm", body)
+	_, _, _ = doAdminRequest(t, h, "/warm", body)
 
 	_, out, _ := doRequest(t, h, "GET", "/get?scope=s&id=a", "")
 	a := out["item"].(map[string]interface{})

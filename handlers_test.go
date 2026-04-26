@@ -16,7 +16,7 @@ func newTestHandler(maxItems int) (http.Handler, *API) {
 	// 100 MiB byte budget is more than enough for handler tests with tiny
 	// payloads; dedicated byte-cap behaviour tests construct stores with a
 	// small maxStoreBytes so their writes can fail the store cap on purpose.
-	api := NewAPI(NewStore(Config{ScopeMaxItems: maxItems, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20, MaxResponseBytes: 25 << 20, MaxMultiCallBytes: 16 << 20, MaxMultiCallCount: 10}))
+	api := NewAPI(NewStore(Config{ScopeMaxItems: maxItems, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20, MaxResponseBytes: 25 << 20, MaxMultiCallBytes: 16 << 20, MaxMultiCallCount: 10, ServerSecret: "test-secret"}))
 	mux := http.NewServeMux()
 	api.RegisterRoutes(mux)
 	return mux, api
@@ -41,6 +41,51 @@ func doRequest(t *testing.T, h http.Handler, method, path, body string) (int, ma
 		_ = json.Unmarshal([]byte(raw), &out)
 	}
 	return rec.Code, out, raw
+}
+
+// doAdminRequest wraps a single sub-call in /admin's envelope, dispatches
+// it, and returns the slot's status + body so existing tests can keep
+// asserting against the standalone-endpoint shape. Used wherever a test
+// previously called /wipe, /warm, /rebuild, or /delete_scope directly —
+// these are now reachable only via /admin (see guardedflow.md §J, §K).
+func doAdminRequest(t *testing.T, h http.Handler, path, body string) (int, map[string]interface{}, string) {
+	t.Helper()
+
+	call := map[string]interface{}{"path": path}
+	if body != "" {
+		var parsed interface{}
+		if err := json.Unmarshal([]byte(body), &parsed); err != nil {
+			t.Fatalf("doAdminRequest: parse sub-call body: %v (body=%s)", err, body)
+		}
+		call["body"] = parsed
+	}
+	adminBody, _ := json.Marshal(map[string]interface{}{
+		"calls": []interface{}{call},
+	})
+
+	code, out, raw := doRequest(t, h, "POST", "/admin", string(adminBody))
+	if code != 200 {
+		// /admin itself rejected the request (e.g. malformed envelope).
+		return code, out, raw
+	}
+
+	results, ok := out["results"].([]interface{})
+	if !ok || len(results) == 0 {
+		t.Fatalf("doAdminRequest: missing or empty results: %+v", out)
+	}
+	slot, ok := results[0].(map[string]interface{})
+	if !ok {
+		t.Fatalf("doAdminRequest: slot[0] not object: %v", results[0])
+	}
+
+	slotStatus := 0
+	if v, ok := slot["status"].(float64); ok {
+		slotStatus = int(v)
+	}
+	slotBody, _ := slot["body"].(map[string]interface{})
+
+	rawSlotBody, _ := json.Marshal(slot["body"])
+	return slotStatus, slotBody, string(rawSlotBody)
 }
 
 func mustBool(t *testing.T, m map[string]interface{}, key string) bool {
@@ -205,7 +250,7 @@ func TestWarm_LeavesOtherScopesUntouched(t *testing.T) {
 		{"scope":"target","id":"t1","payload":{"v":1}},
 		{"scope":"target","id":"t2","payload":{"v":2}}
 	]}`
-	code, out, _ := doRequest(t, h, "POST", "/warm", body)
+	code, out, _ := doAdminRequest(t, h, "/warm", body)
 	if code != 200 {
 		t.Fatalf("code=%d want 200", code)
 	}
@@ -225,7 +270,7 @@ func TestWarm_DuplicateIDInSameScope(t *testing.T) {
 		{"scope":"s","id":"a","payload":{"v":1}},
 		{"scope":"s","id":"a","payload":{"v":2}}
 	]}`
-	code, _, _ := doRequest(t, h, "POST", "/warm", body)
+	code, _, _ := doAdminRequest(t, h, "/warm", body)
 	if code != 409 {
 		t.Fatalf("code=%d want 409", code)
 	}
@@ -234,7 +279,7 @@ func TestWarm_DuplicateIDInSameScope(t *testing.T) {
 func TestWarm_MissingScopeOnItem(t *testing.T) {
 	h, _ := newTestHandler(10)
 	body := `{"items":[{"id":"a","payload":{"v":1}}]}`
-	code, _, _ := doRequest(t, h, "POST", "/warm", body)
+	code, _, _ := doAdminRequest(t, h, "/warm", body)
 	if code != 400 {
 		t.Fatalf("code=%d want 400", code)
 	}
@@ -249,7 +294,7 @@ func TestRebuild_WipesExistingScopes(t *testing.T) {
 	_, _ = old.appendItem(newItem("old", "", nil))
 
 	body := `{"items":[{"scope":"new","id":"n1","payload":{"v":1}}]}`
-	code, out, _ := doRequest(t, h, "POST", "/rebuild", body)
+	code, out, _ := doAdminRequest(t, h, "/rebuild", body)
 	if code != 200 {
 		t.Fatalf("code=%d want 200", code)
 	}
@@ -270,7 +315,7 @@ func TestRebuild_RejectsEmptyItems(t *testing.T) {
 	keep, _ := api.store.getOrCreateScope("keep")
 	_, _ = keep.appendItem(newItem("keep", "k", nil))
 
-	code, _, _ := doRequest(t, h, "POST", "/rebuild", `{"items":[]}`)
+	code, _, _ := doAdminRequest(t, h, "/rebuild", `{"items":[]}`)
 	if code != 400 {
 		t.Fatalf("code=%d want 400 on empty rebuild", code)
 	}
@@ -666,7 +711,7 @@ func TestDeleteScope_Hit(t *testing.T) {
 	_, _, _ = doRequest(t, h, "POST", "/append", `{"scope":"s","id":"a","payload":{"v":1}}`)
 	_, _, _ = doRequest(t, h, "POST", "/append", `{"scope":"s","id":"b","payload":{"v":2}}`)
 
-	code, out, _ := doRequest(t, h, "POST", "/delete_scope", `{"scope":"s"}`)
+	code, out, _ := doAdminRequest(t, h, "/delete_scope", `{"scope":"s"}`)
 	if code != 200 {
 		t.Fatalf("code=%d want 200", code)
 	}
@@ -680,7 +725,7 @@ func TestDeleteScope_Hit(t *testing.T) {
 
 func TestDeleteScope_Miss(t *testing.T) {
 	h, _ := newTestHandler(10)
-	code, out, _ := doRequest(t, h, "POST", "/delete_scope", `{"scope":"nope"}`)
+	code, out, _ := doAdminRequest(t, h, "/delete_scope", `{"scope":"nope"}`)
 	if code != 200 {
 		t.Fatalf("code=%d want 200", code)
 	}
@@ -694,7 +739,7 @@ func TestDeleteScope_Miss(t *testing.T) {
 func TestWipe_EmptyStore(t *testing.T) {
 	h, _ := newTestHandler(10)
 
-	code, out, _ := doRequest(t, h, "POST", "/wipe", "")
+	code, out, _ := doAdminRequest(t, h, "/wipe", "")
 	if code != 200 {
 		t.Fatalf("code=%d want 200", code)
 	}
@@ -715,7 +760,7 @@ func TestWipe_ClearsEveryScope(t *testing.T) {
 	_, _, _ = doRequest(t, h, "POST", "/append", `{"scope":"a","id":"2","payload":{"v":2}}`)
 	_, _, _ = doRequest(t, h, "POST", "/append", `{"scope":"b","id":"1","payload":{"v":1}}`)
 
-	code, out, _ := doRequest(t, h, "POST", "/wipe", "")
+	code, out, _ := doAdminRequest(t, h, "/wipe", "")
 	if code != 200 {
 		t.Fatalf("code=%d want 200", code)
 	}
@@ -748,7 +793,7 @@ func TestWipe_StatsReportEmptyAfterwards(t *testing.T) {
 	h, _ := newTestHandler(10)
 	_, _, _ = doRequest(t, h, "POST", "/append", `{"scope":"s","id":"x","payload":{"v":1}}`)
 
-	_, _, _ = doRequest(t, h, "POST", "/wipe", "")
+	_, _, _ = doAdminRequest(t, h, "/wipe", "")
 
 	_, out, _ := doRequest(t, h, "GET", "/stats", "")
 	if mustFloat(t, out, "scope_count") != 0 {
@@ -762,12 +807,19 @@ func TestWipe_StatsReportEmptyAfterwards(t *testing.T) {
 	}
 }
 
-func TestWipe_GETNotAllowed(t *testing.T) {
+// /wipe is no longer registered on the public mux — it's reachable only
+// via /admin. Direct calls to /wipe (any method) return 404. See
+// guardedflow.md §J.
+func TestWipe_NotPublic(t *testing.T) {
 	h, _ := newTestHandler(10)
 
 	code, _, _ := doRequest(t, h, "GET", "/wipe", "")
-	if code != 405 {
-		t.Fatalf("code=%d want 405", code)
+	if code != 404 {
+		t.Fatalf("GET /wipe code=%d want 404", code)
+	}
+	code, _, _ = doRequest(t, h, "POST", "/wipe", "")
+	if code != 404 {
+		t.Fatalf("POST /wipe code=%d want 404", code)
 	}
 }
 
@@ -777,7 +829,7 @@ func TestWipe_IgnoresBody(t *testing.T) {
 	h, _ := newTestHandler(10)
 	_, _, _ = doRequest(t, h, "POST", "/append", `{"scope":"s","id":"x","payload":{"v":1}}`)
 
-	code, out, _ := doRequest(t, h, "POST", "/wipe", `{"anything":"goes"}`)
+	code, out, _ := doAdminRequest(t, h, "/wipe", `{"anything":"goes"}`)
 	if code != 200 {
 		t.Fatalf("code=%d want 200", code)
 	}
@@ -794,7 +846,7 @@ func TestWipe_FreshWritesAfterwards(t *testing.T) {
 		_, _, _ = doRequest(t, h, "POST", "/append", `{"scope":"s","id":"`+fmt.Sprint(i)+`","payload":{"v":1}}`)
 	}
 
-	_, _, _ = doRequest(t, h, "POST", "/wipe", "")
+	_, _, _ = doAdminRequest(t, h, "/wipe", "")
 
 	// Re-use an id that existed before the wipe — must succeed.
 	code, out, _ := doRequest(t, h, "POST", "/append", `{"scope":"s","id":"0","payload":{"v":42}}`)
@@ -1179,7 +1231,7 @@ func TestIntegration_MixedWorkload_StatsAndInvariants(t *testing.T) {
 		addItem(&rebuildItems, "y", fmt.Sprintf("item_%03d", i), `{"v":1}`)
 	}
 	rebuildItems.WriteString(`]}`)
-	if code, _, body := doRequest(t, h, "POST", "/rebuild", rebuildItems.String()); code != 200 {
+	if code, _, body := doAdminRequest(t, h, "/rebuild", rebuildItems.String()); code != 200 {
 		t.Fatalf("rebuild: code=%d body=%s", code, body)
 	}
 
@@ -1191,7 +1243,7 @@ func TestIntegration_MixedWorkload_StatsAndInvariants(t *testing.T) {
 		addItem(&warmItems, "y", fmt.Sprintf("warm_%03d", i), `{"v":1}`)
 	}
 	warmItems.WriteString(`]}`)
-	if code, _, body := doRequest(t, h, "POST", "/warm", warmItems.String()); code != 200 {
+	if code, _, body := doAdminRequest(t, h, "/warm", warmItems.String()); code != 200 {
 		t.Fatalf("warm: code=%d body=%s", code, body)
 	}
 

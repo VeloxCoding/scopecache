@@ -845,6 +845,9 @@ type Store struct {
 	// through a separate constructor.
 	maxMultiCallBytes int64
 	maxMultiCallCount int
+	// serverSecret is the HMAC key for /guarded. Empty string means
+	// /guarded is disabled (route not registered). See guardedflow.md §I.
+	serverSecret string
 	// totalBytes tracks the running sum of approxItemSize across every item
 	// in every scope. Kept in an atomic so /append can reserve against it
 	// without touching the store-level mutex; writes that would push it past
@@ -867,6 +870,7 @@ func NewStore(c Config) *Store {
 		maxResponseBytes:  c.MaxResponseBytes,
 		maxMultiCallBytes: c.MaxMultiCallBytes,
 		maxMultiCallCount: c.MaxMultiCallCount,
+		serverSecret:      c.ServerSecret,
 	}
 }
 
@@ -925,6 +929,37 @@ func (s *Store) getOrCreateScope(scope string) (*ScopeBuffer, error) {
 	buf = s.newScopeBuffer()
 	s.scopes[scope] = buf
 	return buf, nil
+}
+
+// ensureScope returns the named scope, creating an empty buffer if it
+// does not yet exist. Used by /guarded to lazily provision its internal
+// counter scopes (`_counters_count_calls`, `_counters_count_kb`) without
+// requiring operator pre-provisioning. Idempotent — safe to call on
+// every request; cost is one map lookup under the read-lock when the
+// scope already exists.
+//
+// Unlike getOrCreateScope, this method does not validate the scope name
+// and is intended only for cache-internal infrastructure scopes whose
+// names are compile-time constants.
+func (s *Store) ensureScope(scope string) *ScopeBuffer {
+	s.mu.RLock()
+	buf, ok := s.scopes[scope]
+	s.mu.RUnlock()
+	if ok {
+		return buf
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	buf, ok = s.scopes[scope]
+	if ok {
+		return buf
+	}
+
+	buf = s.newScopeBuffer()
+	s.scopes[scope] = buf
+	return buf
 }
 
 func (s *Store) getScope(scope string) (*ScopeBuffer, bool) {

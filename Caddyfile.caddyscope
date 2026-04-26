@@ -32,6 +32,10 @@
         scope_max_items 100000
         max_store_mb    100
         max_item_mb     1
+        # Enable /guarded by passing the HMAC key. Substituted from the
+        # process env at config-load (see guardedflow.md §I). Empty/unset
+        # would disable /guarded entirely (route returns 404).
+        server_secret   {$SCOPECACHE_SERVER_SECRET}
     }
     # scopecache calls next() for any path it does not recognise; this
     # terminal handler then returns 404 instead of Caddy's default empty
