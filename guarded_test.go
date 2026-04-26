@@ -279,6 +279,77 @@ func TestGuarded_CounterAutoCreate(t *testing.T) {
 	}
 }
 
+// First /guarded call is a read (not a write). Counter scope must
+// auto-create just the same — handleGuarded calls
+// guardedIncrementCounters after the dispatch loop regardless of
+// whether the sub-calls were reads or writes, but no test pinned that
+// to a read code path until now.
+func TestGuarded_CounterCreatesOnFirstRead(t *testing.T) {
+	h, api := newTestHandler(100)
+	provisionTenantScope(t, h, "tok-readfirst", "events")
+	capID := computeCapForTest(testServerSecret, "tok-readfirst")
+
+	// Counter scope must not exist yet.
+	if _, ok := api.store.getScope(countersScopeCalls); ok {
+		t.Fatal("counter scope already exists before first /guarded call")
+	}
+
+	// First /guarded call is a /get, not a /append. The provisioned
+	// scope is empty so /get returns hit:false — that still counts as
+	// cache work and must increment the calls counter.
+	body := `{"token":"tok-readfirst","calls":[{"path":"/get","query":{"scope":"events","id":"none"}}]}`
+	if code, _, raw := doRequest(t, h, "POST", "/guarded", body); code != 200 {
+		t.Fatalf("first /guarded (read) code=%d body=%s", code, raw)
+	}
+
+	// Counter scope now exists; the entry for our capID has value 1.
+	// Use the public /admin /get path instead of poking buf internals
+	// — keeps the test transport-shaped and reuses the dispatch logic
+	// the production code path uses.
+	getBody := `{"calls":[{"path":"/get","query":{"scope":"_counters_count_calls","id":"` + capID + `"}}]}`
+	code, out, raw := doRequest(t, h, "POST", "/admin", getBody)
+	if code != 200 {
+		t.Fatalf("admin get code=%d body=%s", code, raw)
+	}
+	results := out["results"].([]interface{})
+	getResp := results[0].(map[string]interface{})["body"].(map[string]interface{})
+	hit, _ := getResp["hit"].(bool)
+	if !hit {
+		t.Fatalf("counter for capID %q missing (body=%s)", capID, raw)
+	}
+	item := getResp["item"].(map[string]interface{})
+	if v, _ := item["payload"].(float64); int64(v) != 1 {
+		t.Errorf("counter value=%v want 1 (one read)", v)
+	}
+}
+
+// _counters_count_kb skips the increment when the rounded KiB value is
+// 0, so a small /guarded response (well under 1 KiB) must NOT cause
+// the kb counter scope to come into existence. Bookends the calls
+// counter test: calls always increments (so the scope always exists
+// after one call), kb is conditional.
+func TestGuarded_KBCounterSkippedForTinyResponse(t *testing.T) {
+	h, api := newTestHandler(100)
+	provisionTenantScope(t, h, "tok-tiny", "events")
+
+	// One /guarded /append with a 1-byte payload — outer envelope is a
+	// few hundred bytes, way under 1 KiB.
+	body := `{"token":"tok-tiny","calls":[{"path":"/append","body":{"scope":"events","id":"x","payload":1}}]}`
+	if code, _, raw := doRequest(t, h, "POST", "/guarded", body); code != 200 {
+		t.Fatalf("tiny /guarded code=%d body=%s", code, raw)
+	}
+
+	// Calls counter exists (every successful /guarded bumps it).
+	if _, ok := api.store.getScope(countersScopeCalls); !ok {
+		t.Error("_counters_count_calls missing — calls increment must always fire")
+	}
+	// KB counter does NOT exist — sub-1-KiB response triggers the
+	// kb > 0 skip in guardedIncrementCounters.
+	if _, ok := api.store.getScope(countersScopeKB); ok {
+		t.Error("_counters_count_kb created for sub-1-KiB response — kb-skip rule violated")
+	}
+}
+
 // A batch of N sub-calls bumps _counters_count_calls by N (not 1) — the
 // counter measures cache work, not HTTP requests, so a tenant who batches
 // their work consumes the same number of "calls" as a tenant making N
