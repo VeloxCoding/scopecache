@@ -27,6 +27,19 @@ Thin **adapters** wrap the core and are out of scope for this document:
 
 New **cache features** belong in the core and are spec'd here. **Cross-cutting concerns** (auth, identity, per-tenant policy) belong in an adapter and are deliberately not specified in this document.
 
+`/guarded` (§6.4) sits on the boundary and is worth calling out. It is
+*in* the core — a cache feature for application-defined capability
+namespaces — but it is deliberately *not* a request-context-aware auth
+layer. The cache still does not know who the caller is: `/guarded`
+takes an opaque token from the request body, derives a deterministic
+scope prefix from it via HMAC, and rewrites scope names. Whether a
+given token belongs to user X or session Y is a question the cache
+neither asks nor answers; that mapping lives in the integrating
+application or reverse proxy. In other words, `/guarded` is a scope-
+namespace utility — same tier as `/multi_call` — that happens to use
+HMAC to derive the namespace deterministically from a caller-supplied
+input.
+
 ---
 
 ## 2. Core rules
@@ -102,6 +115,7 @@ separate, cache-owned, and surfaces only in `/stats` and
 - per-response cap: `25 MiB` by default, overridable via the `SCOPECACHE_MAX_RESPONSE_MB` environment variable (integer MiB). Applies uniformly to every HTTP response, including `/multi_call`'s outer envelope. Responses that would exceed the cap are rejected with `507`; already-applied side effects are not rolled back (same stance as every other `507` in this cache). Bounds pathological responses from `/tail?limit=10000` over 1 MiB items, multi-tenant `/stats` enumeration, and accumulated `/multi_call` aggregates.
 - per-request body cap (`/multi_call` input): `16 MiB` by default, overridable via the `SCOPECACHE_MAX_MULTI_CALL_MB` environment variable (integer MiB). Independent of the per-response cap (input vs. output are separate concerns).
 - per-batch sub-call count (`/multi_call`): `10` by default, overridable via the `SCOPECACHE_MAX_MULTI_CALL_COUNT` environment variable. Bounds dispatcher work per HTTP request; batches over the cap return `400` for the whole batch (no partial dispatch).
+- HMAC server secret (`/guarded`): supplied via the `SCOPECACHE_SERVER_SECRET` environment variable (no default). The string itself is opaque to the cache — it is the HMAC-SHA256 key used to derive each tenant's `capability_id` from their token (see §6.4). Empty or unset disables `/guarded` entirely (the route is not registered; public callers receive `404`). The standalone binary reads the env var directly; the Caddy module reads the same value via the `server_secret` Caddyfile directive (or JSON config field), typically as a `{$SCOPECACHE_SERVER_SECRET}` substitution so the secret stays out of the Caddyfile itself.
 
 Read limits, per-scope item cap, and store-wide byte cap are separate concerns.
 
@@ -279,16 +293,29 @@ business-timestamp projection.
 
 ```text
 POST /append
-POST /warm
-POST /rebuild
 POST /update
 POST /upsert
 POST /counter_add
 POST /delete
 POST /delete_up_to
+```
+
+Operator-only writes — not exposed on the public mux, reachable only as
+sub-calls inside `/admin` (§6.4):
+
+```text
+POST /warm
+POST /rebuild
 POST /delete_scope
 POST /wipe
 ```
+
+The split exists because these four either replace store-wide state
+(`/warm`, `/rebuild`, `/wipe`) or remove an entire tenant namespace
+(`/delete_scope`) — actions a tenant has no legitimate reason to perform
+on their own data. They keep the same input shape, behaviour, and locks
+as before; the only change is the routing layer. See §6.4 for the
+admin envelope and §F of the design notes for the rationale.
 
 ### `POST /append`
 Input:
@@ -475,6 +502,150 @@ Behavior:
 Response carries `{ "ok", "count", "results", "approx_response_mb", "duration_us" }` — the uniform read-family signature. `count` is `len(results)`. Each `results[i]` is `{"status": <int>, "body": <json value>}` where `body` is **literally** the JSON the standalone endpoint would have produced for that call (same fields, same ordering, same envelope), so a `/get` slot already carries its own `count` / `approx_response_mb` / `duration_us` inside its `body`.
 
 The outer `duration_us` is total dispatcher time including all sub-calls; per-slot timing lives inside each slot's body where the standalone endpoint already puts it.
+
+---
+
+## 6.4 Operator and tenant gateways
+
+```text
+POST /admin
+POST /guarded
+```
+
+Both endpoints share `/multi_call`'s envelope shape (`{"calls": [...]}`,
+results array out) and dispatcher loop. They differ in two axes:
+
+- **Whitelist.** `/admin` opens up store-wide and reserved-scope
+  operations; `/guarded` narrows to the per-scope subset a tenant can
+  meaningfully self-serve.
+- **Trust model.** `/admin` is gated *outside* the cache (socket
+  permissions + reverse-proxy ACL) and reaches reserved scopes (§6.5)
+  unmodified. `/guarded` is gated *inside* the cache: an opaque token
+  in the request body is HMAC'd against `SCOPECACHE_SERVER_SECRET` to
+  derive a per-tenant scope prefix, every sub-call's `scope` is rewritten
+  to that prefix, and the rewritten scope must already exist
+  (operator-provisioned via `/admin`) or the whole batch is rejected.
+
+### `POST /admin`
+
+Operator-elevated multi-call gateway. Same envelope shape as
+`/multi_call`. No body-level auth — the caller is trusted because they
+reached the listener (Unix socket permissions, or a Caddyfile that
+restricts `/admin` to the operator's source IP / mTLS cert / forward-auth
+result, depending on deployment).
+
+Whitelist (closed):
+
+- per-scope/per-item ops: `/append`, `/get`, `/head`, `/tail`,
+  `/ts_range`, `/update`, `/upsert`, `/counter_add`, `/delete`,
+  `/delete_up_to`, `/delete_scope`, `/render`
+- store-wide ops: `/warm`, `/rebuild`, `/wipe`
+- aggregate reads: `/stats`, `/delete_scope_candidates`
+
+Excluded: `/help` (text/plain), `/multi_call`, `/guarded`, `/admin`
+itself — all would either return non-JSON, double-dispatch, or loop.
+
+`/admin` differs from `/multi_call` in three places:
+
+- **Wider whitelist** — store-wide ops are reachable here and only here.
+- **Reaches reserved scopes** — sub-calls inside `/admin` bypass the
+  reserved-prefix block (§6.5), so the operator can provision tenant
+  namespaces (`_guarded:<capability_id>:*`) by writing through `/admin`
+  /upsert. Public endpoints (and `/guarded`'s post-rewrite paths) cannot
+  write to reserved scopes; only `/admin` can.
+- **Body cap** is the bulk-request cap (§4) — wide enough to carry a
+  full `/rebuild` payload — instead of `/multi_call`'s 16 MiB.
+
+### `POST /guarded`
+
+Tenant-facing multi-call gateway. Body shape:
+
+```json
+{
+  "token": "<opaque token chosen by integrator>",
+  "calls": [{ "path": "/append", "body": { ... } }, ...]
+}
+```
+
+Whitelist (closed): `/append`, `/get`, `/head`, `/tail`, `/ts_range`,
+`/update`, `/upsert`, `/counter_add`, `/delete`, `/delete_up_to`,
+`/render`. Tenants cannot run `/delete_scope` (would deprovision their
+own namespace), `/stats` or `/delete_scope_candidates` (cross-tenant
+visibility), or any store-wide op.
+
+Per-request validation (whole-batch reject on any failure):
+
+1. `token` is required (`401` on empty/missing).
+2. Every sub-call's `path` must be in the whitelist.
+3. For each sub-call: `capability_id = hex(HMAC_SHA256(SCOPECACHE_SERVER_SECRET, token))`
+   (lowercase, 64 hex chars). The cache rewrites `scope` (in body or
+   query) to `_guarded:<capability_id>:<original-scope>`.
+4. Each rewritten scope must already exist in the store. If not, the
+   whole batch is rejected with `400 scope_not_provisioned` and no
+   sub-call runs. This is the load-bearing security check: tenant
+   isolation depends on the operator pre-provisioning every legitimate
+   `_guarded:<capability_id>:*` scope via `/admin`. A forged token
+   produces a deterministic-but-different `capability_id`, names a
+   scope that was never provisioned, and is rejected.
+
+Sub-calls then dispatch through the same loop as `/admin`/`/multi_call`,
+with two extra steps:
+
+- **Response stripping.** Before each result body is appended to the
+  outer envelope, the cache parses the body's JSON, walks
+  `body.item.scope` and `body.items[].scope`, and strips the
+  `_guarded:<capability_id>:` prefix back to the original scope name.
+  Tenants only ever see the scope names they sent — the rewritten form
+  never leaves the cache. (The strip is parse-and-walk, not
+  string-replace, so a payload that happens to contain the prefix
+  literal is left untouched.)
+- **Usage counters.** After each request the cache calls `counterAdd`
+  on two reserved scopes — `_counters_count_calls` (one per
+  `capability_id` per request) and `_counters_count_kb` (KiB of
+  outer-envelope response bytes per request). Both scopes auto-create
+  on first use via `ensureScope` and are queryable through `/admin`
+  `/tail` for usage tracking. Counter failures are silently ignored —
+  this is observability, not auth.
+
+Failure modes:
+
+- Empty token → `401` envelope-level (no body shape echo).
+- Path outside the whitelist → `400` envelope-level, naming the offending
+  index (`calls[2]: path '/wipe' not allowed`).
+- Sub-call missing `scope` → `400 missing 'scope'`. Every `/guarded`
+  sub-call must address a scope; calls that don't take one (e.g.
+  `/stats`) aren't on the whitelist.
+- Rewritten scope not provisioned → `400 scope_not_provisioned`, naming
+  the offending index and the rewritten scope.
+- Body over `SCOPECACHE_MAX_MULTI_CALL_MB`, count over
+  `SCOPECACHE_MAX_MULTI_CALL_COUNT`, response over
+  `SCOPECACHE_MAX_RESPONSE_MB` → same as `/multi_call` (§6.3).
+
+`/guarded` is registered only when `SCOPECACHE_SERVER_SECRET` is set.
+Empty/unset → the route is not in the mux; `POST /guarded` returns
+`404`. This is the kill-switch: deployments that don't want a tenant
+gateway simply leave the env var unset.
+
+## 6.5 Reserved scopes
+
+Scope names beginning with `_` are reserved for cache-internal use.
+Public write endpoints (`/append`, `/upsert`, `/update`, `/counter_add`,
+`/delete`, `/delete_up_to`) and `/guarded`'s post-rewrite handlers
+reject reserved-scope writes with `400 reserved scope prefix`. Reads
+through public endpoints are likewise blocked.
+
+`/admin` is the only path that bypasses the reservation — its
+sub-calls run with an internal admin context-marker on the synthetic
+request, telling the inner handler to skip the prefix check. This is
+how the operator provisions `_guarded:<capability_id>:*` for tenant
+onboarding and how `/guarded` itself increments its
+`_counters_count_calls` / `_counters_count_kb` scopes (which run
+through the same admin-context dispatcher under the hood).
+
+The cache does not interpret the bytes after `_` — `_guarded:`,
+`_counters_*`, and any future internal namespace are conventions the
+core wires up, not parsed prefixes. Operators should avoid the `_`
+prefix in their own scope-naming schemes to keep the boundary clean.
 
 ---
 
@@ -1303,3 +1474,221 @@ Response (trimmed to two scopes for readability — the real response carries ev
 ```
 
 `approx_store_mb` and `max_store_mb` pair so a client can compute headroom in one call. Per-scope `read_count_total` is the lifetime read count; `last_7d_read_count` is the rolling 7-day read count that drives `/delete_scope_candidates`.
+
+### 13.22 Admin (operator-elevated multi-call)
+
+`/admin` is the only path that can write to reserved scopes (anything
+starting with `_`), and the only path that can run store-wide ops
+(`/wipe`, `/warm`, `/rebuild`, `/delete_scope`). Typical first call
+after process start: provision a new tenant's namespace.
+
+```bash
+curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/admin \
+  -H "Content-Type: application/json" \
+  -d '{
+    "calls": [
+      { "path": "/upsert", "body": {
+          "scope":   "_guarded:14071b366a5fa1d421678c6449fff66329dc10618b0e5785893e2db4ea2712d3:events",
+          "id":      "_provisioned",
+          "payload": { "t": 1 }
+      }}
+    ]
+  }'
+```
+
+Response:
+
+```json
+{
+  "ok": true,
+  "count": 1,
+  "results": [
+    {
+      "status": 200,
+      "body": {
+        "ok": true,
+        "created": true,
+        "item": {
+          "scope": "_guarded:14071b366a5fa1d421678c6449fff66329dc10618b0e5785893e2db4ea2712d3:events",
+          "id":    "_provisioned",
+          "seq":   1,
+          "payload": { "t": 1 }
+        },
+        "duration_us": 568
+      }
+    }
+  ],
+  "duration_us": 756,
+  "approx_response_mb": 0.0003
+}
+```
+
+The `_provisioned` sentinel item has no semantic meaning — the cache
+checks scope *existence*, not item presence, so any single item is
+enough to bring the scope into being. The hex string in the scope name
+is the tenant's `capability_id` (see §6.4): `hex(HMAC_SHA256(server_secret,
+token))`, computed by the operator the same way `/guarded` does at request
+time. As long as both sides feed the same secret and token into HMAC-SHA256,
+the rewritten scope names match.
+
+`/wipe` reachable only here:
+
+```bash
+curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/admin \
+  -H "Content-Type: application/json" \
+  -d '{"calls":[{"path":"/wipe"}]}'
+```
+
+```json
+{
+  "ok": true,
+  "count": 1,
+  "results": [
+    {
+      "status": 200,
+      "body": {
+        "ok": true,
+        "deleted_scopes": 0,
+        "deleted_items": 0,
+        "freed_mb": 0.0000,
+        "duration_us": 1
+      }
+    }
+  ],
+  "duration_us": 644,
+  "approx_response_mb": 0.0002
+}
+```
+
+A `POST /admin` call whose `calls[]` references a path outside the
+admin whitelist (`/multi_call`, `/guarded`, `/admin`, `/help`)
+rejects the whole batch with a `400` envelope-level error and runs
+none of the sub-calls.
+
+### 13.23 Guarded (tenant-facing multi-call)
+
+After the operator has provisioned `_guarded:<capability_id>:events` via
+`/admin` (above), the tenant can address that scope by its short name.
+The cache rewrites the scope to the prefixed form on the way in and
+strips the prefix on the way out — the tenant only ever sees `"events"`.
+
+Append:
+
+```bash
+curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/guarded \
+  -H "Content-Type: application/json" \
+  -d '{
+    "token": "tenant-A-token",
+    "calls": [
+      { "path": "/append", "body": {
+          "scope":   "events",
+          "id":      "e1",
+          "payload": { "text": "hello" }
+      }}
+    ]
+  }'
+```
+
+Response (note the `scope` in the slot's `item` reads `"events"`, not
+`_guarded:14071b…:events`):
+
+```json
+{
+  "ok": true,
+  "count": 1,
+  "results": [
+    {
+      "status": 200,
+      "body": {
+        "ok": true,
+        "item": { "scope": "events", "id": "e1", "seq": 2, "payload": { "text": "hello" } },
+        "duration_us": 8
+      }
+    }
+  ],
+  "duration_us": 144,
+  "approx_response_mb": 0.0002
+}
+```
+
+Read it back:
+
+```bash
+curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/guarded \
+  -H "Content-Type: application/json" \
+  -d '{
+    "token": "tenant-A-token",
+    "calls": [{ "path": "/get", "query": { "scope": "events", "id": "e1" } }]
+  }'
+```
+
+```json
+{
+  "ok": true,
+  "count": 1,
+  "results": [
+    {
+      "status": 200,
+      "body": {
+        "ok": true,
+        "hit": true,
+        "count": 1,
+        "item": { "scope": "events", "id": "e1", "seq": 2, "payload": { "text": "hello" } },
+        "duration_us": 5,
+        "approx_response_mb": 0.0002
+      }
+    }
+  ],
+  "duration_us": 92,
+  "approx_response_mb": 0.0002
+}
+```
+
+A forged token whose HMAC names a scope that was never provisioned is
+rejected up-front with `400` — no sub-call runs:
+
+```bash
+curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/guarded \
+  -H "Content-Type: application/json" \
+  -d '{
+    "token": "random-attacker",
+    "calls": [{"path":"/append","body":{"scope":"events","payload":"junk"}}]
+  }'
+```
+
+```json
+{
+  "ok": false,
+  "error": "calls[0]: scope '_guarded:b4bfb82f45b123de68a8c0ef51a90930c43c56e176a1d0593cae8ee7b1cb994d:events' is not provisioned",
+  "duration_us": 108
+}
+```
+
+Note the rewritten scope appears in this error message: that is
+deliberate, so an operator debugging a misconfigured tenant can match
+the rejected name against `/admin` `/stats`. Tenants only see this when
+they target a scope the operator has not provisioned for them — i.e.
+when something is already wrong. Successful responses still strip the
+prefix.
+
+Other envelope-level failures (omitted for brevity, all `400` unless
+noted):
+
+- `token` missing or empty → `401`, `the 'token' field is required`.
+- `calls[i].path` outside the whitelist (e.g. `/wipe`, `/delete_scope`,
+  `/stats`) → `path 'X' (calls[i]) is not allowed in /guarded`.
+- `calls[i]` with no `scope` in body or query → `calls[i]: missing
+  'scope'`.
+
+After each successful `/guarded` request, two reserved scopes get an
+atomic counter increment:
+
+- `_counters_count_calls`, item id = `<capability_id>`, value += 1
+- `_counters_count_kb`, item id = `<capability_id>`, value += response
+  KiB
+
+Both scopes auto-create on first hit and survive `/wipe` (next call
+auto-recreates them). Operators read them via `/admin` `/tail` for
+per-tenant usage tracking. Counter writes are best-effort — a counter
+failure is silently swallowed and does not affect the tenant's
+response, since this is an observability signal, not auth.

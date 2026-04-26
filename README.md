@@ -97,9 +97,15 @@ The rule: new **cache features** go into the core. **Cross-cutting concerns** (a
 
 ## Authorization
 
-Scopecache itself does not interpret authentication, validate credentials, or rewrite scope names — scopes are opaque strings the cache stores and serves verbatim. Access control is defined entirely by the integrating application or reverse proxy, through naming conventions on scope strings combined with which endpoints are exposed externally. Possession of a scope name (or of a token an integrator translates into a scope prefix) *is* the capability. This pattern is **application-defined capability namespaces** — also called **authorization-by-naming-convention at the integration layer**.
+Scopecache itself does not interpret authentication or validate credentials — scopes are opaque strings the cache stores by name. Access control is defined by the integrating application or reverse proxy, through naming conventions on scope strings combined with which endpoints are exposed externally. Possession of a scope name (or of a token an integrator translates into a scope prefix) *is* the capability. This pattern is **application-defined capability namespaces** — also called **authorization-by-naming-convention at the integration layer**.
 
-A typical deployment: the application server issues a bearer token to a client; the client returns it on each request; Caddy rewrites the scope to prepend the token before forwarding to scopecache. A client `GET /render?scope=privatethread:432` carrying `Authorization: Bearer aaa-bbb-ccc` reaches scopecache as `GET /render?scope=aaa-bbb-ccc:privatethread:432`. The token never appears in the cache's logic — only in the integrator's rewrite step.
+scopecache supports two ways to apply this pattern. They are deployable separately or together; pick whichever fits the workload.
+
+**1. Reverse-proxy rewrite (no `server_secret` needed).** The integrator does the scope rewrite outside the cache. Application server issues a bearer token, client returns it on each request, Caddy/nginx prepends it to the scope before forwarding. A client `GET /render?scope=privatethread:432` carrying `Authorization: Bearer aaa-bbb-ccc` reaches scopecache as `GET /render?scope=aaa-bbb-ccc:privatethread:432`. The cache sees only opaque scope strings; the token never appears in cache logic. The Caddy helper `scopecache_bearer_prefix` ([Helpers](#helpers-optional-caddy-middleware)) automates this rewrite. Fits when you already have a proxy doing token validation, when public reads need to be cacheable at the proxy layer, or when integrators want full control over the prefix shape.
+
+**2. Built-in `/guarded` gateway (requires `server_secret`).** scopecache itself does the rewrite. Tenant POSTs to `/guarded` with `{"token": "...", "calls": [...]}`; the cache derives a deterministic 64-hex `capability_id = HMAC_SHA256(server_secret, token)` and rewrites every sub-call's scope to `_guarded:<capability_id>:<original-scope>`. The rewritten scope must already exist in the store (operator pre-provisions it via `/admin`) or the whole batch is rejected — possession of *any* token is not enough; only tokens whose HMAC names a provisioned scope can land. Responses get the prefix stripped before the tenant sees them. Fits when no proxy is doing token validation, when revocation is needed (delete the provisioned scope and the token is dead), or when usage tracking per token is wanted (the cache auto-counts calls and KiB per `capability_id`). See [Multi-tenant gateways](#multi-tenant-gateways) below for curl examples and the [spec §6.4](scopecache-rfc.md) for the full contract.
+
+The two patterns compose: a deployment can let internal services use the proxy-rewrite path (cheap, cacheable) while exposing `/guarded` to external API tenants (revocable, usage-tracked).
 
 ## Helpers (optional Caddy middleware)
 
@@ -107,7 +113,7 @@ scopecache's core stays minimal — append, read, address, update, delete, repla
 
 Concrete examples:
 
-- **`scopecache_bearer_prefix`** — reads `Authorization: Bearer <token>` and prepends `<token>:` to the scope, so an authenticated client's `privatethread:432` becomes `aaa-bbb-ccc:privatethread:432` before reaching scopecache (the pattern from *Authorization* above).
+- **`scopecache_bearer_prefix`** — reads `Authorization: Bearer <token>` and prepends `<token>:` to the scope, so an authenticated client's `privatethread:432` becomes `aaa-bbb-ccc:privatethread:432` before reaching scopecache (the proxy-rewrite pattern from *Authorization* above). Functionally overlaps with the built-in `/guarded` gateway — pick `bearer_prefix` when you want every standard public endpoint (`/render`, `/tail`, `/get`, …) to be cacheable through the proxy with no envelope; pick `/guarded` when you want HMAC-derived prefixes, scope-existence enforcement, response stripping, or per-tenant usage counters.
 - **`scopecache_pop`** — read-and-delete in one Caddyfile directive for write-buffer drain workers, combining `/tail` and `/delete_up_to`.
 - **`scopecache_scope_rewrite`** — generic scope templating from Caddy placeholders (`{remote_host}`, cookie values, header values, …); the bearer-prefix helper is a special case.
 
@@ -193,12 +199,13 @@ Minimal Caddyfile:
         scope_max_items 100000
         max_store_mb    100
         max_item_mb     1
+        server_secret   {$SCOPECACHE_SERVER_SECRET}
     }
     respond 404
 }
 ```
 
-All three `scopecache { ... }` subdirectives are optional; omit any of them to fall back to the compile-time default. See [Caddyfile.caddyscope](Caddyfile.caddyscope) for a working example and [Dockerfile.caddyscope](Dockerfile.caddyscope) for the xcaddy build recipe.
+All `scopecache { ... }` subdirectives are optional; omit any of them to fall back to the compile-time default. `server_secret` enables the `/guarded` tenant gateway (see [Multi-tenant gateways](#multi-tenant-gateways) below); leaving it empty or unset disables `/guarded` entirely. The `{$SCOPECACHE_SERVER_SECRET}` substitution reads the value from the process environment at config-load — recommended over inlining the secret in the Caddyfile. See [Caddyfile.caddyscope](Caddyfile.caddyscope) for a working example and [Dockerfile.caddyscope](Dockerfile.caddyscope) for the xcaddy build recipe.
 
 ## Quickstart (Linux VPS)
 
@@ -271,6 +278,7 @@ Environment=SCOPECACHE_SOCKET_PATH=/run/scopecache/scopecache.sock
 Environment=SCOPECACHE_SCOPE_MAX_ITEMS=100000
 Environment=SCOPECACHE_MAX_STORE_MB=100
 Environment=SCOPECACHE_MAX_ITEM_MB=1
+EnvironmentFile=-/etc/scopecache.env
 RuntimeDirectory=scopecache
 RuntimeDirectoryMode=0750
 Restart=on-failure
@@ -279,7 +287,7 @@ Restart=on-failure
 WantedBy=multi-user.target
 ```
 
-All four `SCOPECACHE_*` variables are listed explicitly so every capacity knob is visible and tunable in one place — remove any line to fall back to the compile-time default. The socket lives under a systemd-managed `RuntimeDirectory` (`/run/scopecache/`), which is created at service start and cleaned up on stop.
+The four `SCOPECACHE_*` capacity variables are listed explicitly so every knob is visible and tunable in one place — remove any line to fall back to the compile-time default. `EnvironmentFile=-/etc/scopecache.env` (with the leading `-` so the unit still starts when the file is absent) is the recommended way to inject `SCOPECACHE_SERVER_SECRET` for the `/guarded` tenant gateway: keep the secret in `/etc/scopecache.env` (mode `0600`, owned by the `scopecache` user) instead of a world-readable unit file. The socket lives under a systemd-managed `RuntimeDirectory` (`/run/scopecache/`), which is created at service start and cleaned up on stop.
 
 Then:
 
@@ -426,7 +434,7 @@ Contract: hit returns `200` with the raw payload bytes; miss returns `404` with 
 
 ### Other endpoints
 
-`/head`, `/tail`, `/ts_range`, `/warm`, `/rebuild`, `/update`, `/upsert`, `/counter_add`, `/delete`, `/delete_up_to`, `/delete_scope`, `/wipe`, `/multi_call`, `/delete_scope_candidates`, `/stats`, `/help` — see section 13 of the [spec](scopecache-rfc.md) for full examples.
+`/head`, `/tail`, `/ts_range`, `/update`, `/upsert`, `/counter_add`, `/delete`, `/delete_up_to`, `/multi_call`, `/delete_scope_candidates`, `/stats`, `/help` — see section 13 of the [spec](scopecache-rfc.md) for full examples. `/warm`, `/rebuild`, `/delete_scope`, and `/wipe` are **not** on the public mux; they are reachable only as sub-calls inside `/admin` (see [Multi-tenant gateways](#multi-tenant-gateways) below).
 
 `/ts_range` filters a scope by a client-supplied top-level `ts` (signed int64, milliseconds since unix epoch by convention — the cache is opaque to the unit). At least one of `since_ts` / `until_ts` must be provided; both together form an inclusive `[since_ts, until_ts]` window. Items without a `ts` are excluded. Results are returned in ascending `seq` order — `ts` is a filter, not an ordering key. Responses on `/head`, `/tail`, and `/ts_range` carry `{ "ok", "items", "truncated" }`; `truncated: true` means more matching items exist beyond the returned `limit`. `/ts_range` has **no pagination cursor** because `ts` is mutable (via `/update` / `/upsert`) and non-unique — narrow the window or raise `limit` to fetch more. `ts` is optional on `/append`, `/warm`, `/rebuild`, `/update` (absent = preserve) and `/upsert` (absent = clear, matching its whole-item replace semantics).
 
@@ -437,6 +445,94 @@ Contract: hit returns `200` with the raw payload bytes; miss returns `404` with 
 `/wipe` clears the entire store in one atomic call: every scope, every item, every byte reservation. It takes no request body. The response carries `{"ok", "deleted_scopes", "deleted_items", "freed_mb"}` so a client can verify what was released. The store-wide complement of `/delete_scope` — useful for test teardown, emergency reset, or preparing a fresh slate before a `/rebuild`. The cache never wipes on its own; this is explicitly a client-initiated action.
 
 `/multi_call` dispatches `N` self-contained sub-calls in a single HTTP roundtrip. The body is `{"calls": [{"path": "/get", "query": {...}}, {"path": "/append", "body": {...}}, ...]}`; the response is `{"ok", "count", "results", "approx_response_mb", "duration_us"}` where each `results[i]` is `{"status", "body"}` carrying literally the JSON the standalone endpoint would have produced. Sub-calls run **strictly sequentially**, so a `/get` at index `k+1` observes everything writes at indices `0..k` committed; there is **no cross-call atomicity**, a write at index 0 stays applied even if a later sub-call errors. The whitelist is closed: `/append`, `/get`, `/head`, `/tail`, `/ts_range`, `/update`, `/upsert`, `/counter_add`, `/delete`, `/delete_up_to`, `/delete_scope`, `/stats`, `/delete_scope_candidates`. Store-wide locks (`/warm`, `/rebuild`, `/wipe`), raw-byte `/render`, `text/plain` `/help`, and `/multi_call` itself are excluded — a path outside the whitelist rejects the whole batch with `400`. Use case: collapse the call-count tax for small fanouts ("fetch K known ids", "do a small mixed read+write"). On a loopback Unix socket a 3-call batch typically returns in the low hundreds of microseconds vs. ~1 ms for three separate roundtrips; the gap widens on TCP. See section 13.20 of the [spec](scopecache-rfc.md) for the full contract and a captured example response.
+
+## Multi-tenant gateways
+
+`/admin` and `/guarded` are sibling endpoints that wrap `/multi_call`'s envelope shape with two different trust models. Use them to expose the cache to multiple tenants without writing your own dispatcher.
+
+### `/admin` — operator-elevated multi-call
+
+Same `{"calls": [...]}` body and `{"results": [...]}` response as `/multi_call`. Three things make it different:
+
+- **Wider whitelist.** Includes the four operator-only paths that no longer live on the public mux (`/wipe`, `/warm`, `/rebuild`, `/delete_scope`), plus everything `/multi_call` allows.
+- **Reaches reserved scopes.** Scope names beginning with `_` are blocked on every public endpoint (and on `/guarded`). `/admin` is the one path that can write them — that is how the operator provisions tenant namespaces (`_guarded:<capability_id>:*`) for `/guarded` to hand out.
+- **No body-level auth.** `/admin` trusts that whoever reached the listener was authorised to do so. The deployment story is socket-permission-based on the standalone binary, and Caddyfile-route-restricted on the module path (`@operator { client_ip 10.0.0.0/8 } handle /admin { ... }` or similar). Treat the `/admin` path the same way you would treat root access to `/etc`: gated outside the cache, by the same boundary that gates the rest of the deployment.
+
+Provision a tenant scope:
+
+```bash
+curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/admin \
+  -H "Content-Type: application/json" \
+  -d '{
+    "calls": [
+      { "path": "/upsert", "body": {
+          "scope":   "_guarded:14071b366a5fa1d421678c6449fff66329dc10618b0e5785893e2db4ea2712d3:events",
+          "id":      "_provisioned",
+          "payload": { "t": 1 }
+      }}
+    ]
+  }'
+```
+
+Wipe the store (`/wipe` is reachable only here):
+
+```bash
+curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/admin \
+  -H "Content-Type: application/json" \
+  -d '{"calls":[{"path":"/wipe"}]}'
+```
+
+### `/guarded` — tenant-facing multi-call
+
+Body shape:
+
+```json
+{ "token": "<opaque token>", "calls": [{ "path": "/append", "body": {...} }, ...] }
+```
+
+For each request the cache derives `capability_id = HMAC_SHA256(SCOPECACHE_SERVER_SECRET, token)` (64-char lowercase hex), rewrites every sub-call's `scope` to `_guarded:<capability_id>:<original-scope>`, and verifies that scope already exists. If it does not — because the operator never provisioned it for this token — the whole batch is rejected with `400 scope_not_provisioned` and no sub-call runs. Possession of *any* token is not enough; only tokens whose HMAC names a provisioned scope can land. Response bodies have the prefix stripped before the tenant sees them; the rewritten form never leaves the cache.
+
+Append (after the operator has provisioned `_guarded:14071b…:events` via `/admin` above):
+
+```bash
+curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/guarded \
+  -H "Content-Type: application/json" \
+  -d '{
+    "token": "tenant-A-token",
+    "calls": [
+      { "path": "/append", "body": {
+          "scope":   "events",
+          "id":      "e1",
+          "payload": { "text": "hello" }
+      }}
+    ]
+  }'
+```
+
+Response (the `scope` in the slot's `item` reads `"events"` — the prefix is stripped):
+
+```json
+{
+  "ok": true,
+  "count": 1,
+  "results": [
+    {
+      "status": 200,
+      "body": {
+        "ok": true,
+        "item": { "scope": "events", "id": "e1", "seq": 2, "payload": { "text": "hello" } },
+        "duration_us": 8
+      }
+    }
+  ],
+  "duration_us": 144,
+  "approx_response_mb": 0.0002
+}
+```
+
+Whitelist excludes `/delete_scope` (a tenant cannot deprovision their own namespace), `/stats` and `/delete_scope_candidates` (cross-tenant visibility), and every store-wide op. After each successful request the cache atomically increments two reserved scopes — `_counters_count_calls` and `_counters_count_kb`, item id = `<capability_id>` — for usage tracking; both auto-create on first use and are queryable via `/admin` `/tail`.
+
+`/guarded` is registered only when `SCOPECACHE_SERVER_SECRET` is set. Unset → the route is not in the mux, `POST /guarded` returns `404`. See [§6.4](scopecache-rfc.md) and [§13.22-13.23](scopecache-rfc.md) of the spec for the full contract and worked examples.
 
 ## Configuration
 
@@ -451,6 +547,7 @@ All overrides via environment variables:
 | `SCOPECACHE_MAX_RESPONSE_MB`      | `25`                     | Per-response byte cap (integer MiB)           |
 | `SCOPECACHE_MAX_MULTI_CALL_MB`    | `16`                     | `/multi_call` input body cap (integer MiB)    |
 | `SCOPECACHE_MAX_MULTI_CALL_COUNT` | `10`                     | `/multi_call` max sub-calls per batch         |
+| `SCOPECACHE_SERVER_SECRET`        | *(unset)*                | HMAC key for `/guarded`; empty/unset disables the route |
 
 ## Limits
 
