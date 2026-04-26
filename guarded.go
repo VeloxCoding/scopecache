@@ -246,12 +246,15 @@ func (api *API) handleGuarded(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Step 10: counter increments. Best-effort — failures are silently
-	// ignored (observability counter, not auth). Approximate response
-	// bytes from the slots' bytes used (the outer envelope adds ~256
-	// constant bytes; the granularity at KiB matters less than at
-	// bytes). See guardedflow.md §M.
+	// ignored (observability counter, not auth). Calls counter advances
+	// by len(calls) so a batch of N sub-calls counts as N units of cache
+	// work, matching how the kb counter (which scales with the outer
+	// envelope's byte size) already behaves. Approximate response bytes
+	// from the slots' bytes used (the outer envelope adds ~256 constant
+	// bytes; the granularity at KiB matters less than at bytes).
+	// See guardedflow.md §M.
 	approxKB := (bodyBytesUsed + multiCallEnvelopeOverhead) / 1024
-	api.guardedIncrementCounters(capabilityID, approxKB)
+	api.guardedIncrementCounters(capabilityID, int64(len(calls)), approxKB)
 
 	writeJSONWithMeta(w, http.StatusOK, orderedFields{
 		{"ok", true},
@@ -264,9 +267,11 @@ func (api *API) handleGuarded(w http.ResponseWriter, r *http.Request) {
 // for a /guarded request. Auto-provisions both scopes via ensureScope —
 // self-heals after a /wipe. Failures are silently ignored: this is an
 // observability counter, not auth. See guardedflow.md §M.
-func (api *API) guardedIncrementCounters(capabilityID string, kb int64) {
-	callsBuf := api.store.ensureScope(countersScopeCalls)
-	_, _, _ = callsBuf.counterAdd(countersScopeCalls, capabilityID, 1)
+func (api *API) guardedIncrementCounters(capabilityID string, calls, kb int64) {
+	if calls > 0 {
+		callsBuf := api.store.ensureScope(countersScopeCalls)
+		_, _, _ = callsBuf.counterAdd(countersScopeCalls, capabilityID, calls)
+	}
 
 	if kb > 0 {
 		kbBuf := api.store.ensureScope(countersScopeKB)

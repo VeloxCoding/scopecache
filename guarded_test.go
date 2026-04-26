@@ -248,6 +248,58 @@ func TestGuarded_CounterAutoCreate(t *testing.T) {
 	}
 }
 
+// A batch of N sub-calls bumps _counters_count_calls by N (not 1) — the
+// counter measures cache work, not HTTP requests, so a tenant who batches
+// their work consumes the same number of "calls" as a tenant making N
+// solo /guarded calls.
+func TestGuarded_CounterIncrementsPerSubCall(t *testing.T) {
+	h, _ := newTestHandler(100)
+	provisionTenantScope(t, h, "tok-batch", "events")
+	capID := computeCapForTest(testServerSecret, "tok-batch")
+
+	// Single /guarded request with 3 sub-calls. Counter should land on 3.
+	body := `{"token":"tok-batch","calls":[
+		{"path":"/append","body":{"scope":"events","id":"a","payload":1}},
+		{"path":"/append","body":{"scope":"events","id":"b","payload":2}},
+		{"path":"/append","body":{"scope":"events","id":"c","payload":3}}
+	]}`
+	if code, _, raw := doRequest(t, h, "POST", "/guarded", body); code != 200 {
+		t.Fatalf("batch /guarded code=%d body=%s", code, raw)
+	}
+
+	getBody := `{"calls":[{"path":"/get","query":{"scope":"_counters_count_calls","id":"` + capID + `"}}]}`
+	code, out, raw := doRequest(t, h, "POST", "/admin", getBody)
+	if code != 200 {
+		t.Fatalf("admin get code=%d body=%s", code, raw)
+	}
+	results := out["results"].([]interface{})
+	getResp := results[0].(map[string]interface{})["body"].(map[string]interface{})
+	item := getResp["item"].(map[string]interface{})
+	if v, _ := item["payload"].(float64); int64(v) != 3 {
+		t.Errorf("counter value=%v want 3 (3 sub-calls in one batch)", v)
+	}
+
+	// A second batch of 2 sub-calls should land at 5.
+	body2 := `{"token":"tok-batch","calls":[
+		{"path":"/get","query":{"scope":"events","id":"a"}},
+		{"path":"/get","query":{"scope":"events","id":"b"}}
+	]}`
+	if code, _, raw := doRequest(t, h, "POST", "/guarded", body2); code != 200 {
+		t.Fatalf("second batch code=%d body=%s", code, raw)
+	}
+
+	code, out, _ = doRequest(t, h, "POST", "/admin", getBody)
+	if code != 200 {
+		t.Fatalf("admin get post-second code=%d", code)
+	}
+	results = out["results"].([]interface{})
+	getResp = results[0].(map[string]interface{})["body"].(map[string]interface{})
+	item = getResp["item"].(map[string]interface{})
+	if v, _ := item["payload"].(float64); int64(v) != 5 {
+		t.Errorf("counter value=%v want 5 (3 + 2 sub-calls)", v)
+	}
+}
+
 // After /wipe the counter scopes are gone. The next /guarded call must
 // re-provision them via ensureScope.
 func TestGuarded_CountersSelfHealAfterWipe(t *testing.T) {
