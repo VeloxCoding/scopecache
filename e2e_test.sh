@@ -698,6 +698,60 @@ case $LAST_BODY in
     *) bad "gd: tenant A counter missing: $LAST_BODY" ;;
 esac
 
+# Counter increments per sub-call, not per HTTP request. Tenant A has so
+# far made 2 single-sub-call /guarded requests (append + read back), so
+# the counter sits at 2. Send one batch with 5 sub-calls plus one
+# helper-style single call and verify the counter advances by exactly 6
+# — proving the counter measures cache work, not HTTP request count.
+admin_call_query 'gd: read counter A (before batch)' 200 /get \
+    "{\"scope\":\"_counters_count_calls\",\"id\":\"${TENANT_A_CAP}\"}"
+before=$(printf '%s' "$LAST_BODY" | jq -r '.item.payload')
+say "  -- counter A before 5-sub-call batch: ${before}"
+
+guarded_call 'gd: 5-sub-call batch (single)' 200 "$TENANT_A_TOKEN" /append '{"scope":"events","id":"b1","payload":1}'
+# Single-call helpers send one sub-call. For a 5-sub-call batch we drop
+# down to a raw POST. Quote-and-concat to keep this POSIX sh.
+batch5="{\"token\":\"${TENANT_A_TOKEN}\",\"calls\":["
+batch5="${batch5}{\"path\":\"/append\",\"body\":{\"scope\":\"events\",\"id\":\"b2\",\"payload\":2}},"
+batch5="${batch5}{\"path\":\"/append\",\"body\":{\"scope\":\"events\",\"id\":\"b3\",\"payload\":3}},"
+batch5="${batch5}{\"path\":\"/append\",\"body\":{\"scope\":\"events\",\"id\":\"b4\",\"payload\":4}},"
+batch5="${batch5}{\"path\":\"/append\",\"body\":{\"scope\":\"events\",\"id\":\"b5\",\"payload\":5}},"
+batch5="${batch5}{\"path\":\"/append\",\"body\":{\"scope\":\"events\",\"id\":\"b6\",\"payload\":6}}"
+batch5="${batch5}]}"
+call 'gd: explicit 5-sub-call batch'      200 POST /guarded "$batch5"
+
+admin_call_query 'gd: read counter A (after batch)' 200 /get \
+    "{\"scope\":\"_counters_count_calls\",\"id\":\"${TENANT_A_CAP}\"}"
+after=$(printf '%s' "$LAST_BODY" | jq -r '.item.payload')
+say "  -- counter A after 5-sub-call batch: ${after}"
+
+# Reads happen via /admin (separate counter scope) so they do NOT bump
+# /guarded's _counters_count_calls. Delta is therefore exactly 1 (helper
+# single sub-call) + 5 (explicit batch) = 6.
+expected_delta=6
+actual_delta=$((after - before))
+if [ "$actual_delta" -eq "$expected_delta" ]; then
+    okmsg "gd: counter delta = ${actual_delta} (1 single + 5 batch sub-calls)"
+else
+    bad "gd: counter delta = ${actual_delta}, want ${expected_delta} (before=${before} after=${after})"
+fi
+
+# Whole-batch rejects don't increment. Send a /guarded whose whitelist
+# fails (one slot is /wipe) and confirm the counter is unchanged.
+admin_call_query 'gd: read counter A (before reject)' 200 /get \
+    "{\"scope\":\"_counters_count_calls\",\"id\":\"${TENANT_A_CAP}\"}"
+before_reject=$(printf '%s' "$LAST_BODY" | jq -r '.item.payload')
+call 'gd: rejected batch (no increment)' 400 POST /guarded \
+    "{\"token\":\"${TENANT_A_TOKEN}\",\"calls\":[{\"path\":\"/append\",\"body\":{\"scope\":\"events\",\"payload\":1}},{\"path\":\"/wipe\"}]}"
+admin_call_query 'gd: read counter A (after reject)' 200 /get \
+    "{\"scope\":\"_counters_count_calls\",\"id\":\"${TENANT_A_CAP}\"}"
+after_reject=$(printf '%s' "$LAST_BODY" | jq -r '.item.payload')
+if [ "$before_reject" = "$after_reject" ]; then
+    okmsg "gd: whole-batch reject did not increment counter (still ${after_reject})"
+else
+    bad "gd: rejected batch leaked an increment: ${before_reject} -> ${after_reject}"
+fi
+
 # Missing token → 401.
 call 'gd: missing token'                 401 POST /guarded \
     '{"calls":[{"path":"/get","query":{"scope":"events","id":"x"}}]}'
