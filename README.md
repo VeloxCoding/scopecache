@@ -85,6 +85,46 @@ Two independent ceilings, one in each direction:
 
 *Harness lives in `phase4/` (git-ignored local testbench); measurement notes, caveats, and known artefacts in `phase4/CLAUDE.md`.*
 
+### Phase-4 `/guarded` overhead and counter-scope contention (32 CPU host)
+
+`/guarded` adds non-trivial work on top of a bare `/get`: HMAC-SHA256 of the token, JSON parse + scope rewrite + re-serialize, scope-existence check, sub-call dispatch, response parsing + prefix strip, and two `counterAdd` writes (`_counters_count_calls`, `_counters_count_kb`). The pre-design fear was that the two counter scopes — shared across every tenant — would become a serialisation point at high concurrency: every `/guarded` request takes the same scope-lock for `counterAdd`, so multi-tenant traffic could in principle bottleneck on a write that single-tenant traffic doesn't notice. This bench measures the actual cost on the same harness as the section above, with `wrk` driving four shapes from a sidecar container on the `phase4_default` bridge network (apples-to-apples vs. the wrk numbers above):
+
+| test | conc=50 req/s | conc=200 req/s | p50 (200) | sub-calls/s @ conc=200 |
+|------|--------------:|---------------:|----------:|------------------------:|
+| 1. `GET /get` baseline (50-byte items, no /guarded)            | 83,537 | **113,360** | 1.6 ms | 113,360 |
+| 2. `POST /guarded` 1 sub-call, single tenant                   | 49,990 | **62,796**  | 1.4 ms | 62,796 |
+| 3. `POST /guarded` 10 sub-calls, single tenant (batch)         | 11,248 | **12,212**  | 14.7 ms | **122,123** |
+| 4. `POST /guarded` 1 sub-call, rotating across 10 tenants      | 57,689 | **66,281**  | 2.4 ms | 66,281 |
+
+Bench setup: 10 tenant scopes pre-provisioned via `/admin /warm` (`_guarded:<capId>:bench-data` × 50 items each) plus one public baseline scope (`bench-data-public` × 50 items). Items are 50-byte JSON objects. The PHP-driver bench page at `phase4/app/public/sc/bench_guarded.php` exists for quick UI feedback but underestimates by the same ~70% pattern the README documented earlier (PHP's `curl_multi` adds overhead the cache itself does not pay) — wrk numbers are the real ceiling.
+
+**Three takeaways:**
+
+1. **`/guarded` overhead = ~45% throughput cost.** 113k → 63k req/s (test 1 vs. test 2). That is the price of HMAC + scope rewrite + existence check + dispatch + response strip + 2× counter write. p50 latency cost is small (+0.07 ms at conc=50, roughly flat at conc=200) — the cost shows up in throughput, not per-request wall time.
+
+2. **Batch amortisation puts `/guarded` *above* the `/get` baseline.** Test 3 runs 12,212 batches/s × 10 sub-calls = **122,123 effective sub-calls/s**, slightly faster than the bare-`/get` baseline (113,360). Inside a batch every sub-call goes through the same handler code as a standalone call but pays no per-sub-call HTTP framing cost — only the outer envelope is parsed and serialised once. Tenants who batch effectively get the multi-call discount on top of `/guarded`'s fixed-cost overhead.
+
+3. **The shared counter scopes are NOT a contention bottleneck.** Test 4 (multi-tenant rotation) is *consistently faster* than test 2 (single tenant) at both concurrency points: 57.7k vs. 50.0k at conc=50, 66.3k vs. 62.8k at conc=200. Spreading reads across 10 tenant scopes parallelises the per-scope `RWMutex` for the read side, while the counter-scope write is short enough (one map update + one atomic int64 add under one lock acquisition) that it disappears into the noise. **Pre-v1.0 design verdict:** `_counters_count_calls` / `_counters_count_kb` stay shared across tenants — splitting them per-`capability_id` would be a premature optimisation that the data does not justify.
+
+### Bandwidth-bound vs. request-handling-bound — why `/get` exceeds the published `/render` ceiling
+
+The `/get` baseline above (113,360 req/s) is *higher* than the `/render` ceiling reported earlier in this section (80,962 req/s on the same hardware). That is not a contradiction — it is the two endpoints running into different physical limits:
+
+| endpoint | typical response size (this harness) | bytes/sec @ ceiling | bound by |
+|----------|-------------------------------------:|---------------------:|----------|
+| `/render` (5 KB pre-rendered HTML page) | ~5,000 B | ~400 MB/s | **bandwidth** through the loopback / bridge network — every byte serialised over the socket |
+| `/get` (50-byte item, JSON envelope) | ~250 B | ~28 MB/s | **request handling** — `net/http` framing, accept loop, goroutine wakeup, ServeMux dispatch |
+
+At ~5 KB per response, throughput hits the network's bytes-per-second wall before the cache can do more work — the floor moves with payload size, not with cache-internal complexity. At ~250 B per response the same ceiling is ~14× higher in raw req/s because there are simply fewer bytes to push. The cache-internal cost per request (map lookup, scope lock acquire/release) is sub-microsecond and never the dominant term in either regime.
+
+What this means in practice:
+
+- **`/guarded` on small payloads** (the 63k req/s number above, on 50-byte items) is pure request-handling territory — adding HMAC + rewrite + counter writes pays a structural ~45% throughput tax.
+- **`/guarded` on `/render`-sized payloads** (5 KB HTML pages, not measured here) would hit the same ~400 MB/s bandwidth wall as `/render` does standalone, well before the cache's per-request work becomes visible. The 45% tax above would shrink to single digits — once you are bandwidth-bound, additional CPU work is approximately free.
+- **Anything in between** (~1-2 KB items: small JSON documents, rendered fragments) sits in a transition zone where both terms matter. Worth measuring on the actual workload before assuming either ceiling applies.
+
+The published `/render` ceiling is the right number to quote when the question is "how many bytes/sec can scopecache serve through Caddy"; the `/get` and `/guarded` numbers above are the right ones to quote when the question is "how many cache operations/sec can scopecache dispatch". Both are real, both are measured on the same hardware, and they differ by an order of magnitude because they answer different questions.
+
 ## Architecture
 
 Three layers with clear boundaries:
