@@ -3,6 +3,7 @@ package scopecache
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"sync"
 	"testing"
@@ -987,6 +988,7 @@ func assertBytesInvariant(t *testing.T, s *Store, iter int, label string) {
 
 	s.mu.RLock()
 	var sum int64
+	scopeCount := len(s.scopes)
 	for _, buf := range s.scopes {
 		buf.mu.RLock()
 		sum += buf.bytes
@@ -994,10 +996,15 @@ func assertBytesInvariant(t *testing.T, s *Store, iter int, label string) {
 	}
 	s.mu.RUnlock()
 
+	// Since v0.5.14 totalBytes also includes scopeBufferOverhead per
+	// allocated scope (admission control sees the real per-scope memory
+	// cost). Σ buf.bytes is item-bytes only, so add the overhead per
+	// surviving scope to get the expected counter value.
+	expected := sum + int64(scopeCount)*scopeBufferOverhead
 	total := s.totalBytes.Load()
-	if total != sum {
-		t.Errorf("[%s iter %d] totalBytes=%d but Σ buf.bytes=%d (drift=%d)",
-			label, iter, total, sum, total-sum)
+	if total != expected {
+		t.Errorf("[%s iter %d] totalBytes=%d but expected=%d (Σ buf.bytes=%d + %d×%d overhead, drift=%d)",
+			label, iter, total, expected, sum, scopeCount, scopeBufferOverhead, total-expected)
 	}
 }
 
@@ -1110,6 +1117,83 @@ func TestConfig_WithDefaults(t *testing.T) {
 			t.Errorf("ServerSecret got %q want empty", got.ServerSecret)
 		}
 	})
+}
+
+// Empty-scope spam — a malicious client with auto-create access
+// (e.g., a /guarded tenant under v0.5.12+) creating thousands of
+// empty scopes — must eventually hit the store-byte cap. Pre-v0.5.14
+// this attack was unbounded: scope-buffer overhead was not charged
+// against totalBytes, so 1M empty scopes consumed ~1 GiB while
+// approx_store_mb stayed at 0. This test anchors the bound.
+func TestStore_EmptyScopeSpam_HitsByteCap(t *testing.T) {
+	// Cap big enough for ~10 scopes' worth of overhead, no item room.
+	capBytes := int64(scopeBufferOverhead) * 10
+	s := NewStore(Config{ScopeMaxItems: 100, MaxStoreBytes: capBytes, MaxItemBytes: 1 << 20})
+
+	created := 0
+	var lastErr error
+	for i := 0; i < 100; i++ {
+		_, err := s.getOrCreateScope(fmt.Sprintf("scope_%d", i))
+		if err != nil {
+			lastErr = err
+			break
+		}
+		created++
+	}
+
+	if created >= 100 {
+		t.Fatalf("created %d empty scopes without hitting cap (cap=%d, overhead=%d)",
+			created, capBytes, scopeBufferOverhead)
+	}
+	if lastErr == nil {
+		t.Fatal("expected StoreFullError after the cap is reached")
+	}
+	var stfe *StoreFullError
+	if !errors.As(lastErr, &stfe) {
+		t.Errorf("expected *StoreFullError, got %T: %v", lastErr, lastErr)
+	}
+
+	// totalBytes equals exactly created × overhead — a clean accounting
+	// of pure scope-buffer cost, no items in any scope.
+	wantBytes := int64(created) * scopeBufferOverhead
+	if got := s.totalBytes.Load(); got != wantBytes {
+		t.Errorf("totalBytes=%d want %d (created=%d × overhead=%d)",
+			got, wantBytes, created, scopeBufferOverhead)
+	}
+}
+
+// /delete_scope must release the per-scope overhead, not just the
+// items. Without this, a workload that churns scopes (create, fill,
+// delete, repeat) would slowly leak overhead and eventually 507 even
+// when the store looks empty.
+func TestStore_DeleteScope_ReleasesOverhead(t *testing.T) {
+	s := NewStore(Config{ScopeMaxItems: 100, MaxStoreBytes: int64(scopeBufferOverhead) * 5, MaxItemBytes: 1 << 20})
+
+	// Fill the cap with empty scopes — 5 scopes × overhead = cap.
+	for i := 0; i < 5; i++ {
+		if _, err := s.getOrCreateScope(fmt.Sprintf("s_%d", i)); err != nil {
+			t.Fatalf("getOrCreateScope %d: %v", i, err)
+		}
+	}
+	// 6th must fail.
+	if _, err := s.getOrCreateScope("s_overflow"); err == nil {
+		t.Fatal("expected StoreFullError at scope #6")
+	}
+
+	// Delete one scope — its overhead is released.
+	if _, ok := s.deleteScope("s_0"); !ok {
+		t.Fatal("deleteScope s_0 reported miss")
+	}
+
+	// Now there's room for one more.
+	if _, err := s.getOrCreateScope("s_replaced"); err != nil {
+		t.Fatalf("getOrCreateScope after delete: %v", err)
+	}
+
+	// totalBytes is still exactly 5 × overhead.
+	if got, want := s.totalBytes.Load(), int64(scopeBufferOverhead)*5; got != want {
+		t.Errorf("totalBytes=%d want %d after delete+create cycle", got, want)
+	}
 }
 
 func TestStore_GetScope_Miss(t *testing.T) {
@@ -1284,7 +1368,9 @@ func TestStore_Wipe_ResetsTotalBytes(t *testing.T) {
 // was at its byte cap — the cap budget has been fully released.
 func TestStore_Wipe_FreesHeadroomForNextAppend(t *testing.T) {
 	itemSize := approxItemSize(newItem("s", "", nil))
-	capBytes := itemSize * 3
+	// Cap room for: per-scope overhead (allocated by getOrCreateScope)
+	// + 3 items. The fourth item then exceeds the cap.
+	capBytes := scopeBufferOverhead + itemSize*3
 
 	s := NewStore(Config{ScopeMaxItems: 100, MaxStoreBytes: capBytes, MaxItemBytes: 1 << 20})
 	buf, _ := s.getOrCreateScope("s")
@@ -1300,7 +1386,10 @@ func TestStore_Wipe_FreesHeadroomForNextAppend(t *testing.T) {
 
 	s.wipe()
 
-	buf2, _ := s.getOrCreateScope("s")
+	buf2, err := s.getOrCreateScope("s")
+	if err != nil {
+		t.Fatalf("getOrCreateScope after wipe: %v", err)
+	}
 	if _, err := buf2.appendItem(newItem("s", "", nil)); err != nil {
 		t.Fatalf("append after wipe: %v", err)
 	}
@@ -1355,10 +1444,11 @@ func TestStore_RebuildAll_DetachesOrphanedBuffers(t *testing.T) {
 	if !errors.As(err, &sde) {
 		t.Fatalf("orphan append: got %v, want *ScopeDetachedError", err)
 	}
-	// Counter must still match only the rebuilt scope's item — the orphan
-	// write must not have inflated it.
+	// Counter must still match only the rebuilt scope's item + its
+	// per-scope buffer overhead — the orphan write must not have
+	// inflated it.
 	newBuf, _ := s.getScope("new")
-	if got, want := s.totalBytes.Load(), newBuf.bytes; got != want {
+	if got, want := s.totalBytes.Load(), newBuf.bytes+scopeBufferOverhead; got != want {
 		t.Fatalf("totalBytes=%d want %d (orphan leaked into counter)", got, want)
 	}
 }
@@ -1756,7 +1846,7 @@ func TestBuildReplacementState_SeqFromOne(t *testing.T) {
 // the per-scope ScopeFullError.
 func TestStore_Append_RejectsAtByteCap(t *testing.T) {
 	itemSize := approxItemSize(newItem("s", "", nil))
-	capBytes := itemSize * 3
+	capBytes := scopeBufferOverhead + itemSize*3
 
 	s := NewStore(Config{ScopeMaxItems: 100, MaxStoreBytes: capBytes, MaxItemBytes: 1 << 20})
 	buf, _ := s.getOrCreateScope("s")
@@ -1785,8 +1875,8 @@ func TestStore_Append_RejectsAtByteCap(t *testing.T) {
 	if len(buf.items) != 3 {
 		t.Fatalf("rejected write mutated buffer: len=%d want 3", len(buf.items))
 	}
-	if got := s.totalBytes.Load(); got != itemSize*3 {
-		t.Fatalf("totalBytes=%d want %d after rejected append", got, itemSize*3)
+	if got, want := s.totalBytes.Load(), int64(scopeBufferOverhead)+itemSize*3; got != want {
+		t.Fatalf("totalBytes=%d want %d after rejected append (overhead + 3 items)", got, want)
 	}
 }
 
@@ -1795,7 +1885,7 @@ func TestStore_Append_RejectsAtByteCap(t *testing.T) {
 // into a permanently "full" state.
 func TestStore_Delete_FreesBytes(t *testing.T) {
 	itemSize := approxItemSize(newItem("s", "a", nil))
-	capBytes := itemSize * 2
+	capBytes := scopeBufferOverhead + itemSize*2
 
 	s := NewStore(Config{ScopeMaxItems: 100, MaxStoreBytes: capBytes, MaxItemBytes: 1 << 20})
 	buf, _ := s.getOrCreateScope("s")
@@ -1819,14 +1909,14 @@ func TestStore_Delete_FreesBytes(t *testing.T) {
 	if _, err := buf.appendItem(newItem("s", "c", nil)); err != nil {
 		t.Fatalf("append c after delete: %v", err)
 	}
-	if got := s.totalBytes.Load(); got != itemSize*2 {
-		t.Fatalf("totalBytes=%d want %d after delete+append", got, itemSize*2)
+	if got, want := s.totalBytes.Load(), int64(scopeBufferOverhead)+itemSize*2; got != want {
+		t.Fatalf("totalBytes=%d want %d after delete+append", got, want)
 	}
 }
 
 func TestStore_DeleteUpTo_FreesBytes(t *testing.T) {
 	itemSize := approxItemSize(newItem("s", "", nil))
-	capBytes := itemSize * 3
+	capBytes := scopeBufferOverhead + itemSize*3
 
 	s := NewStore(Config{ScopeMaxItems: 100, MaxStoreBytes: capBytes, MaxItemBytes: 1 << 20})
 	buf, _ := s.getOrCreateScope("s")
@@ -1846,14 +1936,14 @@ func TestStore_DeleteUpTo_FreesBytes(t *testing.T) {
 			t.Fatalf("append after drain %d: %v", i, err)
 		}
 	}
-	if got := s.totalBytes.Load(); got != itemSize*3 {
-		t.Fatalf("totalBytes=%d want %d", got, itemSize*3)
+	if got, want := s.totalBytes.Load(), int64(scopeBufferOverhead)+itemSize*3; got != want {
+		t.Fatalf("totalBytes=%d want %d", got, want)
 	}
 }
 
 func TestStore_DeleteScope_FreesBytes(t *testing.T) {
 	itemSize := approxItemSize(newItem("s", "", nil))
-	capBytes := itemSize * 4
+	capBytes := scopeBufferOverhead + itemSize*4
 
 	s := NewStore(Config{ScopeMaxItems: 100, MaxStoreBytes: capBytes, MaxItemBytes: 1 << 20})
 	buf, _ := s.getOrCreateScope("s")
@@ -1876,7 +1966,7 @@ func TestStore_DeleteScope_FreesBytes(t *testing.T) {
 // byte cap returns StoreFullError without mutating the stored item.
 func TestStore_Update_RejectsGrowAtByteCap(t *testing.T) {
 	small := newItem("s", "a", map[string]interface{}{"v": 1})
-	capBytes := approxItemSize(small) + 8 // room for the small item, not a large replacement
+	capBytes := scopeBufferOverhead + approxItemSize(small) + 8 // room for the small item, not a large replacement
 
 	s := NewStore(Config{ScopeMaxItems: 100, MaxStoreBytes: capBytes, MaxItemBytes: 1 << 20})
 	buf, _ := s.getOrCreateScope("s")
@@ -1912,7 +2002,11 @@ func TestStore_Update_RejectsGrowAtByteCap(t *testing.T) {
 // whole with StoreFullError, and no scope is applied.
 func TestStore_ReplaceScopes_RejectsAtByteCap(t *testing.T) {
 	itemSize := approxItemSize(newItem("s", "", nil))
-	capBytes := itemSize * 3
+	// One scope-buffer overhead (for the pre-seed) + 3 items worth.
+	// The /warm batch needs 2 new scopes (overhead × 2) + 4 items, so
+	// expected post-batch usage = 3 overheads + 5 items, well past
+	// the cap of 1 overhead + 3 items.
+	capBytes := scopeBufferOverhead + itemSize*3
 
 	s := NewStore(Config{ScopeMaxItems: 100, MaxStoreBytes: capBytes, MaxItemBytes: 1 << 20})
 
@@ -1923,8 +2017,8 @@ func TestStore_ReplaceScopes_RejectsAtByteCap(t *testing.T) {
 	}
 	preLen := len(pre.items)
 
-	// Batch adds 4 items worth — store already holds 1, so delta pushes total
-	// to 5×itemSize which exceeds the cap of 3×itemSize.
+	// Batch adds 4 items + 2 new scopes — store already holds 1 item +
+	// 1 scope overhead, so delta pushes total over the cap.
 	grouped := map[string][]Item{
 		"a": {newItem("a", "", nil), newItem("a", "", nil)},
 		"b": {newItem("b", "", nil), newItem("b", "", nil)},
@@ -1950,8 +2044,8 @@ func TestStore_ReplaceScopes_RejectsAtByteCap(t *testing.T) {
 		t.Fatalf("untouched scope mutated: len=%d want %d", len(pre.items), preLen)
 	}
 	preSize := approxItemSize(newItem("untouched", "u", nil))
-	if got := s.totalBytes.Load(); got != preSize {
-		t.Fatalf("totalBytes=%d want %d (only pre-seed should count)", got, preSize)
+	if got, want := s.totalBytes.Load(), int64(scopeBufferOverhead)+preSize; got != want {
+		t.Fatalf("totalBytes=%d want %d (only pre-seed scope+item should count)", got, want)
 	}
 }
 
@@ -1971,10 +2065,13 @@ func TestStore_ReplaceScopes_RejectsAtByteCap(t *testing.T) {
 // appender fits (4 → 5). Anything past that violates the cap.
 func TestStore_ReplaceScopes_StrictCapAgainstConcurrentAppends(t *testing.T) {
 	itemSize := approxItemSize(newItem("s", "x", nil))
-	capBytes := itemSize * 5
+	const appendersPerIter = 16
+	// Per-scope overhead × (1 batch + 16 appenders) + 5 items worth.
+	// Originally just `itemSize*5`; bumped to make room for the
+	// per-scope overhead introduced in v0.5.14.
+	capBytes := scopeBufferOverhead*(appendersPerIter+1) + itemSize*5
 
 	const iterations = 500
-	const appendersPerIter = 16
 
 	for iter := 0; iter < iterations; iter++ {
 		s := NewStore(Config{ScopeMaxItems: 100, MaxStoreBytes: capBytes, MaxItemBytes: 1 << 20})
@@ -2001,7 +2098,17 @@ func TestStore_ReplaceScopes_StrictCapAgainstConcurrentAppends(t *testing.T) {
 			go func() {
 				defer wg.Done()
 				scope := "other" + string(rune('A'+i))
-				buf, _ := s.getOrCreateScope(scope)
+				// getOrCreateScope can fail with StoreFullError when
+				// the per-scope overhead reservation hits the cap;
+				// the test deliberately provisions just enough room
+				// for all appenders, but a tight race may still see
+				// a transient over-cap. Skip on err — the test
+				// asserts the cap-strict invariant on whatever
+				// landed.
+				buf, err := s.getOrCreateScope(scope)
+				if err != nil {
+					return
+				}
 				_, _ = buf.appendItem(newItem(scope, "w", nil))
 			}()
 		}
@@ -2017,15 +2124,18 @@ func TestStore_ReplaceScopes_StrictCapAgainstConcurrentAppends(t *testing.T) {
 				iter, got, capBytes)
 		}
 
-		// Accounting invariant: totalBytes must equal sum of per-scope bytes.
+		// Accounting invariant: totalBytes must equal sum of per-scope
+		// item bytes PLUS scope-buffer overhead × scope count.
 		var sum int64
-		for _, buf := range s.listScopes() {
+		scopes := s.listScopes()
+		for _, buf := range scopes {
 			buf.mu.RLock()
 			sum += buf.bytes
 			buf.mu.RUnlock()
 		}
-		if got != sum {
-			t.Fatalf("iter %d: totalBytes=%d != sum(buf.bytes)=%d", iter, got, sum)
+		expected := sum + int64(len(scopes))*scopeBufferOverhead
+		if got != expected {
+			t.Fatalf("iter %d: totalBytes=%d != Σ buf.bytes + overhead = %d", iter, got, expected)
 		}
 	}
 }
@@ -2034,7 +2144,9 @@ func TestStore_ReplaceScopes_StrictCapAgainstConcurrentAppends(t *testing.T) {
 // rebuild aborts and the prior store is left intact.
 func TestStore_RebuildAll_RejectsAtByteCap(t *testing.T) {
 	itemSize := approxItemSize(newItem("s", "", nil))
-	capBytes := itemSize * 2
+	// Cap fits 1 scope-overhead + 2 items. The /rebuild target tries
+	// 1 scope-overhead + 3 items — should fail by 1 itemSize.
+	capBytes := scopeBufferOverhead + itemSize*2
 
 	s := NewStore(Config{ScopeMaxItems: 100, MaxStoreBytes: capBytes, MaxItemBytes: 1 << 20})
 	pre, _ := s.getOrCreateScope("prior")
@@ -2082,7 +2194,8 @@ func TestStore_RebuildAll_ResetsByteCounter(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	expected := approxItemSize(newItem("new", "n1", nil)) + approxItemSize(newItem("new", "n2", nil))
+	// 1 new scope (overhead) + 2 items.
+	expected := int64(scopeBufferOverhead) + approxItemSize(newItem("new", "n1", nil)) + approxItemSize(newItem("new", "n2", nil))
 	if got := s.totalBytes.Load(); got != expected {
 		t.Fatalf("totalBytes=%d want %d (counter must be reset to new total)", got, expected)
 	}
@@ -2146,15 +2259,19 @@ func TestStore_DeleteScope_RaceWithAppend(t *testing.T) {
 		<-done
 	}
 
-	// Final invariant: s.totalBytes == sum(buf.bytes for every live scope).
-	// Any ghost bytes from the race would inflate totalBytes above the sum.
+	// Final invariant: s.totalBytes == sum(buf.bytes) + scope-overhead
+	// per live scope. Any ghost bytes from the race would inflate
+	// totalBytes above the sum.
 	var liveBytes int64
-	for _, buf := range s.listScopes() {
+	live := s.listScopes()
+	for _, buf := range live {
 		buf.mu.RLock()
 		liveBytes += buf.bytes
 		buf.mu.RUnlock()
 	}
-	if got := s.totalBytes.Load(); got != liveBytes {
-		t.Fatalf("totalBytes=%d but live scopes hold %d bytes — ghost bytes from race", got, liveBytes)
+	expected := liveBytes + int64(len(live))*scopeBufferOverhead
+	if got := s.totalBytes.Load(); got != expected {
+		t.Fatalf("totalBytes=%d but live scopes hold %d bytes + %d overhead = %d (ghost bytes from race)",
+			got, liveBytes, int64(len(live))*scopeBufferOverhead, expected)
 	}
 }

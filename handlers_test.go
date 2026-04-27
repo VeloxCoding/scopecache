@@ -1403,30 +1403,37 @@ func TestIntegration_MixedWorkload_StatsAndInvariants(t *testing.T) {
 	}
 
 	// --- Internal accounting invariants ---
-	// 1. totalBytes matches what we'd compute from current items — proves the
-	//    incremental counter never drifted across the whole workload.
+	// Since v0.5.14 totalBytes also charges per-scope buffer overhead.
+	// scopeOverhead = scope-count × scopeBufferOverhead is added to the
+	// expected counter value.
+	storeScopes := api.store.listScopes()
+	scopeOverhead := int64(len(storeScopes)) * scopeBufferOverhead
+
+	// 1. totalBytes matches what we'd compute from current items + overhead
+	//    — proves the incremental counter never drifted across the workload.
 	var ground int64
-	for _, buf := range api.store.listScopes() {
+	for _, buf := range storeScopes {
 		buf.mu.RLock()
 		for i := range buf.items {
 			ground += approxItemSize(buf.items[i])
 		}
 		buf.mu.RUnlock()
 	}
-	if got := api.store.totalBytes.Load(); got != ground {
-		t.Errorf("totalBytes=%d but recomputed from items=%d (counter drift)", got, ground)
+	if got := api.store.totalBytes.Load(); got != ground+scopeOverhead {
+		t.Errorf("totalBytes=%d but recomputed-from-items+overhead=%d (counter drift)", got, ground+scopeOverhead)
 	}
 
-	// 2. Sum of per-scope b.bytes == store totalBytes. Catches the ghost-bytes
-	//    class of bug where store and scope counters silently diverge.
+	// 2. Sum of per-scope b.bytes + overhead == store totalBytes. Catches
+	//    the ghost-bytes class of bug where store and scope counters
+	//    silently diverge.
 	var sumBufBytes int64
-	for _, buf := range api.store.listScopes() {
+	for _, buf := range storeScopes {
 		buf.mu.RLock()
 		sumBufBytes += buf.bytes
 		buf.mu.RUnlock()
 	}
-	if got := api.store.totalBytes.Load(); got != sumBufBytes {
-		t.Errorf("totalBytes=%d but sum(buf.bytes)=%d", got, sumBufBytes)
+	if got := api.store.totalBytes.Load(); got != sumBufBytes+scopeOverhead {
+		t.Errorf("totalBytes=%d but Σ buf.bytes + overhead=%d", got, sumBufBytes+scopeOverhead)
 	}
 }
 
@@ -1564,7 +1571,9 @@ func TestRace_ParallelMixedWorkload(t *testing.T) {
 	var sumBufBytes, recomputedBytes int64
 	var totalItemsWalked int64
 	var totalReadCount uint64
-	for scopeName, buf := range api.store.listScopes() {
+	storeScopes := api.store.listScopes()
+	scopeOverhead := int64(len(storeScopes)) * scopeBufferOverhead
+	for scopeName, buf := range storeScopes {
 		buf.mu.RLock()
 		sumBufBytes += buf.bytes
 		totalItemsWalked += int64(len(buf.items))
@@ -1604,11 +1613,11 @@ func TestRace_ParallelMixedWorkload(t *testing.T) {
 	if totalItemsWalked != expectedItems {
 		t.Errorf("items-walked-from-store=%d != expectedItems=%d", totalItemsWalked, expectedItems)
 	}
-	if got := api.store.totalBytes.Load(); got != sumBufBytes {
-		t.Errorf("totalBytes=%d != Σ buf.bytes=%d (ghost bytes)", got, sumBufBytes)
+	if got := api.store.totalBytes.Load(); got != sumBufBytes+scopeOverhead {
+		t.Errorf("totalBytes=%d != Σ buf.bytes + overhead=%d (ghost bytes)", got, sumBufBytes+scopeOverhead)
 	}
-	if got := api.store.totalBytes.Load(); got != recomputedBytes {
-		t.Errorf("totalBytes=%d != recomputed-from-items=%d (counter drift)", got, recomputedBytes)
+	if got := api.store.totalBytes.Load(); got != recomputedBytes+scopeOverhead {
+		t.Errorf("totalBytes=%d != recomputed-from-items + overhead=%d (counter drift)", got, recomputedBytes+scopeOverhead)
 	}
 	// /head and /tail are the only read paths the workers use, and both call
 	// recordRead exactly once on a hit. So Σ readCountTotal must equal the

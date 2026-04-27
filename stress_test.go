@@ -217,6 +217,7 @@ func verifyInvariants(t *testing.T, s *Store) {
 	defer s.mu.RUnlock()
 
 	var totalBytesSum int64
+	scopeCount := int64(len(s.scopes))
 	for name, buf := range s.scopes {
 		buf.mu.RLock()
 
@@ -256,9 +257,10 @@ func verifyInvariants(t *testing.T, s *Store) {
 		buf.mu.RUnlock()
 	}
 
-	if got := s.totalBytes.Load(); got != totalBytesSum {
-		t.Errorf("totalBytes=%d != sum(buf.bytes)=%d (drift=%d)",
-			got, totalBytesSum, got-totalBytesSum)
+	expected := totalBytesSum + scopeCount*scopeBufferOverhead
+	if got := s.totalBytes.Load(); got != expected {
+		t.Errorf("totalBytes=%d != sum(buf.bytes)=%d + %d×%d overhead = %d (drift=%d)",
+			got, totalBytesSum, scopeCount, scopeBufferOverhead, expected, got-expected)
 	}
 	if totalBytesSum < 0 {
 		t.Errorf("sum(buf.bytes)=%d is negative", totalBytesSum)

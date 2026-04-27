@@ -929,6 +929,24 @@ func (s *Store) reserveBytes(delta int64) (bool, int64, int64) {
 	}
 }
 
+// scopeBufferOverhead is the byte-cost the cache charges per allocated
+// scope, on top of the scope's items. Covers the *ScopeBuffer struct
+// itself (mutex, slice header, two map headers, heat-bucket
+// ringbuffer, scope-name string in s.scopes), plus slack for the
+// per-key map entry overhead. A conservative single-KiB number.
+//
+// Including it in totalBytes admission control means an attacker
+// holding a valid token who tries to spam empty scopes within their
+// `_guarded:<capId>:*` prefix will hit the store-byte cap (default
+// 100 MiB → ~100k empty scopes) and 507 instead of growing memory
+// unbounded. Without this, totalBytes only counts payload bytes —
+// 1M empty scopes consume ~1 GiB of struct memory but report
+// approx_store_mb = 0.
+//
+// This is also a /stats accuracy improvement: approx_store_mb now
+// matches actual memory pressure, not just item bytes.
+const scopeBufferOverhead = 1024
+
 // newScopeBuffer builds a fresh ScopeBuffer bound to this store so its
 // mutations can participate in byte tracking. Keeping this helper on the
 // store means every production path creates bound buffers; tests that
@@ -958,6 +976,20 @@ func (s *Store) getOrCreateScope(scope string) (*ScopeBuffer, error) {
 	buf, ok = s.scopes[scope]
 	if ok {
 		return buf, nil
+	}
+
+	// Reserve the per-scope overhead before allocating the buffer.
+	// Mirrors how /append reserves item bytes: if the cap can't fit
+	// the new scope, return StoreFullError so the caller surfaces
+	// the standard 507 envelope. Without this an attacker (or a
+	// poorly-written client) could fill the store with empty scopes
+	// while the byte counter stayed at zero.
+	if ok, current, max := s.reserveBytes(scopeBufferOverhead); !ok {
+		return nil, &StoreFullError{
+			StoreBytes: current,
+			AddedBytes: scopeBufferOverhead,
+			Cap:        max,
+		}
 	}
 
 	buf = s.newScopeBuffer()
@@ -1029,9 +1061,10 @@ func (s *Store) deleteScope(scope string) (int, bool) {
 	itemCount := len(buf.items)
 	scopeBytes := buf.bytes
 	delete(s.scopes, scope)
-	if scopeBytes > 0 {
-		s.totalBytes.Add(-scopeBytes)
-	}
+	// Release item bytes AND the per-scope overhead reserved at create
+	// time. Combined into one Add so observers never see a transient
+	// state with one released and the other still charged.
+	s.totalBytes.Add(-(scopeBytes + scopeBufferOverhead))
 	buf.detached = true
 	buf.store = nil
 	buf.mu.Unlock()
@@ -1171,6 +1204,9 @@ func (s *Store) replaceScopes(grouped map[string][]Item) (int, error) {
 	// Phase 1.5 — snapshot per-scope b.bytes (under each scope's RLock so
 	// concurrent in-scope writers are observed consistently), compute the
 	// net batch delta, and CAS-reserve it against the store counter.
+	// Per-scope overhead is reserved here for plans that create a NEW
+	// scope (one not yet in s.scopes); existing scopes already have
+	// their overhead charged from when they were first allocated.
 	var totalDelta int64
 	for i := range plans {
 		var old int64
@@ -1178,6 +1214,10 @@ func (s *Store) replaceScopes(grouped map[string][]Item) (int, error) {
 			buf.mu.RLock()
 			old = buf.bytes
 			buf.mu.RUnlock()
+		} else {
+			// New scope — Phase 2 will create it. Reserve the
+			// per-scope overhead now so the cap check sees it.
+			totalDelta += scopeBufferOverhead
 		}
 		plans[i].oldBytes = old
 		totalDelta += plans[i].newBytes - old
@@ -1240,6 +1280,9 @@ func (s *Store) rebuildAll(grouped map[string][]Item) (int, int, error) {
 		newScopes[scope] = buf
 		totalItems += len(r.items)
 		totalNewBytes += buf.bytes
+		// Per-scope overhead — every scope in the new map gets one
+		// charge, just like getOrCreateScope does on the lazy path.
+		totalNewBytes += scopeBufferOverhead
 	}
 
 	if len(offenders) > 0 {

@@ -138,6 +138,13 @@ func (api *API) handleInbox(w http.ResponseWriter, r *http.Request) {
 	// specific scope names.
 	buf, err := api.store.getOrCreateScope(req.Scope)
 	if err != nil {
+		// Per-scope overhead reservation can fail when the store is
+		// at capacity; surface the standard 507 envelope.
+		var stfe *StoreFullError
+		if errors.As(err, &stfe) {
+			storeFull(w, started, stfe)
+			return
+		}
 		badRequest(w, started, err.Error())
 		return
 	}
