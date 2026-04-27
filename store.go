@@ -578,13 +578,17 @@ func (b *ScopeBuffer) updateBySeq(seq uint64, payload json.RawMessage, ts *int64
 	return 1, nil
 }
 
-func (b *ScopeBuffer) deleteByID(id string) int {
+func (b *ScopeBuffer) deleteByID(id string) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
+	if b.detached {
+		return 0, &ScopeDetachedError{}
+	}
+
 	existing, ok := b.byID[id]
 	if !ok {
-		return 0
+		return 0, nil
 	}
 
 	// items is ordered ascending by seq (monotonic append, no mid-slice
@@ -595,7 +599,7 @@ func (b *ScopeBuffer) deleteByID(id string) int {
 	})
 	if i == len(b.items) || b.items[i].Seq != existing.Seq {
 		// Unreachable under b.mu: b.byID confirmed the item exists and items/bySeq are kept in sync.
-		return 0
+		return 0, nil
 	}
 
 	removedSize := approxItemSize(existing)
@@ -612,15 +616,19 @@ func (b *ScopeBuffer) deleteByID(id string) int {
 	if b.store != nil {
 		b.store.totalBytes.Add(-removedSize)
 	}
-	return 1
+	return 1, nil
 }
 
-func (b *ScopeBuffer) deleteBySeq(seq uint64) int {
+func (b *ScopeBuffer) deleteBySeq(seq uint64) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
+	if b.detached {
+		return 0, &ScopeDetachedError{}
+	}
+
 	if _, ok := b.bySeq[seq]; !ok {
-		return 0
+		return 0, nil
 	}
 
 	// items is ordered ascending by seq (monotonic append, no mid-slice
@@ -629,7 +637,7 @@ func (b *ScopeBuffer) deleteBySeq(seq uint64) int {
 		return b.items[i].Seq >= seq
 	})
 	if i == len(b.items) || b.items[i].Seq != seq {
-		return 0
+		return 0, nil
 	}
 
 	removed := b.items[i]
@@ -646,22 +654,28 @@ func (b *ScopeBuffer) deleteBySeq(seq uint64) int {
 	if b.store != nil {
 		b.store.totalBytes.Add(-removedSize)
 	}
-	return 1
+	return 1, nil
 }
 
 // deleteUpToSeq removes every item with Seq <= maxSeq. b.items is always
 // ordered ascending by Seq (appendItem assigns monotonic seqs and nothing
 // removes from the middle), so binary search finds the cut point in O(log n).
-// Returns the number of items removed.
-func (b *ScopeBuffer) deleteUpToSeq(maxSeq uint64) int {
+// Returns the number of items removed and any *ScopeDetachedError if the
+// buffer was orphaned by /delete_scope, /wipe, or /rebuild before the
+// caller's mutation could land.
+func (b *ScopeBuffer) deleteUpToSeq(maxSeq uint64) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+
+	if b.detached {
+		return 0, &ScopeDetachedError{}
+	}
 
 	idx := sort.Search(len(b.items), func(i int) bool {
 		return b.items[i].Seq > maxSeq
 	})
 	if idx == 0 {
-		return 0
+		return 0, nil
 	}
 
 	var freedBytes int64
@@ -687,7 +701,7 @@ func (b *ScopeBuffer) deleteUpToSeq(maxSeq uint64) int {
 	if b.store != nil {
 		b.store.totalBytes.Add(-freedBytes)
 	}
-	return idx
+	return idx, nil
 }
 
 // tailOffset returns the newest-first window `[start, end)` of b.items and a

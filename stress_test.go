@@ -150,7 +150,7 @@ func TestStress_MixedOps(t *testing.T) {
 				if !ok {
 					continue
 				}
-				_ = buf.deleteByID(fmt.Sprintf("w%d_a%d", wid, rng.Intn(localAppend+1)))
+				_, _ = buf.deleteByID(fmt.Sprintf("w%d_a%d", wid, rng.Intn(localAppend+1)))
 				deletes.Add(1)
 
 			case kind < 975:
@@ -166,7 +166,7 @@ func TestStress_MixedOps(t *testing.T) {
 				}
 				buf.mu.RUnlock()
 				if half > 0 {
-					_ = buf.deleteUpToSeq(half)
+					_, _ = buf.deleteUpToSeq(half)
 				}
 				trims.Add(1)
 

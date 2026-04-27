@@ -560,7 +560,7 @@ func TestDeleteByID_Hit(t *testing.T) {
 	_, _ = buf.appendItem(newItem("s", "a", nil))
 	_, _ = buf.appendItem(newItem("s", "b", nil))
 
-	n := buf.deleteByID("a")
+	n, _ := buf.deleteByID("a")
 	if n != 1 {
 		t.Fatalf("deleted=%d want 1", n)
 	}
@@ -574,7 +574,7 @@ func TestDeleteByID_Hit(t *testing.T) {
 
 func TestDeleteByID_Miss(t *testing.T) {
 	buf := NewScopeBuffer(10)
-	n := buf.deleteByID("missing")
+	n, _ := buf.deleteByID("missing")
 	if n != 0 {
 		t.Fatalf("deleted=%d want 0", n)
 	}
@@ -585,7 +585,7 @@ func TestDeleteByID_DoesNotRollbackLastSeq(t *testing.T) {
 	_, _ = buf.appendItem(newItem("s", "a", nil))
 	_, _ = buf.appendItem(newItem("s", "b", nil))
 
-	_ = buf.deleteByID("b")
+	_, _ = buf.deleteByID("b")
 	next, _ := buf.appendItem(newItem("s", "c", nil))
 	if next.Seq != 3 {
 		t.Fatalf("seq=%d want 3 (no rollback)", next.Seq)
@@ -600,7 +600,7 @@ func TestDeleteBySeq_Hit(t *testing.T) {
 	it2, _ := buf.appendItem(newItem("s", "b", nil))
 	_, _ = buf.appendItem(newItem("s", "c", nil))
 
-	n := buf.deleteBySeq(it2.Seq)
+	n, _ := buf.deleteBySeq(it2.Seq)
 	if n != 1 {
 		t.Fatalf("deleted=%d want 1", n)
 	}
@@ -619,7 +619,7 @@ func TestDeleteBySeq_Miss(t *testing.T) {
 	buf := NewScopeBuffer(10)
 	_, _ = buf.appendItem(newItem("s", "a", nil))
 
-	if n := buf.deleteBySeq(999); n != 0 {
+	if n, _ := buf.deleteBySeq(999); n != 0 {
 		t.Fatalf("deleted=%d want 0", n)
 	}
 	if len(buf.items) != 1 {
@@ -631,7 +631,7 @@ func TestDeleteBySeq_NoIDItem(t *testing.T) {
 	buf := NewScopeBuffer(10)
 	it, _ := buf.appendItem(newItem("s", "", nil))
 
-	if n := buf.deleteBySeq(it.Seq); n != 1 {
+	if n, _ := buf.deleteBySeq(it.Seq); n != 1 {
 		t.Fatalf("deleted=%d want 1", n)
 	}
 	if len(buf.items) != 0 {
@@ -644,7 +644,7 @@ func TestDeleteBySeq_DoesNotRollbackLastSeq(t *testing.T) {
 	_, _ = buf.appendItem(newItem("s", "a", nil))
 	it2, _ := buf.appendItem(newItem("s", "b", nil))
 
-	_ = buf.deleteBySeq(it2.Seq)
+	_, _ = buf.deleteBySeq(it2.Seq)
 	next, _ := buf.appendItem(newItem("s", "c", nil))
 	if next.Seq != 3 {
 		t.Fatalf("seq=%d want 3 (no rollback)", next.Seq)
@@ -659,7 +659,7 @@ func TestDeleteUpToSeq_RemovesPrefix(t *testing.T) {
 		_, _ = buf.appendItem(newItem("s", "", nil))
 	}
 
-	n := buf.deleteUpToSeq(3)
+	n, _ := buf.deleteUpToSeq(3)
 	if n != 3 {
 		t.Fatalf("deleted=%d want 3", n)
 	}
@@ -682,7 +682,7 @@ func TestDeleteUpToSeq_RemovesIDsToo(t *testing.T) {
 	_, _ = buf.appendItem(newItem("s", "b", nil))
 	_, _ = buf.appendItem(newItem("s", "c", nil))
 
-	_ = buf.deleteUpToSeq(2)
+	_, _ = buf.deleteUpToSeq(2)
 
 	if _, ok := buf.byID["a"]; ok {
 		t.Fatal("id 'a' should have been removed from byID")
@@ -704,9 +704,9 @@ func TestDeleteUpToSeq_NoOpBelowRange(t *testing.T) {
 	}
 	// Drop seqs 1..2 first to simulate a post-drain state, then ask to drop
 	// anything <= 2 again. The cut point is already past — expect no-op.
-	_ = buf.deleteUpToSeq(2)
+	_, _ = buf.deleteUpToSeq(2)
 
-	n := buf.deleteUpToSeq(2)
+	n, _ := buf.deleteUpToSeq(2)
 	if n != 0 {
 		t.Fatalf("deleted=%d want 0 (no items at or below seq 2 remain)", n)
 	}
@@ -721,7 +721,7 @@ func TestDeleteUpToSeq_RemovesAllWhenMaxAtOrAboveLast(t *testing.T) {
 		_, _ = buf.appendItem(newItem("s", "", nil))
 	}
 
-	n := buf.deleteUpToSeq(99)
+	n, _ := buf.deleteUpToSeq(99)
 	if n != 3 {
 		t.Fatalf("deleted=%d want 3", n)
 	}
@@ -736,7 +736,7 @@ func TestDeleteUpToSeq_DoesNotRollbackLastSeq(t *testing.T) {
 		_, _ = buf.appendItem(newItem("s", "", nil))
 	}
 
-	_ = buf.deleteUpToSeq(3)
+	_, _ = buf.deleteUpToSeq(3)
 	next, _ := buf.appendItem(newItem("s", "", nil))
 	if next.Seq != 4 {
 		t.Fatalf("seq=%d want 4 (no rollback after draining)", next.Seq)
@@ -759,7 +759,7 @@ func TestDeleteUpToSeq_ReleasesBackingArray(t *testing.T) {
 		t.Fatalf("sanity: pre-drain cap=%d want >= %d", preCap, fill)
 	}
 
-	drained := buf.deleteUpToSeq(uint64(fill - 10))
+	drained, _ := buf.deleteUpToSeq(uint64(fill - 10))
 	if drained != fill-10 {
 		t.Fatalf("drained=%d want %d", drained, fill-10)
 	}
@@ -1253,6 +1253,56 @@ func TestStore_RebuildAll_DetachesOrphanedBuffers(t *testing.T) {
 	}
 }
 
+// Orphan deletes (deleteByID, deleteBySeq, deleteUpToSeq) must surface
+// *ScopeDetachedError rather than silently mutate a buffer no reader
+// can reach. Pre-fix the delete methods skipped the detached check, so
+// a /delete handler that grabbed buf before /delete_scope (or /wipe,
+// or /rebuild) detached it would mutate the orphan and return
+// hit:true,deleted_count:1 to the client — meanwhile the live store
+// either has no such scope or has a freshly-created one with the item
+// still present. The fix returns *ScopeDetachedError; the handlers
+// surface it as 409 Conflict, matching every other write path.
+func TestScopeBuffer_DeletesDetectDetached(t *testing.T) {
+	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+
+	buf, _ := s.getOrCreateScope("s")
+	it1, _ := buf.appendItem(newItem("s", "a", nil))
+	_, _ = buf.appendItem(newItem("s", "b", nil))
+	_, _ = buf.appendItem(newItem("s", "c", nil))
+
+	// Detach by deleting the scope. buf is now an orphan.
+	if _, ok := s.deleteScope("s"); !ok {
+		t.Fatal("deleteScope reported miss on a scope that exists")
+	}
+
+	for _, tc := range []struct {
+		name string
+		fn   func() (int, error)
+	}{
+		{"deleteByID", func() (int, error) { return buf.deleteByID("a") }},
+		{"deleteBySeq", func() (int, error) { return buf.deleteBySeq(it1.Seq) }},
+		{"deleteUpToSeq", func() (int, error) { return buf.deleteUpToSeq(99) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			n, err := tc.fn()
+			var sde *ScopeDetachedError
+			if !errors.As(err, &sde) {
+				t.Fatalf("got err=%v, want *ScopeDetachedError", err)
+			}
+			if n != 0 {
+				t.Errorf("returned n=%d on detached buffer; want 0", n)
+			}
+		})
+	}
+
+	// Counter must remain at zero — orphan deletes must not leak into
+	// totalBytes either way (the b.store guard exists, but with the
+	// detached check we never reach it).
+	if got := s.totalBytes.Load(); got != 0 {
+		t.Errorf("totalBytes=%d want 0 (orphan deletes leaked into counter)", got)
+	}
+}
+
 func TestStore_ReplaceScopes_LeavesOtherScopesUntouched(t *testing.T) {
 	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
 
@@ -1542,7 +1592,7 @@ func TestDeleteByID_ClearsBackingSlot(t *testing.T) {
 	_, _ = buf.appendItem(newItem("s", "b", map[string]interface{}{"marker": "B"}))
 	_, _ = buf.appendItem(newItem("s", "c", map[string]interface{}{"marker": "C"}))
 
-	if n := buf.deleteByID("b"); n != 1 {
+	if n, _ := buf.deleteByID("b"); n != 1 {
 		t.Fatalf("delete: n=%d want 1", n)
 	}
 	if len(buf.items) != 2 {
@@ -1651,7 +1701,7 @@ func TestStore_Delete_FreesBytes(t *testing.T) {
 		t.Fatal("expected StoreFullError at cap")
 	}
 
-	if n := buf.deleteByID("a"); n != 1 {
+	if n, _ := buf.deleteByID("a"); n != 1 {
 		t.Fatalf("deleteByID a: n=%d want 1", n)
 	}
 
@@ -1676,7 +1726,7 @@ func TestStore_DeleteUpTo_FreesBytes(t *testing.T) {
 		}
 	}
 
-	if n := buf.deleteUpToSeq(2); n != 2 {
+	if n, _ := buf.deleteUpToSeq(2); n != 2 {
 		t.Fatalf("deleteUpToSeq: n=%d want 2", n)
 	}
 
