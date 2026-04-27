@@ -1,7 +1,6 @@
 package scopecache
 
 import (
-	"fmt"
 	"net/http"
 	"time"
 )
@@ -66,28 +65,11 @@ func (api *API) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		badRequest(w, started, err.Error())
 		return
 	}
-	if req.Calls == nil {
-		badRequest(w, started, "the 'calls' field is required")
+	// Shape-only validation prologue (nil calls, count cap, response
+	// pre-flight, whitelist) — shared with /multi_call and /guarded.
+	calls, done := api.validateBatchShape(w, started, req.Calls, api.adminCallSpecs, "/admin")
+	if done {
 		return
-	}
-	calls := *req.Calls
-	if len(calls) > api.store.maxMultiCallCount {
-		badRequest(w, started, fmt.Sprintf("the 'calls' array has %d entries; the maximum is %d", len(calls), api.store.maxMultiCallCount))
-		return
-	}
-
-	// Pre-flight response cap (see preflightResponseCap doc).
-	if preflightResponseCap(w, started, len(calls), api.store.maxResponseBytes) {
-		return
-	}
-
-	// Pre-validate the whitelist. Same stance as /multi_call: a bad
-	// path in any slot rejects the whole batch up-front.
-	for i, call := range calls {
-		if _, ok := api.adminCallSpecs[call.Path]; !ok {
-			badRequest(w, started, fmt.Sprintf("path '%s' (calls[%d]) is not allowed in /admin", call.Path, i))
-			return
-		}
 	}
 
 	// Pre-build subURLs and bodies before any side effect can land.

@@ -190,24 +190,24 @@ func (api *API) handleGuarded(w http.ResponseWriter, r *http.Request) {
 		badRequest(w, started, err.Error())
 		return
 	}
-	if req.Calls == nil {
-		badRequest(w, started, "the 'calls' field is required")
-		return
-	}
-	calls := *req.Calls
-	if len(calls) > api.store.maxMultiCallCount {
-		badRequest(w, started, fmt.Sprintf("the 'calls' array has %d entries; the maximum is %d", len(calls), api.store.maxMultiCallCount))
+
+	// Steps 1.5-2: shape-only validation prologue (nil calls, count
+	// cap, response pre-flight, whitelist) — shared with /multi_call
+	// and /admin via validateBatchShape.
+	//
+	// Note: whitelist runs BEFORE the token/auth check (it used to be
+	// step 6, after auth). Same rationale as preflightResponseCap-
+	// before-auth: a misconfigured caller learns the real issue is
+	// request shape, not auth. A whitelist miss leaks no more than the
+	// publicly-documented set of /guarded paths (scopecache-rfc.md
+	// §6.4); auth still fires before any sub-call work or side effect,
+	// which is the load-bearing security guarantee.
+	calls, done := api.validateBatchShape(w, started, req.Calls, api.guardedCallSpecs, "/guarded")
+	if done {
 		return
 	}
 
-	// Pre-flight response cap (see preflightResponseCap doc). Runs
-	// before the token check so a misconfigured tenant doesn't think
-	// auth failed when the real issue is operator-side cap sizing.
-	if preflightResponseCap(w, started, len(calls), api.store.maxResponseBytes) {
-		return
-	}
-
-	// Step 2: extract token.
+	// Step 3: extract token.
 	if req.Token == "" {
 		writeJSONWithDuration(w, http.StatusUnauthorized, orderedFields{
 			{"ok", false},
@@ -216,11 +216,11 @@ func (api *API) handleGuarded(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Step 3-4: compute capability_id and prefix.
+	// Step 4-5: compute capability_id and prefix.
 	capabilityID := computeCapabilityID(api.store.serverSecret, req.Token)
 	prefix := "_guarded:" + capabilityID + ":"
 
-	// Step 5: auth-gate. Single lookup in the _tokens scope: does an
+	// Step 6: auth-gate. Single lookup in the _tokens scope: does an
 	// item with id=capabilityID exist? If yes, this token was issued
 	// by the operator and not revoked. If no (or _tokens itself does
 	// not exist yet), reject the whole batch — no further work runs,
@@ -236,19 +236,11 @@ func (api *API) handleGuarded(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Step 6: whitelist check per call. Whole-batch reject on miss.
-	for i, call := range calls {
-		if _, ok := api.guardedCallSpecs[call.Path]; !ok {
-			badRequest(w, started, fmt.Sprintf("path '%s' (calls[%d]) is not allowed in /guarded", call.Path, i))
-			return
-		}
-	}
-
 	// Step 7: scope rewrite per call. Method-aware — GET sub-calls
 	// must carry scope in the query, POST sub-calls in the body.
-	// Whitelist was already enforced in step 6, so guardedCallSpecs
-	// lookup is guaranteed to hit; the defensive `ok` check just
-	// makes future refactors loud instead of silent.
+	// Whitelist was already enforced in validateBatchShape above, so
+	// guardedCallSpecs lookup is guaranteed to hit; the defensive
+	// `ok` check just makes future refactors loud instead of silent.
 	for i := range calls {
 		spec, ok := api.guardedCallSpecs[calls[i].Path]
 		if !ok {

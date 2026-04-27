@@ -185,6 +185,55 @@ func prepareSubCalls(calls []multiCallEntry, specs map[string]subCallSpec) ([]pr
 	return prepared, nil
 }
 
+// validateBatchShape is the shape-only pre-validation prologue shared
+// by /multi_call, /admin, and /guarded. It performs four checks in
+// order — nil `calls`, count cap, response-cap pre-flight, whitelist
+// — and writes the corresponding error response on the first failure.
+//
+// Returns (calls, false) on success: the dereferenced calls slice for
+// the caller to use, and `done=false` meaning the caller should
+// continue. Returns (nil, true) on failure: a response has already
+// been written, the caller should `return`. Same shape as
+// preflightResponseCap (which it wraps).
+//
+// `endpoint` is interpolated into the whitelist error string so the
+// caller name matches the actual endpoint (`"...not allowed in
+// /multi_call"`, `"...in /admin"`, `"...in /guarded"`). Same closed
+// `specs` map the caller hands to prepareSubCalls — keeping the
+// whitelist source of truth in one place per endpoint.
+//
+// The body cap (decodeBody) is NOT covered: /admin uses the larger
+// bulk-request cap (it must accept a /rebuild body) while /multi_call
+// and /guarded use SCOPECACHE_MAX_MULTI_CALL_MB. Each caller does its
+// own decodeBody before passing the parsed `callsPtr` here.
+func (api *API) validateBatchShape(
+	w http.ResponseWriter,
+	started time.Time,
+	callsPtr *[]multiCallEntry,
+	specs map[string]subCallSpec,
+	endpoint string,
+) ([]multiCallEntry, bool) {
+	if callsPtr == nil {
+		badRequest(w, started, "the 'calls' field is required")
+		return nil, true
+	}
+	calls := *callsPtr
+	if len(calls) > api.store.maxMultiCallCount {
+		badRequest(w, started, fmt.Sprintf("the 'calls' array has %d entries; the maximum is %d", len(calls), api.store.maxMultiCallCount))
+		return nil, true
+	}
+	if preflightResponseCap(w, started, len(calls), api.store.maxResponseBytes) {
+		return nil, true
+	}
+	for i, call := range calls {
+		if _, ok := specs[call.Path]; !ok {
+			badRequest(w, started, fmt.Sprintf("path '%s' (calls[%d]) is not allowed in %s", call.Path, i, endpoint))
+			return nil, true
+		}
+	}
+	return calls, false
+}
+
 // envelope-budgeting constants. multiCallEnvelopeOverhead covers the
 // outer JSON frame (`{"ok":true,"count":N,"approx_response_mb":...,
 // "duration_us":...,"results":[]}`) plus a couple of brackets and
@@ -365,38 +414,18 @@ func (api *API) handleMultiCall(w http.ResponseWriter, r *http.Request) {
 		badRequest(w, started, err.Error())
 		return
 	}
-	if req.Calls == nil {
-		badRequest(w, started, "the 'calls' field is required")
-		return
-	}
-	calls := *req.Calls
-	if len(calls) > api.store.maxMultiCallCount {
-		badRequest(w, started, fmt.Sprintf("the 'calls' array has %d entries; the maximum is %d", len(calls), api.store.maxMultiCallCount))
-		return
-	}
 
-	// Pre-flight: if the per-response cap is too small to fit even an
-	// all-trimmed envelope for this batch size, reject with 507 before
-	// any sub-call runs. Without this check the dispatch loop runs and
-	// every slot trims to a marker, but the accumulated response can
-	// still exceed respCap — the outer capResponse wrapper then 507's
-	// the whole envelope after side effects already landed, and the
-	// client loses the per-slot status info that's the whole point of
-	// /multi_call.
-	if preflightResponseCap(w, started, len(calls), api.store.maxResponseBytes) {
+	// Shape-only validation prologue (nil calls, count cap, response
+	// pre-flight, whitelist). On failure the helper has written the
+	// response and we return; on success `calls` is the dereferenced
+	// slice. Why pre-flight runs here: see preflightResponseCap doc —
+	// without it, the dispatch loop still runs and every slot trims to
+	// a marker, but the accumulated response can still exceed the cap,
+	// and the outer wrapper would 507 the whole envelope after side
+	// effects already landed.
+	calls, done := api.validateBatchShape(w, started, req.Calls, api.multiCallSpecs, "/multi_call")
+	if done {
 		return
-	}
-
-	// Pre-validate the whitelist so a typo in any one path rejects the
-	// whole batch before any side effect lands. Matches the existing
-	// "malformed input rejects the whole request" stance — different
-	// from the "no cross-call atomicity" guarantee, which only applies
-	// to handler-level errors after dispatch begins.
-	for i, call := range calls {
-		if _, ok := api.multiCallSpecs[call.Path]; !ok {
-			badRequest(w, started, fmt.Sprintf("path '%s' (calls[%d]) is not allowed in /multi_call", call.Path, i))
-			return
-		}
 	}
 
 	// Pre-build every subURL and normalised body in a separate pass so
