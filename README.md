@@ -16,7 +16,7 @@ Read endpoints are equally proxyable. Even without `/render`, the regular query 
 >
 > 1. `/admin` is the operator-elevated dispatcher and has no body-level auth — exposing it publicly lets any caller `/wipe` the cache. The Caddy module defaults `enable_admin no`; turn it on only on a trusted listener (localhost-bound, mTLS, or `client_ip` matcher). The standalone Unix-socket binary defaults it on because the socket is already permission-gated by the OS.
 > 2. Public callers should reach **read paths** (`/get`, `/render`, `/head`, `/tail`, `/ts_range`) and possibly `/multi_call` — never the write paths (`/append`, `/upsert`, `/update`, `/counter_add`, `/delete`, `/delete_up_to`). Writes belong on a trusted/internal listener or behind `/guarded` (token-gated, per-tenant scope rewrite).
-> 3. `/stats` and `/delete_scope_candidates` are admin-only since v0.5.17 — they enumerate scope names and would leak `_tokens`, `_guarded:*`, `_counters_*` plus per-scope heat metadata in multi-tenant deployments.
+> 3. `/stats`, `/delete_scope_candidates`, and `/delete_guarded` are admin-only — they enumerate scope names, surface heat metadata, or atomically wipe a tenant's whole namespace, and would leak `_tokens`, `_guarded:*`, `_counters_*` plus per-scope read-heat in multi-tenant deployments.
 
 ## What it is
 
@@ -257,7 +257,7 @@ Minimal Caddyfile:
 
 All `scopecache { ... }` subdirectives are optional; omit any of them to fall back to the compile-time default. `server_secret` enables the `/guarded` tenant gateway (see [Multi-tenant gateways](#multi-tenant-gateways) below); leaving it empty or unset disables `/guarded` entirely. The `{$SCOPECACHE_SERVER_SECRET}` substitution reads the value from the process environment at config-load — recommended over inlining the secret in the Caddyfile.
 
-`/admin` is **not** registered by default on the Caddy module. To enable operator-elevated operations (`/wipe`, `/warm`, `/rebuild`, `/delete_scope`, `/stats`, `/delete_scope_candidates`), add `enable_admin yes` to the block AND restrict the `/admin` path to a trusted matcher — never expose it on a public listener:
+`/admin` is **not** registered by default on the Caddy module. To enable operator-elevated operations (`/wipe`, `/warm`, `/rebuild`, `/delete_scope`, `/delete_guarded`, `/stats`, `/delete_scope_candidates`), add `enable_admin yes` to the block AND restrict the `/admin` path to a trusted matcher — never expose it on a public listener:
 
 ```caddyfile
 :8080 {
@@ -530,7 +530,7 @@ Contract: hit returns `200` with the raw payload bytes; miss returns `404` with 
 
 Same `{"calls": [...]}` body and `{"results": [...]}` response as `/multi_call`. Three things make it different:
 
-- **Wider whitelist.** Includes the six operator-only paths that no longer live on the public mux (`/wipe`, `/warm`, `/rebuild`, `/delete_scope`, `/stats`, `/delete_scope_candidates`), plus everything `/multi_call` allows.
+- **Wider whitelist.** Includes the seven operator-only paths that no longer live on the public mux (`/wipe`, `/warm`, `/rebuild`, `/delete_scope`, `/delete_guarded`, `/stats`, `/delete_scope_candidates`), plus everything `/multi_call` allows.
 - **Reaches reserved scopes.** Scope names beginning with `_` are blocked on every public endpoint (and on `/guarded`). `/admin` is the one path that can write them — that is how the operator manages the `_tokens` auth-gate that gates `/guarded` (one item per active tenant, keyed by `capability_id`).
 - **No body-level auth.** `/admin` trusts that whoever reached the listener was authorised to do so. The deployment story is socket-permission-based on the standalone binary, and Caddyfile-route-restricted on the module path (`@operator { client_ip 10.0.0.0/8 } handle /admin { ... }` or similar). Treat the `/admin` path the same way you would treat root access to `/etc`: gated outside the cache, by the same boundary that gates the rest of the deployment.
 
@@ -567,6 +567,16 @@ curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/admin \
   -H "Content-Type: application/json" \
   -d '{"calls":[{"path":"/wipe"}]}'
 ```
+
+Drop a single tenant's entire `_guarded:<capability_id>:*` namespace in one atomic call (the data-cleanup half of token revocation — pair this with `/delete` against `_tokens` and the two `_counters_*` scopes for the full four-call revocation batch; see [scopecache-rfc.md §6.4 *Token lifecycle is application logic*](scopecache-rfc.md)):
+
+```bash
+curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/admin \
+  -H "Content-Type: application/json" \
+  -d '{"calls":[{"path":"/delete_guarded","body":{"capability_id":"14071b…"}}]}'
+```
+
+`/delete_guarded` accepts only a strictly-validated `capability_id` (64 lowercase hex chars), not a free-form prefix — the handler builds the `_guarded:<capability_id>:` prefix internally so callers cannot typo it, forget the trailing `:` (cross-tenant collision), or aim a free-form sweep at `_tokens` / `_counters_*` / `_inbox`. Damage radius is bounded by construction. Response shape mirrors `/wipe`: `{"ok", "deleted_scopes", "deleted_items", "freed_mb"}`.
 
 ### `/guarded` — tenant-facing multi-call
 
@@ -616,7 +626,7 @@ Response (the `scope` in the slot's `item` reads `"events"` — the prefix is st
 }
 ```
 
-Whitelist excludes `/delete_scope` (a tenant cannot deprovision their own namespace), `/stats` and `/delete_scope_candidates` (cross-tenant visibility), and every store-wide op.
+Whitelist excludes `/delete_scope` and `/delete_guarded` (a tenant cannot deprovision their own namespace), `/stats` and `/delete_scope_candidates` (cross-tenant visibility), and every store-wide op.
 
 After each successful request the cache atomically increments two reserved scopes for per-tenant usage tracking:
 
@@ -680,6 +690,7 @@ All overrides via environment variables:
 | `SCOPECACHE_MAX_RESPONSE_MB`      | `25`                     | Per-response byte cap (integer MiB)           |
 | `SCOPECACHE_MAX_MULTI_CALL_MB`    | `16`                     | `/multi_call` input body cap (integer MiB)    |
 | `SCOPECACHE_MAX_MULTI_CALL_COUNT` | `10`                     | `/multi_call` max sub-calls per batch         |
+| `SCOPECACHE_MAX_INBOX_KB`         | `64`                     | `/inbox` per-call payload cap (integer KiB; tighter than `MAX_ITEM_MB` by design — see [Limits](#limits)) |
 | `SCOPECACHE_SERVER_SECRET`        | *(unset)*                | HMAC key for `/guarded` and `/inbox`; empty/unset disables both routes |
 | `SCOPECACHE_INBOX_SCOPES`         | *(unset)*                | Newline-separated list of scope names `/inbox` accepts; empty/unset disables `/inbox` |
 
@@ -692,6 +703,7 @@ Several independent caps apply; any violation returns **HTTP 507 Insufficient St
 - **Per-item cap** — 1 MiB (default); enforced on the approximate item size (overhead + scope + id + payload). Raise it via `SCOPECACHE_MAX_ITEM_MB` when the use-case stores larger blobs (rendered HTML, large JSON documents).
 - **Per-response cap** — 25 MiB (default); applies uniformly to every HTTP response, including `/multi_call`'s outer envelope. Prevents pathological responses from `/tail?limit=10000` over 1 MiB items, multi-tenant `/stats` enumeration, and accumulated batch aggregates.
 - **`/multi_call` caps** — 16 MiB input body and 10 sub-calls per batch (defaults). Both bound dispatcher work per HTTP request; raise them on bigger hardware.
+- **`/inbox` payload cap** — 64 KiB (default); KiB-granular because the meaningful range for tenant-pushed events is sub-MiB. Tighter than the per-item cap by design: `/inbox` is fire-and-forget tenant ingestion that the operator drains in batches via `/admin /tail`, and a 1 MiB ceiling lets one rogue tenant fill response budgets very fast. Override via `SCOPECACHE_MAX_INBOX_KB` (env) or `max_inbox_kb` (Caddyfile). Per-request shape rule — overflow returns `400`, not `507`.
 
 ## Eviction / TTL
 

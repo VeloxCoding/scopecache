@@ -597,10 +597,20 @@ visibility), or any store-wide op.
 
 Per-request validation (whole-batch reject on any failure):
 
-1. `token` is required (`401` on empty/missing).
-2. `capability_id = hex(HMAC_SHA256(SCOPECACHE_SERVER_SECRET, token))`
+1. **Shape-only prologue** (shared helper `validateBatchShape`,
+   identical to `/multi_call` and `/admin`): `calls` field present,
+   count under `SCOPECACHE_MAX_MULTI_CALL_COUNT`, response pre-flight
+   would fit at the configured cap, every sub-call's `path` is in
+   the whitelist. Whitelist runs HERE — before the token check —
+   for the same reason `preflightResponseCap` runs before auth: a
+   misconfigured caller learns the real issue is request shape, not
+   auth. A whitelist miss leaks no more than the publicly-documented
+   set of `/guarded` paths; auth still fires before any sub-call
+   work or side effect, which is the load-bearing security guarantee.
+2. `token` is required (`401` on empty/missing).
+3. `capability_id = hex(HMAC_SHA256(SCOPECACHE_SERVER_SECRET, token))`
    (lowercase, 64 hex chars).
-3. **Auth-gate**: a single lookup in the reserved `_tokens` scope —
+4. **Auth-gate**: a single lookup in the reserved `_tokens` scope —
    does an item with `id = capability_id` exist? If yes, this token
    was issued by the operator and not revoked. If not (or if
    `_tokens` itself does not exist yet), the batch is rejected with
@@ -608,7 +618,6 @@ Per-request validation (whole-batch reject on any failure):
    load-bearing security check: a forged token produces a
    deterministic-but-different `capability_id` whose item was never
    added, and is rejected.
-4. Every sub-call's `path` must be in the whitelist.
 5. For each sub-call the cache rewrites `scope` (in body or query)
    to `_guarded:<capability_id>:<original-scope>`. The underlying
    scope buffer is auto-created if it doesn't yet exist (via
