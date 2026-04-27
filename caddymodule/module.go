@@ -57,6 +57,11 @@ type Handler struct {
 	// using it (PHP/workers computing capability_ids) must see the same
 	// value. See guardedflow.md §I.
 	ServerSecret string `json:"server_secret,omitempty"`
+	// InboxScopes lists scope names /inbox is allowed to write to.
+	// Empty/unset disables /inbox entirely (route not registered);
+	// /inbox also requires ServerSecret. Repeatable in Caddyfile via
+	// the `inbox_scope <name>` directive.
+	InboxScopes []string `json:"inbox_scopes,omitempty"`
 
 	api *scopecache.API
 	mux *http.ServeMux
@@ -90,6 +95,7 @@ func (h *Handler) Provision(_ caddy.Context) error {
 		MaxMultiCallBytes: int64(h.MaxMultiCallMB) << 20,
 		MaxMultiCallCount: h.MaxMultiCallCount,
 		ServerSecret:      h.ServerSecret,
+		InboxScopes:       h.InboxScopes,
 	})
 	h.api = scopecache.NewAPI(store)
 	h.mux = http.NewServeMux()
@@ -121,11 +127,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 //	    max_multi_call_mb      16
 //	    max_multi_call_count   10
 //	    server_secret          {$SCOPECACHE_SERVER_SECRET}
+//	    inbox_scope            _inbox
+//	    inbox_scope            audit_log
 //	}
 //
 // Numeric capacity knobs are integer; `server_secret` is a string that
 // can be either a literal value or — recommended — a `{$VAR}`
-// substitution of an env-var. See guardedflow.md §I.
+// substitution of an env-var. `inbox_scope` is repeatable: each
+// occurrence appends one allowed scope name to the /inbox allowlist.
 func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	for d.Next() {
 		if d.NextArg() {
@@ -142,6 +151,13 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			switch key {
 			case "server_secret":
 				h.ServerSecret = value
+				continue
+			case "inbox_scope":
+				// Repeatable — each call appends one name. Empty value
+				// is silently dropped (matches env-helper behaviour).
+				if value != "" {
+					h.InboxScopes = append(h.InboxScopes, value)
+				}
 				continue
 			}
 

@@ -36,6 +36,11 @@
         # process env at config-load (see guardedflow.md §I). Empty/unset
         # would disable /guarded entirely (route returns 404).
         server_secret   {$SCOPECACHE_SERVER_SECRET}
+        # Enable /inbox by listing operator-allowed shared write scope
+        # names. Each line registers one. Empty list (no inbox_scope
+        # directives) disables /inbox entirely.
+        inbox_scope     _inbox
+        inbox_scope     audit_log
     }
     # scopecache calls next() for any path it does not recognise; this
     # terminal handler then returns 404 instead of Caddy's default empty

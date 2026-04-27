@@ -8,6 +8,11 @@ services:
       # a fixed deterministic value so PHP-side and shell-side HMAC
       # computations match. See guardedflow.md §I.
       SCOPECACHE_SERVER_SECRET: ${SCOPECACHE_SERVER_SECRET:-test-secret}
+      # Enable /inbox with two operator-allowed shared scope names.
+      # Newline-separated; empty/unset disables /inbox entirely.
+      SCOPECACHE_INBOX_SCOPES: |-
+        _inbox
+        audit_log
     volumes:
       - scopecache-sock:/run
 

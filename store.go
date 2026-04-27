@@ -862,6 +862,11 @@ type Store struct {
 	// serverSecret is the HMAC key for /guarded. Empty string means
 	// /guarded is disabled (route not registered). See guardedflow.md §I.
 	serverSecret string
+	// inboxScopes is the set of scope names /inbox is allowed to
+	// write to. Empty (or nil) means /inbox is disabled — the route
+	// is not registered. Operator opt-in for shared write-only
+	// ingestion patterns.
+	inboxScopes map[string]bool
 	// totalBytes tracks the running sum of approxItemSize across every item
 	// in every scope. Kept in an atomic so /append can reserve against it
 	// without touching the store-level mutex; writes that would push it past
@@ -877,6 +882,12 @@ type Store struct {
 
 func NewStore(c Config) *Store {
 	c = c.WithDefaults()
+	inboxSet := make(map[string]bool, len(c.InboxScopes))
+	for _, name := range c.InboxScopes {
+		if name != "" {
+			inboxSet[name] = true
+		}
+	}
 	return &Store{
 		scopes:            make(map[string]*ScopeBuffer),
 		defaultMaxItems:   c.ScopeMaxItems,
@@ -886,7 +897,15 @@ func NewStore(c Config) *Store {
 		maxMultiCallBytes: c.MaxMultiCallBytes,
 		maxMultiCallCount: c.MaxMultiCallCount,
 		serverSecret:      c.ServerSecret,
+		inboxScopes:       inboxSet,
 	}
+}
+
+// isInboxScope reports whether `name` is in the operator-configured
+// allowlist of /inbox target scopes. Used by handleInbox to reject
+// writes to scope names the operator has not opted into.
+func (s *Store) isInboxScope(name string) bool {
+	return s.inboxScopes[name]
 }
 
 // reserveBytes atomically adjusts the store byte counter by delta, enforcing

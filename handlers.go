@@ -1351,4 +1351,11 @@ func (api *API) RegisterRoutes(mux *http.ServeMux) {
 	if api.store.serverSecret != "" {
 		mux.HandleFunc("/guarded", api.handleGuarded)
 	}
+	// Shared write-only ingestion endpoint. Requires both a server
+	// secret (for HMAC-derived capability_id) AND at least one
+	// configured inbox scope. Either missing → route not registered,
+	// public callers receive 404. See inbox.go.
+	if api.store.serverSecret != "" && len(api.store.inboxScopes) > 0 {
+		mux.HandleFunc("/inbox", api.handleInbox)
+	}
 }

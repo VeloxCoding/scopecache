@@ -75,6 +75,13 @@ type Config struct {
 	// see the same value via their own configuration. See guardedflow.md
 	// §I.
 	ServerSecret string
+	// InboxScopes lists the scope names that /inbox is allowed to write
+	// to. /inbox accepts a single tenant /append into one of these
+	// scopes; reads are operator-only (via /admin). Empty list disables
+	// /inbox entirely (the route is not registered). Together with
+	// ServerSecret, this is the operator's opt-in for shared
+	// write-only ingestion.
+	InboxScopes []string
 }
 
 // WithDefaults returns a copy of c with non-positive numeric fields

@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -148,6 +149,25 @@ func maxMultiCallCountFromEnv() int {
 	return n
 }
 
+// inboxScopesFromEnv returns SCOPECACHE_INBOX_SCOPES split on
+// newlines (the robust separator — scope names may contain ":" or
+// "," but not "\n"). Empty value, missing var, or all-whitespace
+// content yields nil, which leaves /inbox unregistered.
+func inboxScopesFromEnv() []string {
+	raw := os.Getenv("SCOPECACHE_INBOX_SCOPES")
+	if raw == "" {
+		return nil
+	}
+	var out []string
+	for _, s := range strings.Split(raw, "\n") {
+		s = strings.TrimSpace(s)
+		if s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
 const shutdownGracePeriod = 5 * time.Second
 
 func listenUnixSocket(path string) (net.Listener, error) {
@@ -187,6 +207,7 @@ func main() {
 		MaxMultiCallBytes: maxMultiCallBytesFromEnv(),
 		MaxMultiCallCount: maxMultiCallCountFromEnv(),
 		ServerSecret:      os.Getenv("SCOPECACHE_SERVER_SECRET"),
+		InboxScopes:       inboxScopesFromEnv(),
 	}
 	store := scopecache.NewStore(cfg)
 	api := scopecache.NewAPI(store)
@@ -195,8 +216,14 @@ func main() {
 	if cfg.ServerSecret != "" {
 		guardedStatus = "enabled"
 	}
+	inboxStatus := "DISABLED (SCOPECACHE_INBOX_SCOPES unset)"
+	if cfg.ServerSecret == "" {
+		inboxStatus = "DISABLED (SCOPECACHE_SERVER_SECRET unset)"
+	} else if len(cfg.InboxScopes) > 0 {
+		inboxStatus = "enabled, scopes=" + strings.Join(cfg.InboxScopes, ",")
+	}
 	log.Printf("scopecache capacity: %d items per scope, %d MiB store-wide, %d MiB per item, %d MiB per response, %d MiB per /multi_call body, %d sub-calls per /multi_call batch", cfg.ScopeMaxItems, cfg.MaxStoreBytes>>20, cfg.MaxItemBytes>>20, cfg.MaxResponseBytes>>20, cfg.MaxMultiCallBytes>>20, cfg.MaxMultiCallCount)
-	log.Printf("scopecache features: /admin enabled (socket-permission-based auth); /guarded %s", guardedStatus)
+	log.Printf("scopecache features: /admin enabled (socket-permission-based auth); /guarded %s; /inbox %s", guardedStatus, inboxStatus)
 
 	mux := http.NewServeMux()
 	api.RegisterRoutes(mux)

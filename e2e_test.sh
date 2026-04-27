@@ -806,6 +806,77 @@ call 'gd: GET rejected'                  405 GET /guarded
 # Malformed body → 400.
 call 'gd: malformed body'                400 POST /guarded '{not-json'
 
+# --- /inbox -------------------------------------------------------------------
+# Shared write-only ingestion. Operator-configured scope allowlist
+# (SCOPECACHE_INBOX_SCOPES = "_inbox\naudit_log"). Tenants /append into
+# one shared scope; cache assigns id=<capId>:<random> and ts=now().
+# Reads happen via /admin only; tenants cannot see any item.
+say '== inbox =='
+
+# Happy path: tenant A appends to _inbox.
+call 'ib: append happy path'          200 POST /inbox \
+    "{\"token\":\"${TENANT_A_TOKEN}\",\"scope\":\"_inbox\",\"payload\":{\"event\":\"signup\"}}"
+case $LAST_BODY in
+    *'"ok":true'*'"ts":'*) okmsg 'ib: response shape (ok+ts)' ;;
+    *) bad "ib: response shape: $LAST_BODY" ;;
+esac
+case $LAST_BODY in
+    *'"id":'*|*'"seq":'*|*'"scope":'*|*'"item":'*) bad "ib: response leaks identity field: $LAST_BODY" ;;
+    *) okmsg 'ib: response is minimal (no id/seq/scope/item)' ;;
+esac
+
+# Drain via /admin: item exists, id starts with capA, ts populated.
+admin_call_query 'ib: drain via admin /tail'    200 /tail '{"scope":"_inbox","limit":10}'
+case $LAST_BODY in
+    *"\"id\":\"${TENANT_A_CAP}:"*) okmsg "ib: stored id starts with tenant A's capId" ;;
+    *) bad "ib: stored id missing capA prefix: $LAST_BODY" ;;
+esac
+
+# Forbidden fields rejected.
+call 'ib: forbidden id'               400 POST /inbox \
+    "{\"token\":\"${TENANT_A_TOKEN}\",\"scope\":\"_inbox\",\"payload\":1,\"id\":\"x\"}"
+call 'ib: forbidden seq'              400 POST /inbox \
+    "{\"token\":\"${TENANT_A_TOKEN}\",\"scope\":\"_inbox\",\"payload\":1,\"seq\":42}"
+call 'ib: forbidden ts'               400 POST /inbox \
+    "{\"token\":\"${TENANT_A_TOKEN}\",\"scope\":\"_inbox\",\"payload\":1,\"ts\":1745236800000}"
+
+# Missing fields.
+call 'ib: missing token (401)'        401 POST /inbox '{"scope":"_inbox","payload":1}'
+call 'ib: missing scope (400)'        400 POST /inbox \
+    "{\"token\":\"${TENANT_A_TOKEN}\",\"payload\":1}"
+call 'ib: missing payload (400)'      400 POST /inbox \
+    "{\"token\":\"${TENANT_A_TOKEN}\",\"scope\":\"_inbox\"}"
+call 'ib: null payload (400)'         400 POST /inbox \
+    "{\"token\":\"${TENANT_A_TOKEN}\",\"scope\":\"_inbox\",\"payload\":null}"
+
+# Scope not in allowlist.
+call 'ib: scope not in allowlist'     400 POST /inbox \
+    "{\"token\":\"${TENANT_A_TOKEN}\",\"scope\":\"random_scope\",\"payload\":1}"
+
+# Multiple allowed scopes — audit_log also accepts.
+call 'ib: second allowed scope'       200 POST /inbox \
+    "{\"token\":\"${TENANT_A_TOKEN}\",\"scope\":\"audit_log\",\"payload\":{\"event\":\"login\"}}"
+
+# Rogue token rejected.
+call 'ib: rogue token rejected'       400 POST /inbox \
+    '{"token":"random-attacker","scope":"_inbox","payload":1}'
+case $LAST_BODY in
+    *'tenant_not_provisioned'*) okmsg 'ib: rogue token gets tenant_not_provisioned' ;;
+    *) bad "ib: expected tenant_not_provisioned: $LAST_BODY" ;;
+esac
+
+# GET /inbox → 405.
+call 'ib: GET rejected'               405 GET  /inbox
+
+# Tenant cannot read what they wrote — /guarded /tail rewrites scope
+# to `_guarded:<capId>:_inbox` (different scope), returns hit:false.
+guarded_call_query 'ib: tenant cannot read inbox via /guarded' 200 "$TENANT_A_TOKEN" /tail '{"scope":"_inbox"}'
+case $LAST_BODY in
+    *'"items":[]'*|*'"items":null'*|*'"hit":false'*'"items"'*) okmsg 'ib: /guarded read of inbox empty' ;;
+    *'event'*|*'signup'*|*'login'*) bad "ib: /guarded leaked inbox content: $LAST_BODY" ;;
+    *) okmsg 'ib: /guarded read of inbox carries no inbox payload' ;;
+esac
+
 # --- wipe at end --------------------------------------------------------------
 say '== final wipe =='
 admin_call 'wipe'                       200 /wipe

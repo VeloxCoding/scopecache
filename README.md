@@ -602,6 +602,35 @@ The slot's `body.item.payload` is the total sub-call count for that `capability_
 
 `/guarded` is registered only when `SCOPECACHE_SERVER_SECRET` is set. Unset → the route is not in the mux, `POST /guarded` returns `404`. See [§6.4](scopecache-rfc.md) and [§13.22-13.23](scopecache-rfc.md) of the spec for the full contract and worked examples.
 
+### `/inbox` — shared write-only ingestion
+
+Sister of `/guarded` for the "many producers, one drainer" pattern. Each request is a single `/append` (no multi-call envelope); the cache assigns identity (`id = <capability_id>:<random>`) and time (`ts = now()`); tenants cannot read what they wrote — drains happen via `/admin /tail` + `/admin /delete_up_to`.
+
+```bash
+curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/inbox \
+  -H "Content-Type: application/json" \
+  -d '{
+    "token":   "tenant-A-token",
+    "scope":   "_inbox",
+    "payload": { "event": "signup", "user_id": 42 }
+  }'
+```
+
+Response is intentionally minimal — no `id`, `seq`, or `scope` echo, since tenants have nothing to address afterwards:
+
+```json
+{ "ok": true, "ts": 1745236800000, "duration_us": 35 }
+```
+
+`ts` is a server-authoritative timestamp the cache stamped on the item — useful for clients with skewed clocks. Forbidden in the request body (each gets a `400`): `id`, `seq`, `ts`. The cache owns identity and time; clients wanting historical timestamps put them in `payload`.
+
+Operator config:
+- `SCOPECACHE_SERVER_SECRET` must be set (HMAC for `capability_id`).
+- `SCOPECACHE_INBOX_SCOPES` lists allowed inbox scope names, newline-separated. Caddyfile equivalent: repeatable `inbox_scope <name>` directive.
+- Either missing → route not registered, `POST /inbox` returns `404`.
+
+The auth-gate is the same `_tokens` lookup as `/guarded` — one scope-and-revocation primitive across both endpoints. Drain pattern: `/admin /tail _inbox` to read items, parse `id` on first `:` to extract `capability_id` per item, JOIN against your `api_tokens` table to recover the user, then `/admin /delete_up_to` to free the buffer. See [§6.4](scopecache-rfc.md) (`/inbox` subsection) for the full spec.
+
 ## Configuration
 
 All overrides via environment variables:
@@ -615,7 +644,8 @@ All overrides via environment variables:
 | `SCOPECACHE_MAX_RESPONSE_MB`      | `25`                     | Per-response byte cap (integer MiB)           |
 | `SCOPECACHE_MAX_MULTI_CALL_MB`    | `16`                     | `/multi_call` input body cap (integer MiB)    |
 | `SCOPECACHE_MAX_MULTI_CALL_COUNT` | `10`                     | `/multi_call` max sub-calls per batch         |
-| `SCOPECACHE_SERVER_SECRET`        | *(unset)*                | HMAC key for `/guarded`; empty/unset disables the route |
+| `SCOPECACHE_SERVER_SECRET`        | *(unset)*                | HMAC key for `/guarded` and `/inbox`; empty/unset disables both routes |
+| `SCOPECACHE_INBOX_SCOPES`         | *(unset)*                | Newline-separated list of scope names `/inbox` accepts; empty/unset disables `/inbox` |
 
 ## Limits
 

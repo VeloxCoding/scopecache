@@ -1079,7 +1079,13 @@ func TestConfig_WithDefaults(t *testing.T) {
 			ServerSecret:      "real-secret",
 		}
 		got := in.WithDefaults()
-		if got != in {
+		if got.ScopeMaxItems != in.ScopeMaxItems ||
+			got.MaxStoreBytes != in.MaxStoreBytes ||
+			got.MaxItemBytes != in.MaxItemBytes ||
+			got.MaxResponseBytes != in.MaxResponseBytes ||
+			got.MaxMultiCallBytes != in.MaxMultiCallBytes ||
+			got.MaxMultiCallCount != in.MaxMultiCallCount ||
+			got.ServerSecret != in.ServerSecret {
 			t.Errorf("positive Config mutated: got %+v want %+v", got, in)
 		}
 	})

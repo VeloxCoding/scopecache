@@ -115,7 +115,8 @@ separate, cache-owned, and surfaces only in `/stats` and
 - per-response cap: `25 MiB` by default, overridable via the `SCOPECACHE_MAX_RESPONSE_MB` environment variable (integer MiB). Applies uniformly to every HTTP response, including `/multi_call`'s outer envelope. Responses that would exceed the cap are rejected with `507`; already-applied side effects are not rolled back (same stance as every other `507` in this cache). Bounds pathological responses from `/tail?limit=10000` over 1 MiB items, multi-tenant `/stats` enumeration, and accumulated `/multi_call` aggregates.
 - per-request body cap (`/multi_call` input): `16 MiB` by default, overridable via the `SCOPECACHE_MAX_MULTI_CALL_MB` environment variable (integer MiB). Independent of the per-response cap (input vs. output are separate concerns).
 - per-batch sub-call count (`/multi_call`): `10` by default, overridable via the `SCOPECACHE_MAX_MULTI_CALL_COUNT` environment variable. Bounds dispatcher work per HTTP request; batches over the cap return `400` for the whole batch (no partial dispatch).
-- HMAC server secret (`/guarded`): supplied via the `SCOPECACHE_SERVER_SECRET` environment variable (no default). The string itself is opaque to the cache — it is the HMAC-SHA256 key used to derive each tenant's `capability_id` from their token (see §6.4). Empty or unset disables `/guarded` entirely (the route is not registered; public callers receive `404`). The standalone binary reads the env var directly; the Caddy module reads the same value via the `server_secret` Caddyfile directive (or JSON config field), typically as a `{$SCOPECACHE_SERVER_SECRET}` substitution so the secret stays out of the Caddyfile itself.
+- HMAC server secret (`/guarded`, `/inbox`): supplied via the `SCOPECACHE_SERVER_SECRET` environment variable (no default). The string itself is opaque to the cache — it is the HMAC-SHA256 key used to derive each tenant's `capability_id` from their token (see §6.4). Empty or unset disables both `/guarded` and `/inbox` entirely (routes not registered; public callers receive `404`). The standalone binary reads the env var directly; the Caddy module reads the same value via the `server_secret` Caddyfile directive (or JSON config field), typically as a `{$SCOPECACHE_SERVER_SECRET}` substitution so the secret stays out of the Caddyfile itself.
+- Inbox-scope allowlist (`/inbox`): supplied via the `SCOPECACHE_INBOX_SCOPES` environment variable (no default), newline-separated scope names. Empty/unset disables `/inbox` (route not registered) — even if `SCOPECACHE_SERVER_SECRET` is set. The Caddy module uses repeatable `inbox_scope <name>` directives. Operator opts in to which scope names accept shared write-only ingestion; tenants choosing any other scope name get `400`.
 
 Read limits, per-scope item cap, and store-wide byte cap are separate concerns.
 
@@ -650,6 +651,88 @@ Failure modes:
 Empty/unset → the route is not in the mux; `POST /guarded` returns
 `404`. This is the kill-switch: deployments that don't want a tenant
 gateway simply leave the env var unset.
+
+### `POST /inbox`
+
+Shared write-only ingestion. Single `/append` per request, no
+multi-call envelope. Sister of `/guarded`: same `_tokens` auth-gate,
+different shape — every tenant publishes into one of a small set of
+operator-configured shared scopes, the cache assigns identity and
+time, and tenants cannot read what they (or anyone) wrote.
+
+Body shape:
+
+```json
+{
+  "token":   "<opaque>",
+  "scope":   "<configured inbox scope>",
+  "payload": <any JSON value>
+}
+```
+
+Required: `token`, `scope`, `payload`. **Forbidden** (`400` if
+present): `id`, `seq`, `ts`. Anything else in the body is ignored.
+
+Per-request validation (whole-batch reject on any failure):
+
+1. `token` is required (`401` on empty/missing).
+2. Auth-gate: `_tokens.byID[capability_id]` must exist. Same lookup
+   as `/guarded`. Reject with `400 tenant_not_provisioned` otherwise.
+3. `scope` must be in the operator-configured allowlist
+   (`SCOPECACHE_INBOX_SCOPES` env / `inbox_scope` Caddyfile
+   directive). Otherwise `400`.
+4. `payload` is required and not `null` (matches `/append` shape rule).
+
+Cache-assigned, not visible to client:
+
+- `id = <capability_id>:<32-hex random>` — 64 hex + ":" + 32 hex = 97
+  characters. The capability_id prefix is the attribution: operator
+  drains `_inbox`, parses the `id` on the first `:`, and joins to
+  `api_tokens.capability_id` to recover the user. The 32-hex random
+  is uniqueness within the scope.
+- `ts = now()` — milliseconds since unix epoch, set by the cache. A
+  client wanting historical timestamps puts them in the payload (the
+  cache stays opaque to payload contents, no special semantics).
+- `seq` — assigned by the existing `/append` flow.
+
+Response shape (intentionally minimal — tenants cannot read the
+inbox, so nothing in the response is addressable):
+
+```json
+{
+  "ok":          true,
+  "ts":          1745236800000,
+  "duration_us": 35
+}
+```
+
+`ts` is the server-authoritative timestamp the cache stamped on the
+item, useful for clients with skewed clocks. No `id`, no `seq`, no
+`scope` echo.
+
+Failure modes:
+
+- Empty token → `401`, `the 'token' field is required`.
+- `id` / `seq` / `ts` present in body → `400 the 'X' field is
+  forbidden on /inbox`.
+- Scope not in allowlist → `400 scope is not configured as an inbox
+  scope`.
+- Token's capability_id not in `_tokens` → `400 tenant_not_provisioned`.
+- Per-scope item cap exceeded (drainer needs to catch up) → `507`
+  with the standard scope-full envelope.
+- Store-byte cap exceeded → `507`.
+
+`/inbox` is registered only when **both** `SCOPECACHE_SERVER_SECRET`
+is set (HMAC for capability_id derivation) and at least one inbox
+scope is configured (`SCOPECACHE_INBOX_SCOPES`). Either missing → the
+route is not in the mux, public callers receive `404`.
+
+Reads happen exclusively via `/admin` (`/admin /tail _inbox`,
+`/admin /delete_up_to`). Tenants cannot read shared inbox scopes via
+`/guarded`: the rewrite turns `scope=_inbox` into
+`_guarded:<capability_id>:_inbox` — a different scope name from the
+shared `_inbox` where the data lives — so the read returns
+`hit:false` regardless. Drain pattern documented in §13.24.
 
 ## 6.5 Reserved scopes
 
