@@ -98,6 +98,29 @@ call() {
 # invisible until the eventual end-state assertion. The pass
 # counter is still incremented per success so the trailing
 # pass/fail summary stays accurate.
+# json_assert: precise JSON-shape check on $LAST_BODY using jq -e.
+# Use for invariants where substring matching could give false
+# positives (e.g. `"payload":7` would also match `"payload":70`,
+# `"id":"t1"` would also match `"id":"t10"` or `"id":"t12"`).
+#
+# Argument is a jq filter that must evaluate to a truthy value
+# (true, non-zero number, non-empty string/array). On success the
+# pass counter increments; on miss or jq error the body is logged
+# under the label.
+#
+# Substring `case $LAST_BODY in` checks are fine for presence
+# assertions ("body mentions deleted_scopes") and error-string
+# matching ("error contains 'exceed'"); save json_assert for
+# numeric equality, id-list equality, and exact-count checks.
+json_assert() {
+    _label=$1; _expr=$2
+    if printf '%s' "$LAST_BODY" | jq -e "$_expr" >/dev/null 2>&1; then
+        okmsg "$_label"
+    else
+        bad "$_label: $LAST_BODY"
+    fi
+}
+
 quiet_call() {
     _label=$1; _want=$2; _method=$3; _path=$4; _body=${5:-}
     _out=$(req "$_method" "$_path" "$_body")
@@ -313,10 +336,7 @@ i=0; while [ $i -lt 3 ]; do
     i=$((i+1))
 done
 call 'counter: read final'              200 GET    '/get?scope=cmath&id=n'
-case $LAST_BODY in
-    *'"payload":7'*) okmsg 'counter 10x(+1) + 3x(-1) == 7' ;;
-    *) bad "counter math body: $LAST_BODY" ;;
-esac
+json_assert 'counter 10x(+1) + 3x(-1) == 7' '.item.payload == 7'
 
 # delete_up_to: 10 appends, trim up to seq 6, only t7..t10 must survive
 i=1; while [ $i -le 10 ]; do
@@ -325,14 +345,11 @@ i=1; while [ $i -le 10 ]; do
 done
 call 'trim: delete_up_to seq=6'         200 POST   /delete_up_to '{"scope":"tmath","max_seq":6}'
 call 'trim: head after trim'            200 GET    '/head?scope=tmath'
-case $LAST_BODY in
-    *'"id":"t7"'*'"id":"t10"'*) okmsg 'trim: t7..t10 still present' ;;
-    *) bad "trim: expected t7..t10 in body: $LAST_BODY" ;;
-esac
-case $LAST_BODY in
-    *'"id":"t1"'*|*'"id":"t6"'*) bad "trim: stale ids leaked: $LAST_BODY" ;;
-    *) okmsg 'trim: t1..t6 are gone' ;;
-esac
+# Exact id-list invariant: only t7..t10 remain, in seq order.
+# Substring matching is too weak here — `"id":"t1"` would also
+# match "t10", "t11"; `"id":"t7"` matches "t7" but says nothing
+# about whether t1..t6 are also still there.
+json_assert 'trim: items[].id == [t7,t8,t9,t10]' '[.items[].id] == ["t7","t8","t9","t10"]'
 
 # append count: 10 appends to a fresh scope; /stats must report item_count:10
 i=1; while [ $i -le 10 ]; do
@@ -340,10 +357,7 @@ i=1; while [ $i -le 10 ]; do
     i=$((i+1))
 done
 admin_call 'append count: stats'        200 /stats
-case $LAST_BODY in
-    *'"appn"'*'"item_count":10'*) okmsg 'stats: appn has 10 items' ;;
-    *) bad "append count stats: $LAST_BODY" ;;
-esac
+json_assert 'stats: appn has 10 items' '.scopes.appn.item_count == 10'
 
 # upsert idempotency: 5 upserts on the same id must leave exactly 1 item,
 # and the surviving payload must be the last one written (4).
@@ -352,15 +366,9 @@ i=0; while [ $i -lt 5 ]; do
     i=$((i+1))
 done
 admin_call 'upsert idem: stats'         200 /stats
-case $LAST_BODY in
-    *'"uidem"'*'"item_count":1'*) okmsg 'stats: uidem has 1 item after 5 upserts' ;;
-    *) bad "upsert idem stats: $LAST_BODY" ;;
-esac
+json_assert 'stats: uidem has 1 item after 5 upserts' '.scopes.uidem.item_count == 1'
 call 'upsert idem: final value'         200 GET    '/get?scope=uidem&id=only'
-case $LAST_BODY in
-    *'"payload":4'*) okmsg 'upsert idem: final payload is 4' ;;
-    *) bad "upsert idem final: $LAST_BODY" ;;
-esac
+json_assert 'upsert idem: final payload is 4' '.item.payload == 4'
 
 # tail windowing: 10 appends (seq 1..10). limit=5 is the newest slice (t6..t10);
 # limit=5&offset=5 skips that newest slice and returns the previous one (t1..t5).
@@ -369,41 +377,19 @@ i=1; while [ $i -le 10 ]; do
     i=$((i+1))
 done
 call 'tail limit=5 (newest)'            200 GET    '/tail?scope=tail10&limit=5'
-case $LAST_BODY in
-    *'"id":"t6"'*'"id":"t10"'*) okmsg 'tail newest: t6..t10 present (ids)' ;;
-    *) bad "tail newest: $LAST_BODY" ;;
-esac
-case $LAST_BODY in
-    *'"id":"t1"'*|*'"id":"t5"'*) bad "tail newest leaked older ids: $LAST_BODY" ;;
-    *) okmsg 'tail newest: t1..t5 absent (ids)' ;;
-esac
-# seq check: trailing comma prevents "seq":1 from matching "seq":10 etc.
-case $LAST_BODY in
-    *'"seq":6,'*'"seq":10,'*) okmsg 'tail newest: seq 6..10 present' ;;
-    *) bad "tail newest seq: $LAST_BODY" ;;
-esac
-case $LAST_BODY in
-    *'"seq":1,'*|*'"seq":5,'*) bad "tail newest leaked older seqs: $LAST_BODY" ;;
-    *) okmsg 'tail newest: seq 1..5 absent' ;;
-esac
+# Single strict equality replaces three substring checks
+# (t6..t10 present + t1..t5 absent + seq 6..10 present): one
+# array-equality covers all three invariants in one assertion.
+# /tail returns newest-first, so the order is [t10, t9, ..., t6].
+# /tail returns the selected window in seq-ascending order (oldest
+# first within the slice), so limit=5 is t6..t10.
+json_assert 'tail newest: items[].id == [t6..t10]' '[.items[].id] == ["t6","t7","t8","t9","t10"]'
+json_assert 'tail newest: items[].seq == [6..10]' '[.items[].seq] == [6,7,8,9,10]'
 
 call 'tail limit=5 offset=5 (oldest)'   200 GET    '/tail?scope=tail10&limit=5&offset=5'
-case $LAST_BODY in
-    *'"id":"t1"'*'"id":"t5"'*) okmsg 'tail offset=5: t1..t5 present (ids)' ;;
-    *) bad "tail offset=5: $LAST_BODY" ;;
-esac
-case $LAST_BODY in
-    *'"id":"t6"'*|*'"id":"t10"'*) bad "tail offset=5 leaked newer ids: $LAST_BODY" ;;
-    *) okmsg 'tail offset=5: t6..t10 absent (ids)' ;;
-esac
-case $LAST_BODY in
-    *'"seq":1,'*'"seq":5,'*) okmsg 'tail offset=5: seq 1..5 present' ;;
-    *) bad "tail offset=5 seq: $LAST_BODY" ;;
-esac
-case $LAST_BODY in
-    *'"seq":6,'*|*'"seq":10,'*) bad "tail offset=5 leaked newer seqs: $LAST_BODY" ;;
-    *) okmsg 'tail offset=5: seq 6..10 absent' ;;
-esac
+# offset=5 skips the newest 5 (t6..t10) and returns t1..t5 (older slice).
+json_assert 'tail offset=5: items[].id == [t1..t5]' '[.items[].id] == ["t1","t2","t3","t4","t5"]'
+json_assert 'tail offset=5: items[].seq == [1..5]' '[.items[].seq] == [1,2,3,4,5]'
 
 # --- ts_range filtering ------------------------------------------------------
 # The top-level `ts` is client-supplied (signed int64). Items without `ts`
