@@ -93,6 +93,7 @@ func TestAdmin_TinyResponseCapRejectedPreflight(t *testing.T) {
 		MaxMultiCallBytes: 16 << 20,
 		MaxMultiCallCount: 10,
 		ServerSecret:      "test-secret",
+		EnableAdmin:       true,
 	}))
 	mux := http.NewServeMux()
 	api.RegisterRoutes(mux)
@@ -167,6 +168,31 @@ func TestAdmin_BlocksHelp(t *testing.T) {
 	code, _, _ := doRequest(t, h, "POST", "/admin", body)
 	if code != 400 {
 		t.Fatalf("code=%d want 400 (/help not in admin whitelist)", code)
+	}
+}
+
+// /admin is gated by Config.EnableAdmin. Without the flag the route
+// must not be registered and public callers get 404 — same shape as
+// /guarded and /inbox without their config preconditions. Operators
+// embedding scopecache via the Caddy module rely on this default to
+// avoid an exposed wipe-the-cache endpoint when a Caddyfile mounts
+// the handler at a public listener root.
+func TestAdmin_NotRegisteredWhenDisabled(t *testing.T) {
+	api := NewAPI(NewStore(Config{
+		ScopeMaxItems:     10,
+		MaxStoreBytes:     100 << 20,
+		MaxItemBytes:      1 << 20,
+		MaxResponseBytes:  25 << 20,
+		MaxMultiCallBytes: 16 << 20,
+		MaxMultiCallCount: 10,
+		// EnableAdmin deliberately false (zero value).
+	}))
+	mux := http.NewServeMux()
+	api.RegisterRoutes(mux)
+
+	code, _, _ := doRequest(t, mux, "POST", "/admin", `{"calls":[{"path":"/stats"}]}`)
+	if code != http.StatusNotFound {
+		t.Errorf("disabled /admin: code=%d want 404", code)
 	}
 }
 

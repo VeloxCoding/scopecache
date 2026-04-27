@@ -1286,7 +1286,7 @@ GET  /render - serve one item's payload as raw bytes (no JSON envelope); miss re
 POST /multi_call - sequentially dispatch N independent sub-calls in one HTTP roundtrip; body is {"calls": [{"path": "/get|/append|...", "query": {...}, "body": {...}}, ...]}; allowed paths: /append, /get, /head, /tail, /ts_range, /update, /upsert, /counter_add, /delete, /delete_up_to; response is {ok, count, results: [{status, body}, ...], approx_response_mb, duration_us} in input order. No cross-call atomicity — a write at index 0 stays applied even if index 1 fails. Outer envelope honours the per-response cap (SCOPECACHE_MAX_RESPONSE_MB); slot bodies that would push the envelope past the cap are replaced with a minimal {"ok":true|false,"response_truncated":true} marker while the slot's status is preserved.
 
 ADMIN-ONLY (gated outside the cache by socket permissions or Caddyfile route):
-POST /admin - operator-elevated dispatcher; same {"calls":[...]} body and {"results":[...]} envelope as /multi_call. Reaches reserved scopes (_*) directly; no rewrite. Wider whitelist than /multi_call: /append, /get, /head, /tail, /ts_range, /update, /upsert, /counter_add, /delete, /delete_up_to, /delete_scope, /warm, /rebuild, /wipe, /stats, /delete_scope_candidates. Excluded: /help (text/plain), /render (raw bytes don't fit a JSON results array), /multi_call/guarded/admin (self-reference loops). /warm, /rebuild, /wipe, /delete_scope, /stats, /delete_scope_candidates are reachable ONLY through /admin — they are not on the public mux. /stats and /delete_scope_candidates are admin-only because they enumerate every scope name in the store, which leaks reserved scopes (_tokens, _guarded:*, _counters_*) and per-scope heat metadata in multi-tenant deployments.
+POST /admin - operator-elevated dispatcher; same {"calls":[...]} body and {"results":[...]} envelope as /multi_call. Reaches reserved scopes (_*) directly; no rewrite. Wider whitelist than /multi_call: /append, /get, /head, /tail, /ts_range, /update, /upsert, /counter_add, /delete, /delete_up_to, /delete_scope, /warm, /rebuild, /wipe, /stats, /delete_scope_candidates. Excluded: /help (text/plain), /render (raw bytes don't fit a JSON results array), /multi_call/guarded/admin (self-reference loops). /warm, /rebuild, /wipe, /delete_scope, /stats, /delete_scope_candidates are reachable ONLY through /admin — they are not on the public mux. /stats and /delete_scope_candidates are admin-only because they enumerate every scope name in the store, which leaks reserved scopes (_tokens, _guarded:*, _counters_*) and per-scope heat metadata in multi-tenant deployments. Registered only when EnableAdmin is set: standalone defaults true (Unix-socket permission gating); Caddy module defaults false (operator must opt in via 'enable_admin yes' AND add a Caddyfile route guard, since /admin has no body-level auth).
 
 OPTIONAL ENDPOINTS (registered only when configured):
 POST /guarded - tenant-facing multi-call gateway; body {"token":"<opaque>","calls":[...]} derives capability_id = HMAC_SHA256(SCOPECACHE_SERVER_SECRET, token), gates on _tokens membership, and rewrites every sub-call's scope to _guarded:<capability_id>:<original-scope>. Whitelist excludes /delete_scope, /stats, /delete_scope_candidates, /wipe, /warm, /rebuild, and /render. Registered only when SCOPECACHE_SERVER_SECRET is set; otherwise the route returns 404.
@@ -1335,10 +1335,21 @@ func (api *API) RegisterRoutes(mux *http.ServeMux) {
 	// generic "response would exceed maximum" — losing the actionable
 	// guidance to either raise the cap or reduce the call count.
 	mux.HandleFunc("/multi_call", api.handleMultiCall)
-	// Admin-elevated endpoint. /wipe, /warm, /rebuild, /delete_scope are
-	// reachable only via /admin (their handler functions still exist;
-	// they're removed from the public mux). See guardedflow.md §J, §K.
-	mux.HandleFunc("/admin", api.handleAdmin)
+	// Admin-elevated endpoint. /wipe, /warm, /rebuild, /delete_scope,
+	// /stats, /delete_scope_candidates are reachable only via /admin
+	// (their handler functions still exist; they're removed from the
+	// public mux). See guardedflow.md §J, §K.
+	//
+	// Gated on Config.EnableAdmin because /admin has no body-level auth
+	// and trusts the transport layer entirely. Default-deny on the
+	// Caddy module (a misconfigured public proxy is a real risk; the
+	// operator must opt in AND add a route guard); default-allow on the
+	// standalone binary (Unix-socket permissions are the gating layer).
+	// Without the flag the route is not registered, public callers
+	// get 404 — same shape as /guarded and /inbox.
+	if api.store.enableAdmin {
+		mux.HandleFunc("/admin", api.handleAdmin)
+	}
 	// Tenant-facing /guarded gateway. Registered only when the operator
 	// configured a server secret — without one, HMAC computation would
 	// produce identical capability_ids for every token, defeating

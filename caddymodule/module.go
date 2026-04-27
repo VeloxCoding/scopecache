@@ -62,6 +62,17 @@ type Handler struct {
 	// /inbox also requires ServerSecret. Repeatable in Caddyfile via
 	// the `inbox_scope <name>` directive.
 	InboxScopes []string `json:"inbox_scopes,omitempty"`
+	// EnableAdmin gates the /admin endpoint. Defaults to false on the
+	// Caddy module — /admin has no body-level auth and the typical
+	// Caddyfile mounts the scopecache handler at the root of a public
+	// listener. An exposed /admin lets any caller wipe the cache, so
+	// the module errs on the side of "off". The operator must set
+	// `enable_admin yes` AND add a route guard (e.g. `@operator
+	// client_ip 10.0.0.0/8` matched on /admin) to expose admin
+	// operations safely. The standalone binary, which listens on a
+	// permission-gated Unix socket, defaults this to true. See the
+	// EnableAdmin field on scopecache.Config for the rationale.
+	EnableAdmin bool `json:"enable_admin,omitempty"`
 
 	api *scopecache.API
 	mux *http.ServeMux
@@ -96,6 +107,7 @@ func (h *Handler) Provision(_ caddy.Context) error {
 		MaxMultiCallCount: h.MaxMultiCallCount,
 		ServerSecret:      h.ServerSecret,
 		InboxScopes:       h.InboxScopes,
+		EnableAdmin:       h.EnableAdmin,
 	})
 	h.api = scopecache.NewAPI(store)
 	h.mux = http.NewServeMux()
@@ -129,12 +141,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 //	    server_secret          {$SCOPECACHE_SERVER_SECRET}
 //	    inbox_scope            _inbox
 //	    inbox_scope            audit_log
+//	    enable_admin           yes
 //	}
 //
 // Numeric capacity knobs are integer; `server_secret` is a string that
 // can be either a literal value or — recommended — a `{$VAR}`
 // substitution of an env-var. `inbox_scope` is repeatable: each
 // occurrence appends one allowed scope name to the /inbox allowlist.
+// `enable_admin` is a boolean (yes/no, true/false, on/off, 1/0);
+// default is "no" — an unrecognised /admin behind a public Caddyfile
+// is the most common deployment footgun, so the operator must opt in
+// and is expected to also add a route guard (e.g. an `@operator`
+// matcher) on the /admin path.
 func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	for d.Next() {
 		if d.NextArg() {
@@ -157,6 +175,16 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				// is silently dropped (matches env-helper behaviour).
 				if value != "" {
 					h.InboxScopes = append(h.InboxScopes, value)
+				}
+				continue
+			case "enable_admin":
+				switch strings.ToLower(value) {
+				case "yes", "true", "on", "1":
+					h.EnableAdmin = true
+				case "no", "false", "off", "0":
+					h.EnableAdmin = false
+				default:
+					return d.Errf("enable_admin: %q is not a boolean (use yes/no, true/false, on/off, or 1/0)", value)
 				}
 				continue
 			}

@@ -3,6 +3,8 @@ package caddymodule
 import (
 	"strings"
 	"testing"
+
+	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 )
 
 // validateConfig must reject negative integer directives. The standalone
@@ -86,5 +88,61 @@ func TestValidateConfig_RejectsWhitespaceOnlyServerSecret(t *testing.T) {
 		if !strings.Contains(err.Error(), "server_secret") {
 			t.Errorf("error %q does not mention server_secret", err.Error())
 		}
+	}
+}
+
+// EnableAdmin defaults to false on the Caddy module (the typical
+// deployment risk: a Caddyfile mounting the handler at a public
+// listener root). UnmarshalCaddyfile must accept the documented
+// boolean spellings and reject garbage.
+func TestUnmarshalCaddyfile_EnableAdmin(t *testing.T) {
+	cases := []struct {
+		input string
+		want  bool
+		errOK bool
+	}{
+		{"scopecache { enable_admin yes }", true, false},
+		{"scopecache { enable_admin true }", true, false},
+		{"scopecache { enable_admin on }", true, false},
+		{"scopecache { enable_admin 1 }", true, false},
+		{"scopecache { enable_admin no }", false, false},
+		{"scopecache { enable_admin false }", false, false},
+		{"scopecache { enable_admin off }", false, false},
+		{"scopecache { enable_admin 0 }", false, false},
+		{"scopecache { enable_admin maybe }", false, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.input, func(t *testing.T) {
+			h := &Handler{}
+			d := caddyfile.NewTestDispenser(tc.input)
+			err := h.UnmarshalCaddyfile(d)
+			if tc.errOK {
+				if err == nil {
+					t.Errorf("expected error parsing %q; got nil", tc.input)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error parsing %q: %v", tc.input, err)
+			}
+			if h.EnableAdmin != tc.want {
+				t.Errorf("EnableAdmin=%v want %v after parsing %q", h.EnableAdmin, tc.want, tc.input)
+			}
+		})
+	}
+}
+
+// EnableAdmin's zero-value default must be false — the whole point of
+// the directive is to make /admin opt-in on the Caddy module, so a
+// scopecache block without `enable_admin` should leave the field at
+// its safe default.
+func TestUnmarshalCaddyfile_EnableAdminDefaultFalse(t *testing.T) {
+	h := &Handler{}
+	d := caddyfile.NewTestDispenser("scopecache { scope_max_items 10 }")
+	if err := h.UnmarshalCaddyfile(d); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if h.EnableAdmin {
+		t.Errorf("EnableAdmin=true with no enable_admin directive; want false (safe default)")
 	}
 }

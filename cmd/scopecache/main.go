@@ -149,6 +149,24 @@ func maxMultiCallCountFromEnv() int {
 	return n
 }
 
+// enableAdminFromEnv reads SCOPECACHE_ENABLE_ADMIN. Default is true:
+// the standalone binary listens on a Unix socket, which the operator
+// gates with filesystem permissions (`chmod 0660 /run/scopecache.sock`,
+// owner = the operator account). The Caddy module defaults this to
+// false because a public reverse-proxy without an explicit /admin
+// route guard is the common deployment footgun. Recognised "off"
+// values: "0", "false", "no", "off" (case-insensitive). Anything else
+// (including unset) leaves the default in place.
+func enableAdminFromEnv() bool {
+	raw := strings.ToLower(strings.TrimSpace(os.Getenv("SCOPECACHE_ENABLE_ADMIN")))
+	switch raw {
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return true
+	}
+}
+
 // inboxScopesFromEnv returns SCOPECACHE_INBOX_SCOPES split on
 // newlines (the robust separator — scope names may contain ":" or
 // "," but not "\n"). Empty value, missing var, or all-whitespace
@@ -208,10 +226,15 @@ func main() {
 		MaxMultiCallCount: maxMultiCallCountFromEnv(),
 		ServerSecret:      os.Getenv("SCOPECACHE_SERVER_SECRET"),
 		InboxScopes:       inboxScopesFromEnv(),
+		EnableAdmin:       enableAdminFromEnv(),
 	}
 	store := scopecache.NewStore(cfg)
 	api := scopecache.NewAPI(store)
 
+	adminStatus := "DISABLED (SCOPECACHE_ENABLE_ADMIN=off)"
+	if cfg.EnableAdmin {
+		adminStatus = "enabled (gated by Unix-socket permissions)"
+	}
 	guardedStatus := "DISABLED (SCOPECACHE_SERVER_SECRET unset)"
 	if cfg.ServerSecret != "" {
 		guardedStatus = "enabled"
@@ -223,7 +246,7 @@ func main() {
 		inboxStatus = "enabled, scopes=" + strings.Join(cfg.InboxScopes, ",")
 	}
 	log.Printf("scopecache capacity: %d items per scope, %d MiB store-wide, %d MiB per item, %d MiB per response, %d MiB per /multi_call body, %d sub-calls per /multi_call batch", cfg.ScopeMaxItems, cfg.MaxStoreBytes>>20, cfg.MaxItemBytes>>20, cfg.MaxResponseBytes>>20, cfg.MaxMultiCallBytes>>20, cfg.MaxMultiCallCount)
-	log.Printf("scopecache features: /admin enabled (socket-permission-based auth); /guarded %s; /inbox %s", guardedStatus, inboxStatus)
+	log.Printf("scopecache features: /admin %s; /guarded %s; /inbox %s", adminStatus, guardedStatus, inboxStatus)
 
 	mux := http.NewServeMux()
 	api.RegisterRoutes(mux)

@@ -24,6 +24,7 @@ func newInboxHandler(t *testing.T, scopes ...string) (http.Handler, *API) {
 		MaxMultiCallCount: 10,
 		ServerSecret:      testServerSecret,
 		InboxScopes:       scopes,
+		EnableAdmin:       true,
 	}))
 	mux := http.NewServeMux()
 	api.RegisterRoutes(mux)

@@ -895,6 +895,10 @@ type Store struct {
 	// is not registered. Operator opt-in for shared write-only
 	// ingestion patterns.
 	inboxScopes map[string]bool
+	// enableAdmin gates whether /admin is registered. False → /admin
+	// returns 404. Operator opt-in to expose the operator-elevated
+	// dispatcher. See Config.EnableAdmin for the rationale.
+	enableAdmin bool
 	// totalBytes tracks the running sum of approxItemSize across every item
 	// in every scope. Kept in an atomic so /append can reserve against it
 	// without touching the store-level mutex; writes that would push it past
@@ -926,6 +930,7 @@ func NewStore(c Config) *Store {
 		maxMultiCallCount: c.MaxMultiCallCount,
 		serverSecret:      c.ServerSecret,
 		inboxScopes:       inboxSet,
+		enableAdmin:       c.EnableAdmin,
 	}
 }
 

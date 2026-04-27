@@ -8,6 +8,16 @@ Read endpoints are equally proxyable. Even without `/render`, the regular query 
 
 **No client library required.** scopecache speaks standard HTTP rather than a bespoke wire protocol — any language with an HTTP client in its standard library (Python, PHP, Node, Ruby, Go, …) can call the cache directly, with no driver to install, pin, or keep version-aligned with the server. Redis and memcached by contrast require **two** layers before a cached value ever reaches the wire: a **per-language driver** (`redis-py`, `phpredis`, `node-redis`, …) to speak their custom binary protocol, and an **application layer** in front to translate that driver's reply into an HTTP response. scopecache collapses both into a single HTTP hop — and via `/render`, that hop can end at Caddy/nginx/apache without any application code in the loop at all.
 
+> **Deployment safety — read this before mounting scopecache on a public listener.**
+>
+> scopecache is **caller-anonymous**: the cache never looks at who you are. Authentication and scope-based authorisation live in the integrator layer (Caddyfile route guards, Unix-socket permissions, the `/guarded` HMAC gateway). That means **never proxy the full scopecache API to the public internet**. Expose only the exact paths you intend to serve.
+>
+> Three rules of thumb:
+>
+> 1. `/admin` is the operator-elevated dispatcher and has no body-level auth — exposing it publicly lets any caller `/wipe` the cache. The Caddy module defaults `enable_admin no`; turn it on only on a trusted listener (localhost-bound, mTLS, or `client_ip` matcher). The standalone Unix-socket binary defaults it on because the socket is already permission-gated by the OS.
+> 2. Public callers should reach **read paths** (`/get`, `/render`, `/head`, `/tail`, `/ts_range`) and possibly `/multi_call` — never the write paths (`/append`, `/upsert`, `/update`, `/counter_add`, `/delete`, `/delete_up_to`). Writes belong on a trusted/internal listener or behind `/guarded` (token-gated, per-tenant scope rewrite).
+> 3. `/stats` and `/delete_scope_candidates` are admin-only since v0.5.17 — they enumerate scope names and would leak `_tokens`, `_guarded:*`, `_counters_*` plus per-scope heat metadata in multi-tenant deployments.
+
 ## What it is
 
 - A scope-first hot-window cache / write-buffer that sits in front of your real data store. (A *scope* is what other systems call a **namespace** or **bucket** — conceptually comparable to a **table** in SQL terms: every item lives inside exactly one.)
@@ -245,7 +255,32 @@ Minimal Caddyfile:
 }
 ```
 
-All `scopecache { ... }` subdirectives are optional; omit any of them to fall back to the compile-time default. `server_secret` enables the `/guarded` tenant gateway (see [Multi-tenant gateways](#multi-tenant-gateways) below); leaving it empty or unset disables `/guarded` entirely. The `{$SCOPECACHE_SERVER_SECRET}` substitution reads the value from the process environment at config-load — recommended over inlining the secret in the Caddyfile. See [Caddyfile.caddyscope](Caddyfile.caddyscope) for a working example and [Dockerfile.caddyscope](Dockerfile.caddyscope) for the xcaddy build recipe.
+All `scopecache { ... }` subdirectives are optional; omit any of them to fall back to the compile-time default. `server_secret` enables the `/guarded` tenant gateway (see [Multi-tenant gateways](#multi-tenant-gateways) below); leaving it empty or unset disables `/guarded` entirely. The `{$SCOPECACHE_SERVER_SECRET}` substitution reads the value from the process environment at config-load — recommended over inlining the secret in the Caddyfile.
+
+`/admin` is **not** registered by default on the Caddy module. To enable operator-elevated operations (`/wipe`, `/warm`, `/rebuild`, `/delete_scope`, `/stats`, `/delete_scope_candidates`), add `enable_admin yes` to the block AND restrict the `/admin` path to a trusted matcher — never expose it on a public listener:
+
+```caddyfile
+:8080 {
+    @operator client_ip 10.0.0.0/8
+    handle /admin {
+        scopecache {
+            scope_max_items 100000
+            enable_admin    yes
+            server_secret   {$SCOPECACHE_SERVER_SECRET}
+        }
+    }
+    handle {
+        scopecache {
+            scope_max_items 100000
+            # enable_admin omitted → /admin returns 404 on the public path.
+            server_secret   {$SCOPECACHE_SERVER_SECRET}
+        }
+    }
+    respond 404
+}
+```
+
+See [Caddyfile.caddyscope](Caddyfile.caddyscope) for the working demo and [Dockerfile.caddyscope](Dockerfile.caddyscope) for the xcaddy build recipe.
 
 ## Quickstart (Linux VPS)
 

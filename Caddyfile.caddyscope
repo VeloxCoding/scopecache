@@ -41,6 +41,25 @@
         # directives) disables /inbox entirely.
         inbox_scope     _inbox
         inbox_scope     audit_log
+        # Enable /admin. Default on the Caddy module is "no" because
+        # /admin has no body-level auth and a Caddyfile mounting the
+        # handler at a public listener would expose /wipe, /warm,
+        # /rebuild, /delete_scope etc. to any caller. THIS DEMO SETUP
+        # IS NOT PUBLIC-INTERNET-SAFE: the e2e test suite needs /admin
+        # so we turn it on here. In a real deployment, pair this with a
+        # Caddy route guard so /admin is only reachable from a trusted
+        # network — for example:
+        #
+        #     @operator client_ip 10.0.0.0/8
+        #     handle /admin {
+        #         scopecache { ... enable_admin yes ... }
+        #     }
+        #     handle {
+        #         scopecache { ... enable_admin no ... }
+        #     }
+        #
+        # Or terminate /admin on a separate listener bound to localhost.
+        enable_admin    yes
     }
     # scopecache calls next() for any path it does not recognise; this
     # terminal handler then returns 404 instead of Caddy's default empty

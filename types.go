@@ -82,6 +82,20 @@ type Config struct {
 	// ServerSecret, this is the operator's opt-in for shared
 	// write-only ingestion.
 	InboxScopes []string
+	// EnableAdmin gates whether the /admin endpoint is registered on
+	// the public mux. /admin has no body-level auth and reaches
+	// reserved scopes (/wipe, /warm, /rebuild, /delete_scope, _* writes)
+	// — gating relies entirely on transport-layer access (Unix-socket
+	// permissions on the standalone binary; Caddyfile route-restriction
+	// or client_ip matcher on the module path). When the cache is
+	// fronted by a public reverse proxy and the operator forgets to
+	// add a route guard, an exposed /admin lets any caller wipe the
+	// cache. The standalone binary defaults this to true (the Unix
+	// socket is the gating layer); the Caddy module defaults it to
+	// false (a misconfigured proxy is a real risk and the integrator
+	// must opt in). Operators who need /admin from a Caddyfile MUST
+	// set both this flag AND a route guard in front of /admin.
+	EnableAdmin bool
 }
 
 // WithDefaults returns a copy of c with non-positive numeric fields
