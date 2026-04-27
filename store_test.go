@@ -3,6 +3,7 @@ package scopecache
 import (
 	"encoding/json"
 	"errors"
+	"net/http"
 	"sync"
 	"testing"
 )
@@ -1001,6 +1002,109 @@ func assertBytesInvariant(t *testing.T, s *Store, iter int, label string) {
 }
 
 func jsonRaw(s string) []byte { return []byte(s) }
+
+// NewStore(Config{}) must produce a usable Store. Pre-fix the zero
+// Config carried zero caps to every field, so any positive write
+// failed with StoreFullError or worse — the public package was
+// effectively dead-on-arrival for library users.
+func TestNewStore_ZeroConfigUsesDefaults(t *testing.T) {
+	s := NewStore(Config{})
+	api := NewAPI(s)
+	mux := http.NewServeMux()
+	api.RegisterRoutes(mux)
+
+	// A normal /append must just work.
+	body := `{"scope":"smoke","id":"a","payload":{"v":1}}`
+	code, _, raw := doRequest(t, mux, "POST", "/append", body)
+	if code != 200 {
+		t.Fatalf("/append on default-config Store: code=%d body=%s", code, raw)
+	}
+
+	// Caps must match the package-level compile-time defaults.
+	if s.defaultMaxItems != ScopeMaxItems {
+		t.Errorf("defaultMaxItems=%d want %d", s.defaultMaxItems, ScopeMaxItems)
+	}
+	if s.maxStoreBytes != int64(MaxStoreMiB)<<20 {
+		t.Errorf("maxStoreBytes=%d want %d", s.maxStoreBytes, int64(MaxStoreMiB)<<20)
+	}
+	if s.maxItemBytes != int64(MaxItemBytes) {
+		t.Errorf("maxItemBytes=%d want %d", s.maxItemBytes, int64(MaxItemBytes))
+	}
+	if s.maxResponseBytes != int64(MaxResponseMiB)<<20 {
+		t.Errorf("maxResponseBytes=%d want %d", s.maxResponseBytes, int64(MaxResponseMiB)<<20)
+	}
+	if s.maxMultiCallBytes != int64(MaxMultiCallMiB)<<20 {
+		t.Errorf("maxMultiCallBytes=%d want %d", s.maxMultiCallBytes, int64(MaxMultiCallMiB)<<20)
+	}
+	if s.maxMultiCallCount != MaxMultiCallCount {
+		t.Errorf("maxMultiCallCount=%d want %d", s.maxMultiCallCount, MaxMultiCallCount)
+	}
+}
+
+// Config.WithDefaults treats <= 0 as "use default" (matching the
+// standalone binary's env-var helpers) but leaves explicit positive
+// values alone. ServerSecret is untouched: empty disables /guarded
+// by design, not by accident.
+func TestConfig_WithDefaults(t *testing.T) {
+	t.Run("zero fields fall back to defaults", func(t *testing.T) {
+		got := Config{}.WithDefaults()
+		if got.ScopeMaxItems != ScopeMaxItems {
+			t.Errorf("ScopeMaxItems=%d", got.ScopeMaxItems)
+		}
+		if got.MaxStoreBytes != int64(MaxStoreMiB)<<20 {
+			t.Errorf("MaxStoreBytes=%d", got.MaxStoreBytes)
+		}
+		if got.MaxItemBytes != int64(MaxItemBytes) {
+			t.Errorf("MaxItemBytes=%d", got.MaxItemBytes)
+		}
+		if got.MaxResponseBytes != int64(MaxResponseMiB)<<20 {
+			t.Errorf("MaxResponseBytes=%d", got.MaxResponseBytes)
+		}
+		if got.MaxMultiCallBytes != int64(MaxMultiCallMiB)<<20 {
+			t.Errorf("MaxMultiCallBytes=%d", got.MaxMultiCallBytes)
+		}
+		if got.MaxMultiCallCount != MaxMultiCallCount {
+			t.Errorf("MaxMultiCallCount=%d", got.MaxMultiCallCount)
+		}
+	})
+
+	t.Run("positive fields preserved", func(t *testing.T) {
+		in := Config{
+			ScopeMaxItems:     5,
+			MaxStoreBytes:     7,
+			MaxItemBytes:      11,
+			MaxResponseBytes:  13,
+			MaxMultiCallBytes: 17,
+			MaxMultiCallCount: 19,
+			ServerSecret:      "real-secret",
+		}
+		got := in.WithDefaults()
+		if got != in {
+			t.Errorf("positive Config mutated: got %+v want %+v", got, in)
+		}
+	})
+
+	t.Run("negative treated as zero", func(t *testing.T) {
+		// Same lenient policy as the standalone env-var helpers (n<=0 → default).
+		// The Caddy module rejects negatives explicitly via validateConfig
+		// before even calling NewStore, so this path only fires for direct
+		// library callers — friendlier to fall back than to crash.
+		got := Config{ScopeMaxItems: -1, MaxStoreBytes: -100}.WithDefaults()
+		if got.ScopeMaxItems != ScopeMaxItems {
+			t.Errorf("negative ScopeMaxItems not defaulted: %d", got.ScopeMaxItems)
+		}
+		if got.MaxStoreBytes != int64(MaxStoreMiB)<<20 {
+			t.Errorf("negative MaxStoreBytes not defaulted: %d", got.MaxStoreBytes)
+		}
+	})
+
+	t.Run("empty server_secret stays empty (kill-switch)", func(t *testing.T) {
+		got := Config{ServerSecret: ""}.WithDefaults()
+		if got.ServerSecret != "" {
+			t.Errorf("ServerSecret got %q want empty", got.ServerSecret)
+		}
+	})
+}
 
 func TestStore_GetScope_Miss(t *testing.T) {
 	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})

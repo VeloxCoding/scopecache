@@ -77,6 +77,35 @@ type Config struct {
 	ServerSecret string
 }
 
+// WithDefaults returns a copy of c with non-positive numeric fields
+// replaced by the package-level compile-time defaults. NewStore calls
+// this internally so library users can pass a partially-filled Config
+// (or `Config{}` for "all defaults") and still get a working Store —
+// without it, every cap would be zero and every positive write would
+// be rejected with 507. ServerSecret is left untouched: empty is a
+// documented kill-switch for /guarded, not a missing value.
+func (c Config) WithDefaults() Config {
+	if c.ScopeMaxItems <= 0 {
+		c.ScopeMaxItems = ScopeMaxItems
+	}
+	if c.MaxStoreBytes <= 0 {
+		c.MaxStoreBytes = int64(MaxStoreMiB) << 20
+	}
+	if c.MaxItemBytes <= 0 {
+		c.MaxItemBytes = int64(MaxItemBytes)
+	}
+	if c.MaxResponseBytes <= 0 {
+		c.MaxResponseBytes = int64(MaxResponseMiB) << 20
+	}
+	if c.MaxMultiCallBytes <= 0 {
+		c.MaxMultiCallBytes = int64(MaxMultiCallMiB) << 20
+	}
+	if c.MaxMultiCallCount <= 0 {
+		c.MaxMultiCallCount = MaxMultiCallCount
+	}
+	return c
+}
+
 // MB is an int64 byte count that serializes to JSON as a number in MiB with
 // 4 decimals (e.g. 79845 bytes → 0.0762). One display unit across every
 // user-facing surface (/stats, /delete_scope_candidates, 507 responses) keeps clients from

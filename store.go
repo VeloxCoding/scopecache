@@ -876,6 +876,7 @@ type Store struct {
 }
 
 func NewStore(c Config) *Store {
+	c = c.WithDefaults()
 	return &Store{
 		scopes:            make(map[string]*ScopeBuffer),
 		defaultMaxItems:   c.ScopeMaxItems,
