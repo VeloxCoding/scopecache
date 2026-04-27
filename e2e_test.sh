@@ -1302,6 +1302,35 @@ case $LAST_BODY in
     *) bad "ib: expected 65536 in error: $LAST_BODY" ;;
 esac
 
+# Cap-vs-allowlist ordering: an oversized payload aimed at a scope
+# that is NOT in the operator's inbox-scope allowlist must produce
+# the scope-misconfigured error, not the cap error. The cap check
+# runs *after* the allowlist by design (so a wrong scope name gets
+# the most informative error). Pre-fix or after a re-ordering
+# regression this would surface "/inbox cap" instead.
+call 'ib: over-cap + wrong scope -> allowlist error wins' 400 POST /inbox \
+    "{\"token\":\"${TENANT_A_TOKEN}\",\"scope\":\"random_scope_not_in_allowlist\",\"payload\":${ib_over_cap_payload}}"
+case $LAST_BODY in
+    *'not configured as an inbox scope'*) okmsg 'ib: cap-vs-allowlist: allowlist fires first (correct)' ;;
+    *'/inbox cap'*) bad "ib: cap-vs-allowlist regression: cap fired before allowlist: $LAST_BODY" ;;
+    *) bad "ib: unexpected error: $LAST_BODY" ;;
+esac
+
+# Cap-vs-auth ordering: an oversized payload from a tenant whose
+# token is NOT in _tokens must produce the cap error, not
+# tenant_not_provisioned. The cap check runs *before* the auth
+# gate by design (mirroring /guarded's pre-flight cap check) so a
+# misconfigured tenant learns the real issue is request size, not
+# auth. Pre-fix or after a re-ordering regression this would
+# surface "tenant_not_provisioned" instead.
+call 'ib: over-cap + bad token -> cap error wins' 400 POST /inbox \
+    "{\"token\":\"never-provisioned-token\",\"scope\":\"_inbox\",\"payload\":${ib_over_cap_payload}}"
+case $LAST_BODY in
+    *'/inbox cap'*) okmsg 'ib: cap-vs-auth: cap fires first (correct)' ;;
+    *'tenant_not_provisioned'*) bad "ib: cap-vs-auth regression: auth fired before cap: $LAST_BODY" ;;
+    *) bad "ib: unexpected error: $LAST_BODY" ;;
+esac
+
 # --- mega deterministic state-machine test ------------------------------------
 # One large end-to-end invariant test. Drives a full sequence:
 #   wipe → /rebuild → 50 appends → updates → 50 ts-appends → updates →
