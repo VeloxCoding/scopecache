@@ -165,10 +165,14 @@ GET /tail
 GET /ts_range
 GET /get
 GET /render
-GET /stats
 GET /help
-GET /delete_scope_candidates
 ```
+
+`/stats` and `/delete_scope_candidates` are admin-only — they enumerate
+every scope name in the store and would leak reserved scopes (`_tokens`,
+`_guarded:*`, `_counters_*`) and per-scope heat metadata in
+multi-tenant deployments. Both routes are unregistered on the public
+mux; operators reach them through `/admin`'s wider whitelist.
 
 ### `GET /head`
 Query:
@@ -262,15 +266,16 @@ Contract:
 
 Hits count toward scope read-heat (`last_access_ts`, `last_7d_read_count`) exactly like `/get`; misses do not.
 
-### `GET /stats`
-Returns store-level and scope-level operational metadata.
+### `GET /stats` (admin-only)
+Returns store-level and scope-level operational metadata. Reachable
+only through `/admin` — see §10 for the dispatcher contract.
 
-### `GET /delete_scope_candidates`
+### `GET /delete_scope_candidates` (admin-only)
 Query:
 - `limit` optional
 - `hours` optional
 
-Returns scope-level eviction candidates sorted by ascending `last_access_ts`. Named to mirror `/delete_scope`: these are the candidates a client would feed to that endpoint.
+Returns scope-level eviction candidates sorted by ascending `last_access_ts`. Named to mirror `/delete_scope`: these are the candidates a client would feed to that endpoint. Reachable only through `/admin`.
 
 If `hours` is provided, only scopes whose `created_ts` is at least that many hours in the past are included.
 

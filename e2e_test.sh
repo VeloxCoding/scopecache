@@ -173,7 +173,9 @@ admin_call 'wipe initial'               200 /wipe
 # --- help / stats / unknown routes --------------------------------------------
 say '== introspection =='
 call 'help'                             200 GET    /help
-call 'stats empty'                      200 GET    /stats
+admin_call 'stats empty'                200 /stats
+call 'public /stats blocked'            404 GET    /stats
+call 'public /delete_scope_candidates blocked' 404 GET /delete_scope_candidates
 call 'unknown route'                    404 GET    /nope
 call 'wrong method on /help'            405 POST   /help
 
@@ -241,7 +243,7 @@ case $LAST_BODY in
     *) bad "delete miss body: $LAST_BODY" ;;
 esac
 admin_call 'delete_scope'               200 /delete_scope '{"scope":"trim"}'
-call 'delete_scope_candidates'          200 GET    /delete_scope_candidates
+admin_call 'delete_scope_candidates'    200 /delete_scope_candidates
 
 # --- validation errors (400) --------------------------------------------------
 say '== validation =='
@@ -302,7 +304,7 @@ i=1; while [ $i -le 10 ]; do
     req POST /append "{\"scope\":\"appn\",\"id\":\"a$i\",\"payload\":$i}" >/dev/null
     i=$((i+1))
 done
-call 'append count: stats'              200 GET    /stats
+admin_call 'append count: stats'        200 /stats
 case $LAST_BODY in
     *'"appn"'*'"item_count":10'*) okmsg 'stats: appn has 10 items' ;;
     *) bad "append count stats: $LAST_BODY" ;;
@@ -314,7 +316,7 @@ i=0; while [ $i -lt 5 ]; do
     req POST /upsert "{\"scope\":\"uidem\",\"id\":\"only\",\"payload\":$i}" >/dev/null
     i=$((i+1))
 done
-call 'upsert idem: stats'               200 GET    /stats
+admin_call 'upsert idem: stats'         200 /stats
 case $LAST_BODY in
     *'"uidem"'*'"item_count":1'*) okmsg 'stats: uidem has 1 item after 5 upserts' ;;
     *) bad "upsert idem stats: $LAST_BODY" ;;
@@ -895,7 +897,7 @@ if printf '%s' "$LAST_BODY" | grep -q '"deleted_scopes"'; then
 else
     bad "wipe body missing deleted_scopes: $LAST_BODY"
 fi
-call 'stats after wipe'                 200 GET    /stats
+admin_call 'stats after wipe'           200 /stats
 if printf '%s' "$LAST_BODY" | grep -q '"scope_count":0'; then
     okmsg 'stats shows empty store'; pass=$((pass+1))
 else

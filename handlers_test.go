@@ -808,7 +808,7 @@ func TestWipe_ClearsEveryScope(t *testing.T) {
 
 	// Both scopes must now be gone.
 	for _, scope := range []string{"a", "b"} {
-		_, out, _ := doRequest(t, h, "GET", "/stats", "")
+		_, out, _ := doAdminRequest(t, h, "/stats", "")
 		scopes, ok := out["scopes"].(map[string]interface{})
 		if !ok {
 			t.Fatalf("stats has no scopes map: %+v", out)
@@ -827,7 +827,7 @@ func TestWipe_StatsReportEmptyAfterwards(t *testing.T) {
 
 	_, _, _ = doAdminRequest(t, h, "/wipe", "")
 
-	_, out, _ := doRequest(t, h, "GET", "/stats", "")
+	_, out, _ := doAdminRequest(t, h, "/stats", "")
 	if mustFloat(t, out, "scope_count") != 0 {
 		t.Errorf("scope_count=%v want 0", out["scope_count"])
 	}
@@ -1206,7 +1206,7 @@ func TestStats_Structure(t *testing.T) {
 	h, _ := newTestHandler(10)
 	_, _, _ = doRequest(t, h, "POST", "/append", `{"scope":"s","payload":{"v":1}}`)
 
-	_, out, _ := doRequest(t, h, "GET", "/stats", "")
+	_, out, _ := doAdminRequest(t, h, "/stats", "")
 	if mustFloat(t, out, "scope_count") != 1 {
 		t.Errorf("scope_count=%v want 1", out["scope_count"])
 	}
@@ -1225,9 +1225,45 @@ func TestDeleteScopeCandidates_Basic(t *testing.T) {
 	_, _, _ = doRequest(t, h, "POST", "/append", `{"scope":"a","payload":{"v":1}}`)
 	_, _, _ = doRequest(t, h, "POST", "/append", `{"scope":"b","payload":{"v":1}}`)
 
-	_, out, _ := doRequest(t, h, "GET", "/delete_scope_candidates", "")
+	_, out, _ := doAdminRequest(t, h, "/delete_scope_candidates", "")
 	if mustFloat(t, out, "count") != 2 {
 		t.Errorf("count=%v want 2", out["count"])
+	}
+}
+
+// /stats and /delete_scope_candidates enumerate every scope in the
+// store, so they leak reserved scope names (`_tokens`,
+// `_guarded:<capID>:*`, `_counters_*`) and per-scope heat metadata to
+// any caller that can reach the public mux. Both are admin-only since
+// v0.5.17 — public callers must get 404, the routes are not registered
+// at all, and operators reach them through /admin's wider whitelist.
+func TestStats_NotOnPublicMux(t *testing.T) {
+	h, _ := newTestHandler(10)
+
+	code, _, _ := doRequest(t, h, "GET", "/stats", "")
+	if code != http.StatusNotFound {
+		t.Errorf("public GET /stats: code=%d want 404", code)
+	}
+
+	// Through /admin still works.
+	_, body, raw := doAdminRequest(t, h, "/stats", "")
+	if _, ok := body["scopes"].(map[string]interface{}); !ok {
+		t.Errorf("admin /stats body missing scopes map: %s", raw)
+	}
+}
+
+func TestDeleteScopeCandidates_NotOnPublicMux(t *testing.T) {
+	h, _ := newTestHandler(10)
+
+	code, _, _ := doRequest(t, h, "GET", "/delete_scope_candidates", "")
+	if code != http.StatusNotFound {
+		t.Errorf("public GET /delete_scope_candidates: code=%d want 404", code)
+	}
+
+	// Through /admin still works.
+	_, body, raw := doAdminRequest(t, h, "/delete_scope_candidates", "")
+	if _, ok := body["candidates"]; !ok {
+		t.Errorf("admin /delete_scope_candidates body missing candidates: %s", raw)
 	}
 }
 
@@ -1347,7 +1383,7 @@ func TestIntegration_MixedWorkload_StatsAndInvariants(t *testing.T) {
 	}
 
 	// --- Assertions on /stats ---
-	_, stats, _ := doRequest(t, h, "GET", "/stats", "")
+	_, stats, _ := doAdminRequest(t, h, "/stats", "")
 
 	if got := mustFloat(t, stats, "scope_count"); got != 2 {
 		t.Errorf("scope_count=%v want 2 (rejected too-long-scope must not register)", got)
@@ -1561,7 +1597,7 @@ func TestRace_ParallelMixedWorkload(t *testing.T) {
 		t.Fatalf("tally arithmetic impossible: appendsOK=%d < deletedN=%d", appendsOK, deletedN)
 	}
 
-	_, stats, _ := doRequest(t, h, "GET", "/stats", "")
+	_, stats, _ := doAdminRequest(t, h, "/stats", "")
 	if got := int64(mustFloat(t, stats, "total_items")); got != expectedItems {
 		t.Errorf("/stats total_items=%d want %d (appends=%d deletes=%d)",
 			got, expectedItems, appendsOK, deletedN)

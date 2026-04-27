@@ -212,7 +212,7 @@ As a Caddy module, listening on TCP :8081:
 
 ```bash
 docker compose up --build caddyscope
-curl http://localhost:8081/stats
+curl http://localhost:8081/help
 ```
 
 ## Quickstart (Caddy / FrankenPHP via xcaddy)
@@ -291,7 +291,8 @@ Smoke test:
 
 ```bash
 curl --unix-socket /run/scopecache.sock http://localhost/help
-curl -s --unix-socket /run/scopecache.sock http://localhost/stats
+curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/admin \
+  -H "Content-Type: application/json" -d '{"calls":[{"path":"/stats"}]}'
 ```
 
 Full end-to-end suite (75 assertions over every endpoint):
@@ -474,7 +475,7 @@ Contract: hit returns `200` with the raw payload bytes; miss returns `404` with 
 
 ### Other endpoints
 
-`/head`, `/tail`, `/ts_range`, `/update`, `/upsert`, `/counter_add`, `/delete`, `/delete_up_to`, `/multi_call`, `/delete_scope_candidates`, `/stats`, `/help` — see section 13 of the [spec](scopecache-rfc.md) for full examples. `/warm`, `/rebuild`, `/delete_scope`, and `/wipe` are **not** on the public mux; they are reachable only as sub-calls inside `/admin` (see [Multi-tenant gateways](#multi-tenant-gateways) below).
+`/head`, `/tail`, `/ts_range`, `/update`, `/upsert`, `/counter_add`, `/delete`, `/delete_up_to`, `/multi_call`, `/help` — see section 13 of the [spec](scopecache-rfc.md) for full examples. `/warm`, `/rebuild`, `/delete_scope`, `/wipe`, `/stats`, and `/delete_scope_candidates` are **not** on the public mux; they are reachable only as sub-calls inside `/admin` (see [Multi-tenant gateways](#multi-tenant-gateways) below). `/stats` and `/delete_scope_candidates` are admin-only because they enumerate every scope name in the store and would leak reserved scopes (`_tokens`, `_guarded:*`, `_counters_*`) and per-scope heat metadata in multi-tenant deployments.
 
 `/ts_range` filters a scope by a client-supplied top-level `ts` (signed int64, milliseconds since unix epoch by convention — the cache is opaque to the unit). At least one of `since_ts` / `until_ts` must be provided; both together form an inclusive `[since_ts, until_ts]` window. Items without a `ts` are excluded. Results are returned in ascending `seq` order — `ts` is a filter, not an ordering key. Responses on `/head`, `/tail`, and `/ts_range` carry `{ "ok", "items", "truncated" }`; `truncated: true` means more matching items exist beyond the returned `limit`. `/ts_range` has **no pagination cursor** because `ts` is mutable (via `/update` / `/upsert`) and non-unique — narrow the window or raise `limit` to fetch more. `ts` is optional on `/append`, `/warm`, `/rebuild`, `/update` (absent = preserve) and `/upsert` (absent = clear, matching its whole-item replace semantics).
 
@@ -484,7 +485,7 @@ Contract: hit returns `200` with the raw payload bytes; miss returns `404` with 
 
 `/wipe` clears the entire store in one atomic call: every scope, every item, every byte reservation. It takes no request body. The response carries `{"ok", "deleted_scopes", "deleted_items", "freed_mb"}` so a client can verify what was released. The store-wide complement of `/delete_scope` — useful for test teardown, emergency reset, or preparing a fresh slate before a `/rebuild`. The cache never wipes on its own; this is explicitly a client-initiated action.
 
-`/multi_call` dispatches `N` self-contained sub-calls in a single HTTP roundtrip. The body is `{"calls": [{"path": "/get", "query": {...}}, {"path": "/append", "body": {...}}, ...]}`; the response is `{"ok", "count", "results", "approx_response_mb", "duration_us"}` where each `results[i]` is `{"status", "body"}` carrying literally the JSON the standalone endpoint would have produced. Sub-calls run **strictly sequentially**, so a `/get` at index `k+1` observes everything writes at indices `0..k` committed; there is **no cross-call atomicity**, a write at index 0 stays applied even if a later sub-call errors. The whitelist is closed: `/append`, `/get`, `/head`, `/tail`, `/ts_range`, `/update`, `/upsert`, `/counter_add`, `/delete`, `/delete_up_to`, `/stats`, `/delete_scope_candidates`. Store-wide locks (`/warm`, `/rebuild`, `/wipe`), admin-only `/delete_scope`, raw-byte `/render`, `text/plain` `/help`, and `/multi_call` itself are excluded — a path outside the whitelist rejects the whole batch with `400`. Use case: collapse the call-count tax for small fanouts ("fetch K known ids", "do a small mixed read+write"). On a loopback Unix socket a 3-call batch typically returns in the low hundreds of microseconds vs. ~1 ms for three separate roundtrips; the gap widens on TCP. See section 13.20 of the [spec](scopecache-rfc.md) for the full contract and a captured example response.
+`/multi_call` dispatches `N` self-contained sub-calls in a single HTTP roundtrip. The body is `{"calls": [{"path": "/get", "query": {...}}, {"path": "/append", "body": {...}}, ...]}`; the response is `{"ok", "count", "results", "approx_response_mb", "duration_us"}` where each `results[i]` is `{"status", "body"}` carrying literally the JSON the standalone endpoint would have produced. Sub-calls run **strictly sequentially**, so a `/get` at index `k+1` observes everything writes at indices `0..k` committed; there is **no cross-call atomicity**, a write at index 0 stays applied even if a later sub-call errors. The whitelist is closed: `/append`, `/get`, `/head`, `/tail`, `/ts_range`, `/update`, `/upsert`, `/counter_add`, `/delete`, `/delete_up_to`. Store-wide locks (`/warm`, `/rebuild`, `/wipe`), admin-only `/delete_scope`/`/stats`/`/delete_scope_candidates`, raw-byte `/render`, `text/plain` `/help`, and `/multi_call` itself are excluded — a path outside the whitelist rejects the whole batch with `400`. Use case: collapse the call-count tax for small fanouts ("fetch K known ids", "do a small mixed read+write"). On a loopback Unix socket a 3-call batch typically returns in the low hundreds of microseconds vs. ~1 ms for three separate roundtrips; the gap widens on TCP. See section 13.20 of the [spec](scopecache-rfc.md) for the full contract and a captured example response.
 
 ## Multi-tenant gateways
 
@@ -494,7 +495,7 @@ Contract: hit returns `200` with the raw payload bytes; miss returns `404` with 
 
 Same `{"calls": [...]}` body and `{"results": [...]}` response as `/multi_call`. Three things make it different:
 
-- **Wider whitelist.** Includes the four operator-only paths that no longer live on the public mux (`/wipe`, `/warm`, `/rebuild`, `/delete_scope`), plus everything `/multi_call` allows.
+- **Wider whitelist.** Includes the six operator-only paths that no longer live on the public mux (`/wipe`, `/warm`, `/rebuild`, `/delete_scope`, `/stats`, `/delete_scope_candidates`), plus everything `/multi_call` allows.
 - **Reaches reserved scopes.** Scope names beginning with `_` are blocked on every public endpoint (and on `/guarded`). `/admin` is the one path that can write them — that is how the operator manages the `_tokens` auth-gate that gates `/guarded` (one item per active tenant, keyed by `capability_id`).
 - **No body-level auth.** `/admin` trusts that whoever reached the listener was authorised to do so. The deployment story is socket-permission-based on the standalone binary, and Caddyfile-route-restricted on the module path (`@operator { client_ip 10.0.0.0/8 } handle /admin { ... }` or similar). Treat the `/admin` path the same way you would treat root access to `/etc`: gated outside the cache, by the same boundary that gates the rest of the deployment.
 

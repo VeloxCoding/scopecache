@@ -135,9 +135,9 @@ func TestResponseCap_TsRangeOverflowReturns507(t *testing.T) {
 }
 
 // TestResponseCap_OtherEndpointsUnaffected confirms the cap is wired only
-// on the three endpoints that can produce limit-scaled bodies. /append is
-// a small write, /stats is admin, /get is single-item — none of them go
-// through capResponse and so a tiny cap must not affect them.
+// on the three endpoints that can produce limit-scaled bodies. /append
+// is a small write, /get is single-item — neither goes through capResponse
+// so a tiny cap must not affect them.
 func TestResponseCap_OtherEndpointsUnaffected(t *testing.T) {
 	h := newCappedHandler(50)
 
@@ -146,9 +146,6 @@ func TestResponseCap_OtherEndpointsUnaffected(t *testing.T) {
 	}
 	if code, _, raw := doRequest(t, h, "GET", "/get?scope=s&id=a", ""); code != 200 {
 		t.Fatalf("/get code=%d want 200, body=%s", code, raw)
-	}
-	if code, _, raw := doRequest(t, h, "GET", "/stats", ""); code != 200 {
-		t.Fatalf("/stats code=%d want 200, body=%s", code, raw)
 	}
 }
 

@@ -27,25 +27,27 @@ type subCallSpec struct {
 
 // buildMultiCallSpecs returns the closed whitelist of paths /multi_call
 // dispatches to, paired with their fixed HTTP method and handler. The
-// excluded set (/warm, /rebuild, /wipe, /delete_scope, /render, /help
-// and /multi_call itself) is documented in CLAUDE.md → Phase 4 design
-// signals → /multi_call → Allowed paths. /delete_scope is admin-only —
-// it is removed from the public mux entirely (handlers.go) and is only
-// reachable via /admin, so it must not slip back in via /multi_call.
+// excluded set (/warm, /rebuild, /wipe, /delete_scope, /stats,
+// /delete_scope_candidates, /render, /help and /multi_call itself) is
+// documented in CLAUDE.md → Phase 4 design signals → /multi_call →
+// Allowed paths. /delete_scope, /stats, and /delete_scope_candidates
+// are admin-only — they are removed from the public mux entirely
+// (handlers.go) and are only reachable via /admin, so they must not
+// slip back in via /multi_call. Store-wide enumeration endpoints
+// (/stats, /delete_scope_candidates) leak reserved scope names in
+// multi-tenant deployments; admin-gating is the fix.
 func (api *API) buildMultiCallSpecs() map[string]subCallSpec {
 	return map[string]subCallSpec{
-		"/append":                  {http.MethodPost, api.handleAppend},
-		"/get":                     {http.MethodGet, api.handleGet},
-		"/head":                    {http.MethodGet, api.handleHead},
-		"/tail":                    {http.MethodGet, api.handleTail},
-		"/ts_range":                {http.MethodGet, api.handleTsRange},
-		"/update":                  {http.MethodPost, api.handleUpdate},
-		"/upsert":                  {http.MethodPost, api.handleUpsert},
-		"/counter_add":             {http.MethodPost, api.handleCounterAdd},
-		"/delete":                  {http.MethodPost, api.handleDelete},
-		"/delete_up_to":            {http.MethodPost, api.handleDeleteUpTo},
-		"/stats":                   {http.MethodGet, api.handleStats},
-		"/delete_scope_candidates": {http.MethodGet, api.handleDeleteScopeCandidates},
+		"/append":       {http.MethodPost, api.handleAppend},
+		"/get":          {http.MethodGet, api.handleGet},
+		"/head":         {http.MethodGet, api.handleHead},
+		"/tail":         {http.MethodGet, api.handleTail},
+		"/ts_range":     {http.MethodGet, api.handleTsRange},
+		"/update":       {http.MethodPost, api.handleUpdate},
+		"/upsert":       {http.MethodPost, api.handleUpsert},
+		"/counter_add":  {http.MethodPost, api.handleCounterAdd},
+		"/delete":       {http.MethodPost, api.handleDelete},
+		"/delete_up_to": {http.MethodPost, api.handleDeleteUpTo},
 	}
 }
 

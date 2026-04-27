@@ -1283,12 +1283,10 @@ GET  /tail - get the most recent items from a scope (supports optional offset)
 GET  /ts_range - get items whose optional top-level ts falls inside [since_ts, until_ts] (both inclusive, either may be omitted but at least one is required); returns seq-order, items without ts are skipped, no pagination cursor — narrow the window and retry if truncated=true
 GET  /get - get one item by scope + id or scope + seq
 GET  /render - serve one item's payload as raw bytes (no JSON envelope); miss returns 404; JSON-string payloads are decoded one layer so cached HTML/XML/text is served as-is; Content-Type is application/octet-stream — fronting proxy is expected to set the real type if browser-facing
-GET  /stats - show store stats and approximate store size
-GET  /delete_scope_candidates - list scope eviction candidates, sorted by oldest last_access_ts (response includes last_7d_read_count for client-side filtering/sorting)
-POST /multi_call - sequentially dispatch N independent sub-calls in one HTTP roundtrip; body is {"calls": [{"path": "/get|/append|...", "query": {...}, "body": {...}}, ...]}; allowed paths: /append, /get, /head, /tail, /ts_range, /update, /upsert, /counter_add, /delete, /delete_up_to, /stats, /delete_scope_candidates; response is {ok, count, results: [{status, body}, ...], approx_response_mb, duration_us} in input order. No cross-call atomicity — a write at index 0 stays applied even if index 1 fails. Outer envelope honours the per-response cap (SCOPECACHE_MAX_RESPONSE_MB); slot bodies that would push the envelope past the cap are replaced with a minimal {"ok":true|false,"response_truncated":true} marker while the slot's status is preserved.
+POST /multi_call - sequentially dispatch N independent sub-calls in one HTTP roundtrip; body is {"calls": [{"path": "/get|/append|...", "query": {...}, "body": {...}}, ...]}; allowed paths: /append, /get, /head, /tail, /ts_range, /update, /upsert, /counter_add, /delete, /delete_up_to; response is {ok, count, results: [{status, body}, ...], approx_response_mb, duration_us} in input order. No cross-call atomicity — a write at index 0 stays applied even if index 1 fails. Outer envelope honours the per-response cap (SCOPECACHE_MAX_RESPONSE_MB); slot bodies that would push the envelope past the cap are replaced with a minimal {"ok":true|false,"response_truncated":true} marker while the slot's status is preserved.
 
 ADMIN-ONLY (gated outside the cache by socket permissions or Caddyfile route):
-POST /admin - operator-elevated dispatcher; same {"calls":[...]} body and {"results":[...]} envelope as /multi_call. Reaches reserved scopes (_*) directly; no rewrite. Wider whitelist than /multi_call: /append, /get, /head, /tail, /ts_range, /update, /upsert, /counter_add, /delete, /delete_up_to, /delete_scope, /warm, /rebuild, /wipe, /stats, /delete_scope_candidates. Excluded: /help (text/plain), /render (raw bytes don't fit a JSON results array), /multi_call/guarded/admin (self-reference loops). /warm, /rebuild, /wipe, /delete_scope are reachable ONLY through /admin — they are not on the public mux.
+POST /admin - operator-elevated dispatcher; same {"calls":[...]} body and {"results":[...]} envelope as /multi_call. Reaches reserved scopes (_*) directly; no rewrite. Wider whitelist than /multi_call: /append, /get, /head, /tail, /ts_range, /update, /upsert, /counter_add, /delete, /delete_up_to, /delete_scope, /warm, /rebuild, /wipe, /stats, /delete_scope_candidates. Excluded: /help (text/plain), /render (raw bytes don't fit a JSON results array), /multi_call/guarded/admin (self-reference loops). /warm, /rebuild, /wipe, /delete_scope, /stats, /delete_scope_candidates are reachable ONLY through /admin — they are not on the public mux. /stats and /delete_scope_candidates are admin-only because they enumerate every scope name in the store, which leaks reserved scopes (_tokens, _guarded:*, _counters_*) and per-scope heat metadata in multi-tenant deployments.
 
 OPTIONAL ENDPOINTS (registered only when configured):
 POST /guarded - tenant-facing multi-call gateway; body {"token":"<opaque>","calls":[...]} derives capability_id = HMAC_SHA256(SCOPECACHE_SERVER_SECRET, token), gates on _tokens membership, and rewrites every sub-call's scope to _guarded:<capability_id>:<original-scope>. Whitelist excludes /delete_scope, /stats, /delete_scope_candidates, /wipe, /warm, /rebuild, and /render. Registered only when SCOPECACHE_SERVER_SECRET is set; otherwise the route returns 404.
@@ -1321,9 +1319,13 @@ func (api *API) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/ts_range", api.capResponse(api.handleTsRange))
 	mux.HandleFunc("/get", api.handleGet)
 	mux.HandleFunc("/render", api.handleRender)
-	mux.HandleFunc("/stats", api.handleStats)
 	mux.HandleFunc("/help", api.handleHelp)
-	mux.HandleFunc("/delete_scope_candidates", api.handleDeleteScopeCandidates)
+	// /stats and /delete_scope_candidates are admin-only — they enumerate
+	// every scope name in the store, which in a multi-tenant deployment
+	// would leak `_tokens`, `_guarded:<capID>:*`, `_counters_*` and the
+	// per-scope item-counts/heat-stats those carry. Reachable only as
+	// sub-calls through /admin (their handler functions stay on *API for
+	// the dispatcher).
 	// /multi_call, /admin and /guarded are NOT wrapped with capResponse:
 	// they manage the per-response cap themselves via preflightResponseCap
 	// (rejects batches the cap can't fit) plus the per-slot trim mechanism
