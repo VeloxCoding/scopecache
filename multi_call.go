@@ -235,6 +235,119 @@ func preflightResponseCap(w http.ResponseWriter, started time.Time, n int, respC
 	return true
 }
 
+// batchDispatchOptions parameterises the per-handler differences
+// between /multi_call, /admin, and /guarded sub-call dispatch. Both
+// fields are zero-valued (false / "") for /multi_call's no-policy
+// case; /admin sets AdminContext; /guarded sets both AdminContext
+// and StripPrefix.
+type batchDispatchOptions struct {
+	// AdminContext marks each synthetic sub-request with the admin
+	// context-marker so the inner handler's rejectReservedScope check
+	// skips. Required for /admin (operator can write to `_*` scopes
+	// directly) and /guarded (the rewritten scope starts with
+	// `_guarded:` and would otherwise be rejected by the inner handler).
+	AdminContext bool
+	// StripPrefix, when non-empty, is passed to stripGuardedPrefix on
+	// every result body before envelope-budget accounting. Empty
+	// string disables stripping entirely. The strip MUST run before
+	// trim accounting (encoded inside this helper) so the truncation
+	// marker, if it fires, cannot leak the un-stripped form — that's
+	// a security-adjacent invariant /guarded relies on.
+	StripPrefix string
+}
+
+// dispatchPreparedCalls is the shared sequential-dispatch loop for
+// /multi_call, /admin, and /guarded. It runs every prepared sub-call
+// through its registered handler, applies the optional admin-context
+// marker and prefix-strip, enforces the per-response-cap trim
+// asymmetry (2xx → success-marker, non-2xx → error-marker), and
+// returns the assembled results plus the running body-bytes total
+// (the latter is consumed by /guarded for counter increments;
+// /multi_call and /admin discard it).
+//
+// Centralising the loop encodes three correctness invariants in one
+// place that previously lived in three near-identical copies:
+//   - admin context is applied AFTER subReq is built, never forgotten
+//   - strip runs BEFORE trim accounting (truncation marker cannot
+//     leak the un-stripped form)
+//   - defensive copy of the slot body before the next iteration
+//
+// The respCap is read from api.store.maxResponseBytes — all three
+// callers pass the same value, so it's not part of the options.
+func (api *API) dispatchPreparedCalls(prepared []preparedCall, opts batchDispatchOptions) ([]multiCallResult, int64) {
+	respCap := api.store.maxResponseBytes
+	bodyBudget := respCap - multiCallEnvelopeOverhead - int64(len(prepared))*multiCallSlotOverhead
+	if bodyBudget < 0 {
+		bodyBudget = 0
+	}
+
+	results := make([]multiCallResult, 0, len(prepared))
+	var bodyBytesUsed int64
+
+	for _, p := range prepared {
+		var subReq *http.Request
+		if p.spec.method == http.MethodGet {
+			subReq = httptest.NewRequest(p.spec.method, p.subURL, nil)
+		} else {
+			subReq = httptest.NewRequest(p.spec.method, p.subURL, bytes.NewReader(p.body))
+			subReq.Header.Set("Content-Type", "application/json")
+		}
+		if opts.AdminContext {
+			subReq = withAdminContext(subReq)
+		}
+
+		// Wrap the per-call recorder with cappedResponseWriter so a
+		// pathological sub-call response is bounded in memory and
+		// reported to the slot as 507 instead of being buffered in
+		// full. crw.flush replays into rec, so rec.Body holds the
+		// finalised slot body either way.
+		rec := httptest.NewRecorder()
+		crw := newCappedResponseWriter(rec, respCap, time.Now())
+		p.spec.handler(crw, subReq)
+		crw.flush()
+
+		status := rec.Code
+		// Strip the trailing newline that json.Encoder emits — keeps
+		// the nested JSON tidy inside the outer results array.
+		bodyBytes := bytes.TrimRight(rec.Body.Bytes(), "\n")
+
+		// Strip MUST run before trim accounting. If trim fires after
+		// strip, the truncation marker is what the client sees; if
+		// trim fires before strip, the un-stripped body could be
+		// trimmed away but a smaller-than-cap version could still
+		// leak the rewritten scope name (`_guarded:<capId>:...`) in
+		// the slot body. Order is load-bearing — do not reorder.
+		if opts.StripPrefix != "" {
+			bodyBytes = stripGuardedPrefix(bodyBytes, opts.StripPrefix)
+		}
+
+		// Outer-envelope cap: would including this slot push the
+		// running body total past the conservative budget? If so, trim
+		// asymmetrically — 2xx keeps its status with a success
+		// truncation marker, non-2xx keeps its status with an error
+		// truncation marker. The 507 sub-calls produced just above
+		// take the error branch.
+		if bodyBytesUsed+int64(len(bodyBytes)) > bodyBudget {
+			if status >= 200 && status < 300 {
+				bodyBytes = []byte(multiCallSuccessTrim)
+			} else {
+				bodyBytes = []byte(multiCallErrorTrim)
+			}
+		}
+		bodyBytesUsed += int64(len(bodyBytes))
+
+		// Defensive copy — rec.Body's underlying slice would otherwise
+		// be the same buffer the next iteration's recorder writes
+		// into. (httptest allocates a new recorder per call here, so
+		// this is precaution rather than necessity, but it's cheap.)
+		slot := make([]byte, len(bodyBytes))
+		copy(slot, bodyBytes)
+		results = append(results, multiCallResult{Status: status, Body: slot})
+	}
+
+	return results, bodyBytesUsed
+}
+
 // handleMultiCall dispatches N self-contained sub-calls through the
 // existing API handlers and assembles the outer JSON envelope. See
 // CLAUDE.md → Phase 4 design signals → /multi_call for the design
@@ -298,62 +411,7 @@ func (api *API) handleMultiCall(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respCap := api.store.maxResponseBytes
-	bodyBudget := respCap - multiCallEnvelopeOverhead - int64(len(calls))*multiCallSlotOverhead
-	if bodyBudget < 0 {
-		bodyBudget = 0
-	}
-
-	results := make([]multiCallResult, 0, len(calls))
-	var bodyBytesUsed int64
-
-	for _, p := range prepared {
-		var subReq *http.Request
-		if p.spec.method == http.MethodGet {
-			subReq = httptest.NewRequest(p.spec.method, p.subURL, nil)
-		} else {
-			subReq = httptest.NewRequest(p.spec.method, p.subURL, bytes.NewReader(p.body))
-			subReq.Header.Set("Content-Type", "application/json")
-		}
-
-		// Wrap the per-call recorder with cappedResponseWriter so a
-		// pathological sub-call response is bounded in memory and
-		// reported to the slot as 507 instead of being buffered in
-		// full. crw.flush replays into rec, so rec.Body holds the
-		// finalised slot body either way.
-		rec := httptest.NewRecorder()
-		crw := newCappedResponseWriter(rec, respCap, time.Now())
-		p.spec.handler(crw, subReq)
-		crw.flush()
-
-		status := rec.Code
-		// Strip the trailing newline that json.Encoder emits — keeps
-		// the nested JSON tidy inside the outer results array.
-		bodyBytes := bytes.TrimRight(rec.Body.Bytes(), "\n")
-
-		// Outer-envelope cap: would including this slot push the
-		// running body total past the conservative budget? If so, trim
-		// asymmetrically — 2xx keeps its status with a success
-		// truncation marker, non-2xx keeps its status with an error
-		// truncation marker. The 507 sub-calls produced just above
-		// take the error branch.
-		if bodyBytesUsed+int64(len(bodyBytes)) > bodyBudget {
-			if status >= 200 && status < 300 {
-				bodyBytes = []byte(multiCallSuccessTrim)
-			} else {
-				bodyBytes = []byte(multiCallErrorTrim)
-			}
-		}
-		bodyBytesUsed += int64(len(bodyBytes))
-
-		// Defensive copy — rec.Body's underlying slice would otherwise
-		// be the same buffer the next iteration's recorder writes
-		// into. (httptest allocates a new recorder per call here, so
-		// this is precaution rather than necessity, but it's cheap.)
-		slot := make([]byte, len(bodyBytes))
-		copy(slot, bodyBytes)
-		results = append(results, multiCallResult{Status: status, Body: slot})
-	}
+	results, _ := api.dispatchPreparedCalls(prepared, batchDispatchOptions{})
 
 	writeJSONWithMeta(w, http.StatusOK, orderedFields{
 		{"ok", true},

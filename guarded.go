@@ -1,14 +1,12 @@
 package scopecache
 
 import (
-	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"net/http/httptest"
 	"time"
 )
 
@@ -274,54 +272,15 @@ func (api *API) handleGuarded(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Step 8-9: dispatch via shared loop, strip prefix from each result body.
-	respCap := api.store.maxResponseBytes
-	bodyBudget := respCap - multiCallEnvelopeOverhead - int64(len(calls))*multiCallSlotOverhead
-	if bodyBudget < 0 {
-		bodyBudget = 0
-	}
-
-	results := make([]multiCallResult, 0, len(calls))
-	var bodyBytesUsed int64
-
-	for _, p := range prepared {
-		var subReq *http.Request
-		if p.spec.method == http.MethodGet {
-			subReq = httptest.NewRequest(p.spec.method, p.subURL, nil)
-		} else {
-			subReq = httptest.NewRequest(p.spec.method, p.subURL, bytes.NewReader(p.body))
-			subReq.Header.Set("Content-Type", "application/json")
-		}
-		// Mark as admin-context so the inner handler skips the public
-		// reserved-prefix check (the rewritten scope starts with
-		// `_guarded:` and would otherwise be rejected).
-		subReq = withAdminContext(subReq)
-
-		rec := httptest.NewRecorder()
-		crw := newCappedResponseWriter(rec, respCap, time.Now())
-		p.spec.handler(crw, subReq)
-		crw.flush()
-
-		status := rec.Code
-		bodyBytes := bytes.TrimRight(rec.Body.Bytes(), "\n")
-
-		// Strip prefix from response body before envelope-budget
-		// accounting — the trim path then sees the post-strip size.
-		bodyBytes = stripGuardedPrefix(bodyBytes, prefix)
-
-		if bodyBytesUsed+int64(len(bodyBytes)) > bodyBudget {
-			if status >= 200 && status < 300 {
-				bodyBytes = []byte(multiCallSuccessTrim)
-			} else {
-				bodyBytes = []byte(multiCallErrorTrim)
-			}
-		}
-		bodyBytesUsed += int64(len(bodyBytes))
-
-		slot := make([]byte, len(bodyBytes))
-		copy(slot, bodyBytes)
-		results = append(results, multiCallResult{Status: status, Body: slot})
-	}
+	// Step 8-9: dispatch via the shared helper. AdminContext lets the
+	// inner handler accept rewritten `_guarded:*` scopes; StripPrefix
+	// peels the rewritten prefix off every result body before the trim
+	// check so the truncation marker (if it fires) cannot leak the
+	// rewritten form.
+	results, bodyBytesUsed := api.dispatchPreparedCalls(prepared, batchDispatchOptions{
+		AdminContext: true,
+		StripPrefix:  prefix,
+	})
 
 	// Step 10: counter increments. Best-effort — failures are silently
 	// ignored (observability counter, not auth). Calls counter advances

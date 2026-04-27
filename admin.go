@@ -1,10 +1,8 @@
 package scopecache
 
 import (
-	"bytes"
 	"fmt"
 	"net/http"
-	"net/http/httptest"
 	"time"
 )
 
@@ -100,49 +98,11 @@ func (api *API) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respCap := api.store.maxResponseBytes
-	bodyBudget := respCap - multiCallEnvelopeOverhead - int64(len(calls))*multiCallSlotOverhead
-	if bodyBudget < 0 {
-		bodyBudget = 0
-	}
-
-	results := make([]multiCallResult, 0, len(calls))
-	var bodyBytesUsed int64
-
-	for _, p := range prepared {
-		var subReq *http.Request
-		if p.spec.method == http.MethodGet {
-			subReq = httptest.NewRequest(p.spec.method, p.subURL, nil)
-		} else {
-			subReq = httptest.NewRequest(p.spec.method, p.subURL, bytes.NewReader(p.body))
-			subReq.Header.Set("Content-Type", "application/json")
-		}
-		// Mark the synthetic request as originating from /admin so the
-		// inner handler's rejectReservedScope check skips — admin can
-		// freely read/write `_guarded:*`, `_counters_*`, etc.
-		subReq = withAdminContext(subReq)
-
-		rec := httptest.NewRecorder()
-		crw := newCappedResponseWriter(rec, respCap, time.Now())
-		p.spec.handler(crw, subReq)
-		crw.flush()
-
-		status := rec.Code
-		bodyBytes := bytes.TrimRight(rec.Body.Bytes(), "\n")
-
-		if bodyBytesUsed+int64(len(bodyBytes)) > bodyBudget {
-			if status >= 200 && status < 300 {
-				bodyBytes = []byte(multiCallSuccessTrim)
-			} else {
-				bodyBytes = []byte(multiCallErrorTrim)
-			}
-		}
-		bodyBytesUsed += int64(len(bodyBytes))
-
-		slot := make([]byte, len(bodyBytes))
-		copy(slot, bodyBytes)
-		results = append(results, multiCallResult{Status: status, Body: slot})
-	}
+	// AdminContext flips the inner handler's rejectReservedScope check
+	// off, letting operator sub-calls reach `_tokens`, `_guarded:*`,
+	// `_counters_*` etc. directly. /admin is the ONLY way reserved
+	// scopes are written to in normal operation.
+	results, _ := api.dispatchPreparedCalls(prepared, batchDispatchOptions{AdminContext: true})
 
 	writeJSONWithMeta(w, http.StatusOK, orderedFields{
 		{"ok", true},
