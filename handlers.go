@@ -1270,18 +1270,14 @@ RULES:
 - every byte-ish field in JSON responses (approx_store_mb, max_store_mb, approx_scope_mb, added_mb) is expressed in MiB with 4 decimals — one unit across /stats, /delete_scope_candidates and 507 responses
 - the listening socket path defaults to /run/scopecache.sock on Linux and $TMPDIR/scopecache.sock on macOS/Windows; override with SCOPECACHE_SOCKET_PATH
 
-ENDPOINTS:
+ENDPOINTS (public mux):
 GET  /help - show this help text
 POST /append - append one item to a scope
-POST /warm - warm or refresh one or more scopes
-POST /rebuild - rebuild the entire cache
 POST /update - update one item by scope + id or scope + seq (exactly one of id/seq required)
 POST /upsert - create or replace one item by scope + id; response carries "created": true for a fresh item, false for a replace
 POST /counter_add - atomically add 'by' (signed int64, non-zero, within ±(2^53-1)) to the integer counter at scope + id; creates a fresh counter with starting value 'by' on miss; 409 if the existing item is not a counter-valued integer; response carries {ok, created, value}
 POST /delete - delete one item by scope + id or scope + seq (exactly one of id/seq required)
 POST /delete_up_to - delete every item in a scope with seq <= max_seq
-POST /delete_scope - delete one entire scope from the cache
-POST /wipe - delete every scope from the cache in one atomic call (no request body); response carries {ok, deleted_scopes, deleted_items, freed_mb}
 GET  /head - get the oldest items from a scope; supports optional after_seq for cursor-based forward reads (offset is not supported, use /tail for position-based paging)
 GET  /tail - get the most recent items from a scope (supports optional offset)
 GET  /ts_range - get items whose optional top-level ts falls inside [since_ts, until_ts] (both inclusive, either may be omitted but at least one is required); returns seq-order, items without ts are skipped, no pagination cursor — narrow the window and retry if truncated=true
@@ -1289,7 +1285,14 @@ GET  /get - get one item by scope + id or scope + seq
 GET  /render - serve one item's payload as raw bytes (no JSON envelope); miss returns 404; JSON-string payloads are decoded one layer so cached HTML/XML/text is served as-is; Content-Type is application/octet-stream — fronting proxy is expected to set the real type if browser-facing
 GET  /stats - show store stats and approximate store size
 GET  /delete_scope_candidates - list scope eviction candidates, sorted by oldest last_access_ts (response includes last_7d_read_count for client-side filtering/sorting)
-POST /multi_call - sequentially dispatch N independent sub-calls in one HTTP roundtrip; body is {"calls": [{"path": "/get|/append|...", "query": {...}, "body": {...}}, ...]}; allowed paths: /append, /get, /head, /tail, /ts_range, /update, /upsert, /counter_add, /delete, /delete_up_to, /delete_scope, /stats, /delete_scope_candidates; response is {ok, count, results: [{status, body}, ...], approx_response_mb, duration_us} in input order. No cross-call atomicity — a write at index 0 stays applied even if index 1 fails. Outer envelope honours the per-response cap (SCOPECACHE_MAX_RESPONSE_MB); slot bodies that would push the envelope past the cap are replaced with a minimal {"ok":true|false,"response_truncated":true} marker while the slot's status is preserved.
+POST /multi_call - sequentially dispatch N independent sub-calls in one HTTP roundtrip; body is {"calls": [{"path": "/get|/append|...", "query": {...}, "body": {...}}, ...]}; allowed paths: /append, /get, /head, /tail, /ts_range, /update, /upsert, /counter_add, /delete, /delete_up_to, /stats, /delete_scope_candidates; response is {ok, count, results: [{status, body}, ...], approx_response_mb, duration_us} in input order. No cross-call atomicity — a write at index 0 stays applied even if index 1 fails. Outer envelope honours the per-response cap (SCOPECACHE_MAX_RESPONSE_MB); slot bodies that would push the envelope past the cap are replaced with a minimal {"ok":true|false,"response_truncated":true} marker while the slot's status is preserved.
+
+ADMIN-ONLY (gated outside the cache by socket permissions or Caddyfile route):
+POST /admin - operator-elevated dispatcher; same {"calls":[...]} body and {"results":[...]} envelope as /multi_call. Reaches reserved scopes (_*) directly; no rewrite. Wider whitelist than /multi_call: /append, /get, /head, /tail, /ts_range, /update, /upsert, /counter_add, /delete, /delete_up_to, /delete_scope, /warm, /rebuild, /wipe, /stats, /delete_scope_candidates. Excluded: /help (text/plain), /render (raw bytes don't fit a JSON results array), /multi_call/guarded/admin (self-reference loops). /warm, /rebuild, /wipe, /delete_scope are reachable ONLY through /admin — they are not on the public mux.
+
+OPTIONAL ENDPOINTS (registered only when configured):
+POST /guarded - tenant-facing multi-call gateway; body {"token":"<opaque>","calls":[...]} derives capability_id = HMAC_SHA256(SCOPECACHE_SERVER_SECRET, token), gates on _tokens membership, and rewrites every sub-call's scope to _guarded:<capability_id>:<original-scope>. Whitelist excludes /delete_scope, /stats, /delete_scope_candidates, /wipe, /warm, /rebuild, and /render. Registered only when SCOPECACHE_SERVER_SECRET is set; otherwise the route returns 404.
+POST /inbox - shared write-only ingestion; single /append per request (no envelope). Cache assigns id (capability_id:<16-hex random>) and ts (now in millis). Tenants cannot read what they wrote — reads happen via /admin. Registered only when SCOPECACHE_SERVER_SECRET is set AND at least one inbox scope name is configured (SCOPECACHE_INBOX_SCOPES on the standalone binary; repeated 'inbox_scope <name>' directives in the Caddy module).
 
 NOTES:
 - /warm replaces only the scopes present in the request
