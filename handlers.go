@@ -836,6 +836,81 @@ func (api *API) handleWipe(w http.ResponseWriter, r *http.Request) {
 	}, started)
 }
 
+// writeItemsHit assembles and writes the success response for a
+// list-returning read endpoint (/head, /tail, /ts_range). Two
+// load-bearing invariants live in this helper that previously sat
+// parallel in three handler bodies:
+//
+//  1. recordRead is called only when items is non-empty. An empty
+//     result window (e.g. /tail of an existing scope where no items
+//     match the offset, or /ts_range with no items in the time
+//     window) is effectively a miss and must NOT inflate the scope's
+//     last_7d_read_count — that signal drives operator decisions on
+//     /delete_scope_candidates and would silently corrupt if the
+//     `len > 0` guard was forgotten in any of the three handlers.
+//  2. estimateMultiItemResponseBytes runs BEFORE writeJSONWithMeta.
+//     Once the response body has been written there is no way to
+//     switch to a 507 without leaving a half-flushed body on the
+//     wire — the cap check is a one-shot opportunity per request.
+//
+// `extra` slots between `count` and `truncated` so /tail can carry
+// its `offset` field at the right wire position; /head and
+// /ts_range pass nil. Field order is load-bearing: matches the
+// existing wire shape exactly. Do not reorder.
+func (api *API) writeItemsHit(
+	w http.ResponseWriter,
+	started time.Time,
+	buf *ScopeBuffer,
+	items []Item,
+	truncated bool,
+	extra orderedFields,
+) {
+	if len(items) > 0 {
+		buf.recordRead(nowUnixMicro())
+		if estimated := estimateMultiItemResponseBytes(items); estimated > api.store.maxResponseBytes {
+			responseTooLarge(w, started, estimated, api.store.maxResponseBytes)
+			return
+		}
+	}
+
+	fields := make(orderedFields, 0, 5+len(extra))
+	fields = append(fields,
+		kv{"ok", true},
+		kv{"hit", len(items) > 0},
+		kv{"count", len(items)},
+	)
+	fields = append(fields, extra...)
+	fields = append(fields,
+		kv{"truncated", truncated},
+		kv{"items", items},
+	)
+	writeJSONWithMeta(w, http.StatusOK, fields, started)
+}
+
+// writeItemsMiss writes the canonical "scope does not exist" response
+// for a list-returning read endpoint. Same field order as
+// writeItemsHit's success path; truncated is always false; items is
+// the sentinel empty slice (NOT nil — `[]Item{}` marshals as `[]`,
+// nil would marshal as `null` and break clients that iterate).
+func writeItemsMiss(
+	w http.ResponseWriter,
+	started time.Time,
+	extra orderedFields,
+) {
+	fields := make(orderedFields, 0, 5+len(extra))
+	fields = append(fields,
+		kv{"ok", true},
+		kv{"hit", false},
+		kv{"count", 0},
+	)
+	fields = append(fields, extra...)
+	fields = append(fields,
+		kv{"truncated", false},
+		kv{"items", []Item{}},
+	)
+	writeJSONWithMeta(w, http.StatusOK, fields, started)
+}
+
 func (api *API) handleHead(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
 
@@ -872,34 +947,12 @@ func (api *API) handleHead(w http.ResponseWriter, r *http.Request) {
 
 	buf, ok := api.store.getScope(q.Scope)
 	if !ok {
-		writeJSONWithMeta(w, http.StatusOK, orderedFields{
-			{"ok", true},
-			{"hit", false},
-			{"count", 0},
-			{"truncated", false},
-			{"items", []Item{}},
-		}, started)
+		writeItemsMiss(w, started, nil)
 		return
 	}
 
 	items, truncated := buf.sinceSeq(afterSeq, q.Limit)
-	// Only a non-empty result counts toward read-heat. An empty window is
-	// effectively a miss and should not skew eviction.
-	if len(items) > 0 {
-		buf.recordRead(nowUnixMicro())
-		if estimated := estimateMultiItemResponseBytes(items); estimated > api.store.maxResponseBytes {
-			responseTooLarge(w, started, estimated, api.store.maxResponseBytes)
-			return
-		}
-	}
-
-	writeJSONWithMeta(w, http.StatusOK, orderedFields{
-		{"ok", true},
-		{"hit", len(items) > 0},
-		{"count", len(items)},
-		{"truncated", truncated},
-		{"items", items},
-	}, started)
+	api.writeItemsHit(w, started, buf, items, truncated, nil)
 }
 
 func (api *API) handleTail(w http.ResponseWriter, r *http.Request) {
@@ -921,36 +974,18 @@ func (api *API) handleTail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// /tail's wire shape carries `offset` between `count` and `truncated`
+	// — the helpers slot `extra` at exactly that position.
+	offsetField := orderedFields{kv{"offset", offset}}
+
 	buf, ok := api.store.getScope(q.Scope)
 	if !ok {
-		writeJSONWithMeta(w, http.StatusOK, orderedFields{
-			{"ok", true},
-			{"hit", false},
-			{"count", 0},
-			{"offset", offset},
-			{"truncated", false},
-			{"items", []Item{}},
-		}, started)
+		writeItemsMiss(w, started, offsetField)
 		return
 	}
 
 	items, truncated := buf.tailOffset(q.Limit, offset)
-	if len(items) > 0 {
-		buf.recordRead(nowUnixMicro())
-		if estimated := estimateMultiItemResponseBytes(items); estimated > api.store.maxResponseBytes {
-			responseTooLarge(w, started, estimated, api.store.maxResponseBytes)
-			return
-		}
-	}
-
-	writeJSONWithMeta(w, http.StatusOK, orderedFields{
-		{"ok", true},
-		{"hit", len(items) > 0},
-		{"count", len(items)},
-		{"offset", offset},
-		{"truncated", truncated},
-		{"items", items},
-	}, started)
+	api.writeItemsHit(w, started, buf, items, truncated, offsetField)
 }
 
 // handleTsRange answers time-window queries: return every item in a scope
@@ -992,32 +1027,12 @@ func (api *API) handleTsRange(w http.ResponseWriter, r *http.Request) {
 
 	buf, ok := api.store.getScope(q.Scope)
 	if !ok {
-		writeJSONWithMeta(w, http.StatusOK, orderedFields{
-			{"ok", true},
-			{"hit", false},
-			{"count", 0},
-			{"truncated", false},
-			{"items", []Item{}},
-		}, started)
+		writeItemsMiss(w, started, nil)
 		return
 	}
 
 	items, truncated := buf.tsRange(sinceTs, untilTs, q.Limit)
-	if len(items) > 0 {
-		buf.recordRead(nowUnixMicro())
-		if estimated := estimateMultiItemResponseBytes(items); estimated > api.store.maxResponseBytes {
-			responseTooLarge(w, started, estimated, api.store.maxResponseBytes)
-			return
-		}
-	}
-
-	writeJSONWithMeta(w, http.StatusOK, orderedFields{
-		{"ok", true},
-		{"hit", len(items) > 0},
-		{"count", len(items)},
-		{"truncated", truncated},
-		{"items", items},
-	}, started)
+	api.writeItemsHit(w, started, buf, items, truncated, nil)
 }
 
 func (api *API) handleGet(w http.ResponseWriter, r *http.Request) {
