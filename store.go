@@ -437,24 +437,18 @@ func (b *ScopeBuffer) counterAdd(scope, id string, by int64) (int64, bool, error
 		}
 
 		newPayload := json.RawMessage(strconv.FormatInt(newValue, 10))
-		delta := int64(len(newPayload)) - int64(len(existing.Payload))
-		if b.store != nil && delta != 0 {
-			ok, total, max := b.store.reserveBytes(delta)
-			if !ok {
-				return 0, false, &StoreFullError{StoreBytes: total, AddedBytes: delta, Cap: max}
-			}
+		delta, err := b.reservePayloadDeltaLocked(len(existing.Payload), len(newPayload))
+		if err != nil {
+			return 0, false, err
 		}
 
 		for i := range b.items {
 			if b.items[i].ID != id {
 				continue
 			}
-			b.items[i].Payload = newPayload
-
-			updated := b.items[i]
-			b.bySeq[updated.Seq] = updated
-			b.byID[id] = updated
-			b.bytes += delta
+			// /counter_add never updates ts (only the integer payload),
+			// so pass nil for ts — the helper preserves the existing ts.
+			b.replaceItemAtIndexLocked(i, newPayload, nil, delta)
 			return newValue, false, nil
 		}
 
@@ -508,6 +502,111 @@ func parseCounterValue(payload json.RawMessage) (int64, error) {
 	return v, nil
 }
 
+// --- low-level mutation primitives ------------------------------------------
+//
+// These three helpers (`*Locked` suffix) factor out the bytes-accounting,
+// index-syncing and GC-zeroing concerns that previously lived in parallel
+// across updateByID, updateBySeq, counterAdd, deleteByID, and deleteBySeq.
+// Each helper PRECONDITION: caller MUST hold b.mu. The helpers do not
+// attempt to acquire the lock themselves — calling them without the lock
+// is a race; calling them WITH the lock then re-acquiring is a deadlock.
+// The Locked suffix is the convention; the comment above each helper
+// repeats the precondition for callers reading top-down.
+
+// reservePayloadDeltaLocked computes the byte delta between an old and a
+// new payload (newSize − oldSize) and, if the delta is non-zero AND the
+// buffer is store-attached, reserves the delta against the store-wide
+// byte budget via reserveBytes. Returns the delta so the caller can
+// update b.bytes consistently after a successful mutation.
+//
+// PRECONDITION: caller holds b.mu.
+//
+// Returns *StoreFullError when the cap reservation fails. No store
+// state is mutated in that case — the caller can return the error
+// without rolling anything back. Centralises the (b.store != nil &&
+// delta != 0) guard: forgetting either condition produces a nil-
+// pointer crash on orphan buffers (used in tests) or a CAS for a
+// zero delta (cheap but pointless).
+func (b *ScopeBuffer) reservePayloadDeltaLocked(oldSize, newSize int) (int64, error) {
+	delta := int64(newSize) - int64(oldSize)
+	if b.store != nil && delta != 0 {
+		ok, current, max := b.store.reserveBytes(delta)
+		if !ok {
+			return 0, &StoreFullError{StoreBytes: current, AddedBytes: delta, Cap: max}
+		}
+	}
+	return delta, nil
+}
+
+// replaceItemAtIndexLocked overwrites the payload at items[i] (always)
+// and the ts (only if non-nil), then syncs both secondary indexes
+// (bySeq unconditionally, byID only when the item has a non-empty id),
+// and finally updates b.bytes by the supplied delta.
+//
+// PRECONDITION: caller holds b.mu and i is a valid index into b.items.
+// Bounds-check is the caller's responsibility — the helper does not
+// validate i because callers reach it via O(log n) binary-search or
+// guaranteed-hit lookups, and re-checking would defeat that.
+//
+// The byID sync is conditional because /append accepts items without
+// an id (id="" is legal), so not every item has a byID entry to keep
+// in sync. bySeq is unconditional because every item has a seq.
+func (b *ScopeBuffer) replaceItemAtIndexLocked(i int, payload json.RawMessage, ts *int64, delta int64) {
+	b.items[i].Payload = payload
+	if ts != nil {
+		b.items[i].Ts = ts
+	}
+	updated := b.items[i]
+	b.bySeq[updated.Seq] = updated
+	if updated.ID != "" {
+		b.byID[updated.ID] = updated
+	}
+	b.bytes += delta
+}
+
+// deleteIndexLocked removes the item at items[i] in O(n) tail-shift,
+// zeroes the now-duplicate last slot (so the GC can reclaim the
+// removed Item's payload bytes — without this the backing array
+// keeps a reference and the payload leaks), removes the item from
+// bySeq + byID (the latter only if the id is non-empty), and
+// releases the item's bytes from both b.bytes and the store-wide
+// totalBytes counter when store-attached.
+//
+// PRECONDITION: caller holds b.mu and i is a valid index into b.items.
+//
+// Centralises three invariants that previously lived parallel across
+// deleteByID and deleteBySeq:
+//
+//  1. GC-zeroing of the duplicate last slot before truncate. Forgetting
+//     this leaks payloads — silent until /stats drifts under load.
+//  2. Lockstep b.bytes / s.totalBytes update. Forgetting one desyncs
+//     the per-scope and store-wide counters and corrupts /stats.
+//  3. Conditional byID delete. Forgetting the `if removed.ID != ""`
+//     guard would `delete(map, "")` which is a no-op but signals the
+//     reader didn't think about empty-id items.
+func (b *ScopeBuffer) deleteIndexLocked(i int) {
+	removed := b.items[i]
+	removedSize := approxItemSize(removed)
+
+	// Tail-shift then zero the now-duplicate last slot before
+	// shrinking. Without the zero the backing array keeps a
+	// reference to the removed Item (and its payload bytes) and
+	// prevents GC.
+	copy(b.items[i:], b.items[i+1:])
+	b.items[len(b.items)-1] = Item{}
+	b.items = b.items[:len(b.items)-1]
+
+	delete(b.bySeq, removed.Seq)
+	if removed.ID != "" {
+		delete(b.byID, removed.ID)
+	}
+
+	b.bytes -= removedSize
+	if b.store != nil {
+		b.store.totalBytes.Add(-removedSize)
+	}
+}
+
 // updateByID mutates the item at (scope, id). Payload is always overwritten.
 // Ts follows "absent → preserve, present → overwrite" semantics: a nil ts
 // leaves the stored ts alone, a non-nil ts replaces it. This asymmetry with
@@ -529,28 +628,16 @@ func (b *ScopeBuffer) updateByID(id string, payload json.RawMessage, ts *int64) 
 	// Only the payload changes on /update; scope/id/ts are unchanged in size,
 	// so the byte delta reduces to len(new_payload) - len(old_payload). A
 	// shrink can't fail the cap check, but a grow must reserve first.
-	delta := int64(len(payload)) - int64(len(existing.Payload))
-	if b.store != nil && delta != 0 {
-		ok, current, max := b.store.reserveBytes(delta)
-		if !ok {
-			return 0, &StoreFullError{StoreBytes: current, AddedBytes: delta, Cap: max}
-		}
+	delta, err := b.reservePayloadDeltaLocked(len(existing.Payload), len(payload))
+	if err != nil {
+		return 0, err
 	}
 
 	for i := range b.items {
 		if b.items[i].ID != id {
 			continue
 		}
-
-		b.items[i].Payload = payload
-		if ts != nil {
-			b.items[i].Ts = ts
-		}
-
-		updated := b.items[i]
-		b.bySeq[updated.Seq] = updated
-		b.byID[id] = updated
-		b.bytes += delta
+		b.replaceItemAtIndexLocked(i, payload, ts, delta)
 		return 1, nil
 	}
 
@@ -571,12 +658,9 @@ func (b *ScopeBuffer) updateBySeq(seq uint64, payload json.RawMessage, ts *int64
 		return 0, nil
 	}
 
-	delta := int64(len(payload)) - int64(len(existing.Payload))
-	if b.store != nil && delta != 0 {
-		ok, current, max := b.store.reserveBytes(delta)
-		if !ok {
-			return 0, &StoreFullError{StoreBytes: current, AddedBytes: delta, Cap: max}
-		}
+	delta, err := b.reservePayloadDeltaLocked(len(existing.Payload), len(payload))
+	if err != nil {
+		return 0, err
 	}
 
 	i := sort.Search(len(b.items), func(i int) bool {
@@ -587,17 +671,7 @@ func (b *ScopeBuffer) updateBySeq(seq uint64, payload json.RawMessage, ts *int64
 		return 0, nil
 	}
 
-	b.items[i].Payload = payload
-	if ts != nil {
-		b.items[i].Ts = ts
-	}
-
-	updated := b.items[i]
-	b.bySeq[seq] = updated
-	if updated.ID != "" {
-		b.byID[updated.ID] = updated
-	}
-	b.bytes += delta
+	b.replaceItemAtIndexLocked(i, payload, ts, delta)
 	return 1, nil
 }
 
@@ -625,20 +699,7 @@ func (b *ScopeBuffer) deleteByID(id string) (int, error) {
 		return 0, nil
 	}
 
-	removedSize := approxItemSize(existing)
-	// Shift the tail down, then zero the now-duplicate last slot before
-	// shrinking. Without this the backing array keeps a reference and
-	// the Item's payload cannot be GC'd.
-	copy(b.items[i:], b.items[i+1:])
-	b.items[len(b.items)-1] = Item{}
-	b.items = b.items[:len(b.items)-1]
-	delete(b.bySeq, existing.Seq)
-	delete(b.byID, id)
-
-	b.bytes -= removedSize
-	if b.store != nil {
-		b.store.totalBytes.Add(-removedSize)
-	}
+	b.deleteIndexLocked(i)
 	return 1, nil
 }
 
@@ -663,20 +724,7 @@ func (b *ScopeBuffer) deleteBySeq(seq uint64) (int, error) {
 		return 0, nil
 	}
 
-	removed := b.items[i]
-	removedSize := approxItemSize(removed)
-	copy(b.items[i:], b.items[i+1:])
-	b.items[len(b.items)-1] = Item{}
-	b.items = b.items[:len(b.items)-1]
-	delete(b.bySeq, seq)
-	if removed.ID != "" {
-		delete(b.byID, removed.ID)
-	}
-
-	b.bytes -= removedSize
-	if b.store != nil {
-		b.store.totalBytes.Add(-removedSize)
-	}
+	b.deleteIndexLocked(i)
 	return 1, nil
 }
 
