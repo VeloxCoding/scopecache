@@ -1,0 +1,17 @@
+# Force LF line endings on every text file in this repo so gofmt,
+# go vet, and other tooling produce consistent output regardless of
+# the contributor's OS. Without this, Windows checkouts pick up
+# CRLF on the working tree and gofmt-check in CI fires on every
+# file. Binary types are listed explicitly so git never tries to
+# normalise them.
+* text=auto eol=lf
+
+# Binary types — preserve byte-for-byte.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.gz binary
