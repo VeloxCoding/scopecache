@@ -375,6 +375,46 @@ func TestGuarded_RejectsBodyAndQueryScopeSmuggle(t *testing.T) {
 	}
 }
 
+// rewriteCallScope is method-aware since v0.5.20. GET sub-calls
+// must carry `scope` in the URL query (the inner handler reads
+// only the query); POST sub-calls must carry it in the body. The
+// previous implementation accepted scope in either location and
+// rewrote whichever it found — but the dispatched handler only
+// reads one of the two for its method, so a misplaced scope was
+// silently rewritten into a slot the handler ignored, and the
+// call failed downstream with a confusing "missing scope" error
+// that did not name the real problem. Up-front, per-method
+// rejection gives the caller a single clear error site.
+func TestGuarded_RejectsBodyScopeOnGetSubcall(t *testing.T) {
+	h, _ := newTestHandler(10)
+	provisionTenant(t, h, "tok-loc")
+
+	// /get is a GET sub-call; scope must be in query, not body.
+	body := `{"token":"tok-loc","calls":[{"path":"/get","body":{"scope":"events","id":"x"}}]}`
+	code, _, raw := doRequest(t, h, "POST", "/guarded", body)
+	if code != 400 {
+		t.Fatalf("GET with body.scope: code=%d want 400, body=%s", code, raw)
+	}
+	if !strings.Contains(raw, "must be in query for GET") {
+		t.Errorf("expected method-aware error, got: %s", raw)
+	}
+}
+
+func TestGuarded_RejectsQueryScopeOnPostSubcall(t *testing.T) {
+	h, _ := newTestHandler(10)
+	provisionTenant(t, h, "tok-loc")
+
+	// /append is a POST sub-call; scope must be in body, not query.
+	body := `{"token":"tok-loc","calls":[{"path":"/append","query":{"scope":"events"},"body":{"id":"x","payload":{"v":1}}}]}`
+	code, _, raw := doRequest(t, h, "POST", "/guarded", body)
+	if code != 400 {
+		t.Fatalf("POST with query.scope: code=%d want 400, body=%s", code, raw)
+	}
+	if !strings.Contains(raw, "must be in body for POST") {
+		t.Errorf("expected method-aware error, got: %s", raw)
+	}
+}
+
 // /guarded shares the pre-flight response-cap check with /multi_call.
 // Runs before the token check so an undersized cap surfaces directly,
 // not as a misleading 401.

@@ -95,22 +95,26 @@ func computeCapabilityID(serverSecret, token string) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// rewriteCallScope mutates a multiCallEntry's body and query so any
+// rewriteCallScope mutates a multiCallEntry's body or query so the
 // `scope` field has the prefix prepended. Returns the resulting
-// (rewritten) scope value for use in the existence check, or "" if the
-// call carries no scope at all (e.g. an /admin /stats call would, but
-// /guarded's whitelist excludes those — every /guarded sub-call has a
-// scope in either body or query).
+// (rewritten) scope value for use in the existence check.
 //
-// Refuses to rewrite a call that carries `scope` in BOTH body and
-// query: a GET sub-call's handler reads only the URL query, but the
-// existence check would have run on whichever scope this function
-// happened to rewrite first. A caller setting body.scope=allowed AND
-// query.scope=cross-tenant would otherwise pass the existence check
-// on the body value while the GET handler reads the un-rewritten
-// query value — a cross-tenant read. There is no legitimate reason to
-// set both, so reject the whole batch up-front.
-func rewriteCallScope(call *multiCallEntry, prefix string) (string, error) {
+// Method-aware since v0.5.20: GET sub-calls must carry `scope` in
+// the URL query; POST sub-calls must carry it in the body. The
+// inner handlers read only one of the two (matching their HTTP
+// method), so a misplaced scope was previously rewritten by this
+// function and then ignored by the dispatched handler — the call
+// failed downstream with a "missing scope" error from a different
+// code path. Rejecting up-front per method gives the caller a
+// clear, single error site and keeps rewrite/dispatch in lockstep.
+//
+// Also refuses scope in BOTH body and query (kept from the original
+// implementation): a caller setting body.scope=allowed AND
+// query.scope=cross-tenant would have passed the existence check on
+// whichever value was rewritten first while the inner handler read
+// the other un-rewritten one. There is no legitimate reason to set
+// both, so reject the whole batch up-front.
+func rewriteCallScope(call *multiCallEntry, prefix, method string) (string, error) {
 	bodyHasScope := false
 	var bodyMap map[string]json.RawMessage
 	if len(call.Body) > 0 {
@@ -125,8 +129,30 @@ func rewriteCallScope(call *multiCallEntry, prefix string) (string, error) {
 		return "", fmt.Errorf("'scope' must be in body OR query, not both")
 	}
 
-	// Body shape: rewrite body.scope if present.
-	if bodyHasScope {
+	switch method {
+	case http.MethodGet:
+		if bodyHasScope {
+			return "", fmt.Errorf("'scope' must be in query for GET sub-calls (body.scope is ignored by the inner handler)")
+		}
+		if !queryHasScope {
+			return "", fmt.Errorf("missing 'scope' in query for GET sub-call")
+		}
+		var s string
+		if err := json.Unmarshal(call.Query["scope"], &s); err != nil {
+			return "", fmt.Errorf("'scope' in query is not a string: %s", err)
+		}
+		rewritten := prefix + s
+		newScopeRaw, _ := json.Marshal(rewritten)
+		call.Query["scope"] = newScopeRaw
+		return rewritten, nil
+
+	case http.MethodPost:
+		if queryHasScope {
+			return "", fmt.Errorf("'scope' must be in body for POST sub-calls (query.scope is ignored by the inner handler)")
+		}
+		if !bodyHasScope {
+			return "", fmt.Errorf("missing 'scope' in body for POST sub-call")
+		}
 		var s string
 		if err := json.Unmarshal(bodyMap["scope"], &s); err != nil {
 			return "", fmt.Errorf("'scope' in body is not a string: %s", err)
@@ -140,19 +166,12 @@ func rewriteCallScope(call *multiCallEntry, prefix string) (string, error) {
 		}
 		call.Body = newBody
 		return rewritten, nil
+
+	default:
+		// /guarded's whitelist only contains GET and POST handlers;
+		// any other method here is an internal bug, not a client error.
+		return "", fmt.Errorf("internal: unexpected method %q for sub-call", method)
 	}
-	// Query shape: rewrite query["scope"] if present.
-	if queryHasScope {
-		var s string
-		if err := json.Unmarshal(call.Query["scope"], &s); err != nil {
-			return "", fmt.Errorf("'scope' in query is not a string: %s", err)
-		}
-		rewritten := prefix + s
-		newScopeRaw, _ := json.Marshal(rewritten)
-		call.Query["scope"] = newScopeRaw
-		return rewritten, nil
-	}
-	return "", nil
 }
 
 // handleGuarded is the tenant-facing multi-call gateway. Token in body
@@ -227,19 +246,19 @@ func (api *API) handleGuarded(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Step 7: scope rewrite per call. The rewrite itself never fails
-	// (any string is acceptable as a prefixed scope); but a call that
-	// carries no scope at all is malformed and rejects the batch.
+	// Step 7: scope rewrite per call. Method-aware — GET sub-calls
+	// must carry scope in the query, POST sub-calls in the body.
+	// Whitelist was already enforced in step 6, so guardedCallSpecs
+	// lookup is guaranteed to hit; the defensive `ok` check just
+	// makes future refactors loud instead of silent.
 	for i := range calls {
-		rewritten, err := rewriteCallScope(&calls[i], prefix)
-		if err != nil {
-			badRequest(w, started, fmt.Sprintf("calls[%d]: %s", i, err.Error()))
+		spec, ok := api.guardedCallSpecs[calls[i].Path]
+		if !ok {
+			badRequest(w, started, fmt.Sprintf("calls[%d]: path %q is not allowed in /guarded", i, calls[i].Path))
 			return
 		}
-		if rewritten == "" {
-			// /guarded's whitelist is per-scope only; a call with no
-			// scope in body or query is malformed.
-			badRequest(w, started, fmt.Sprintf("calls[%d]: missing 'scope'", i))
+		if _, err := rewriteCallScope(&calls[i], prefix, spec.method); err != nil {
+			badRequest(w, started, fmt.Sprintf("calls[%d]: %s", i, err.Error()))
 			return
 		}
 	}
