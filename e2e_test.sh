@@ -91,6 +91,26 @@ call() {
     LAST_BODY=$_bod
 }
 
+# quiet_call: like call() but does not emit an `ok ...` line on
+# success — only fails are logged. Use for tight loops of muterende
+# calls where every iteration on the happy path adds line noise but
+# a single failed iteration in the middle would otherwise be
+# invisible until the eventual end-state assertion. The pass
+# counter is still incremented per success so the trailing
+# pass/fail summary stays accurate.
+quiet_call() {
+    _label=$1; _want=$2; _method=$3; _path=$4; _body=${5:-}
+    _out=$(req "$_method" "$_path" "$_body")
+    _status=$(printf '%s' "$_out" | head -n1)
+    if [ "$_status" = "$_want" ]; then
+        pass=$((pass+1))
+    else
+        _bod=$(printf '%s' "$_out" | tail -n +2)
+        bad "$_label: want $_want got $_status"
+        printf '       body: %s\n' "$_bod"
+    fi
+}
+
 # admin_call: dispatches a single sub-call through /admin's envelope and
 # returns the SLOT's status + body. Used for /wipe, /warm, /rebuild,
 # /delete_scope which are no longer reachable on the public mux. The
@@ -285,11 +305,11 @@ say '== arithmetic sanity =='
 
 # counter: 10x(+1) + 3x(-1) must land at exactly 7
 i=0; while [ $i -lt 10 ]; do
-    req POST /counter_add '{"scope":"cmath","id":"n","by":1}'  >/dev/null
+    quiet_call "counter +1 #$i" 200 POST /counter_add '{"scope":"cmath","id":"n","by":1}'
     i=$((i+1))
 done
 i=0; while [ $i -lt 3 ]; do
-    req POST /counter_add '{"scope":"cmath","id":"n","by":-1}' >/dev/null
+    quiet_call "counter -1 #$i" 200 POST /counter_add '{"scope":"cmath","id":"n","by":-1}'
     i=$((i+1))
 done
 call 'counter: read final'              200 GET    '/get?scope=cmath&id=n'
@@ -300,7 +320,7 @@ esac
 
 # delete_up_to: 10 appends, trim up to seq 6, only t7..t10 must survive
 i=1; while [ $i -le 10 ]; do
-    req POST /append "{\"scope\":\"tmath\",\"id\":\"t$i\",\"payload\":$i}" >/dev/null
+    quiet_call "tmath /append #$i" 200 POST /append "{\"scope\":\"tmath\",\"id\":\"t$i\",\"payload\":$i}"
     i=$((i+1))
 done
 call 'trim: delete_up_to seq=6'         200 POST   /delete_up_to '{"scope":"tmath","max_seq":6}'
@@ -316,7 +336,7 @@ esac
 
 # append count: 10 appends to a fresh scope; /stats must report item_count:10
 i=1; while [ $i -le 10 ]; do
-    req POST /append "{\"scope\":\"appn\",\"id\":\"a$i\",\"payload\":$i}" >/dev/null
+    quiet_call "appn /append #$i" 200 POST /append "{\"scope\":\"appn\",\"id\":\"a$i\",\"payload\":$i}"
     i=$((i+1))
 done
 admin_call 'append count: stats'        200 /stats
@@ -328,7 +348,7 @@ esac
 # upsert idempotency: 5 upserts on the same id must leave exactly 1 item,
 # and the surviving payload must be the last one written (4).
 i=0; while [ $i -lt 5 ]; do
-    req POST /upsert "{\"scope\":\"uidem\",\"id\":\"only\",\"payload\":$i}" >/dev/null
+    quiet_call "uidem /upsert #$i" 200 POST /upsert "{\"scope\":\"uidem\",\"id\":\"only\",\"payload\":$i}"
     i=$((i+1))
 done
 admin_call 'upsert idem: stats'         200 /stats
@@ -345,7 +365,7 @@ esac
 # tail windowing: 10 appends (seq 1..10). limit=5 is the newest slice (t6..t10);
 # limit=5&offset=5 skips that newest slice and returns the previous one (t1..t5).
 i=1; while [ $i -le 10 ]; do
-    req POST /append "{\"scope\":\"tail10\",\"id\":\"t$i\",\"payload\":$i}" >/dev/null
+    quiet_call "tail10 /append #$i" 200 POST /append "{\"scope\":\"tail10\",\"id\":\"t$i\",\"payload\":$i}"
     i=$((i+1))
 done
 call 'tail limit=5 (newest)'            200 GET    '/tail?scope=tail10&limit=5'
@@ -599,7 +619,7 @@ esac
 # Query coercion: numbers and booleans in the query map are passed through as
 # raw URL-query values. limit:2 must actually cap the /tail to 2 items.
 i=1; while [ $i -le 5 ]; do
-    req POST /append "{\"scope\":\"mcq\",\"id\":\"q$i\",\"payload\":$i}" >/dev/null
+    quiet_call "mcq /append #$i" 200 POST /append "{\"scope\":\"mcq\",\"id\":\"q$i\",\"payload\":$i}"
     i=$((i+1))
 done
 call 'mc: number query value (limit:2)' 200 POST   /multi_call \
