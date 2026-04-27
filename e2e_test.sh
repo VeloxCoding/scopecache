@@ -27,8 +27,36 @@
 
 set -eu
 
+# Required commands. Failing here gives a clear "missing X" message
+# up-front instead of a cryptic curl/jq/openssl error halfway
+# through the run. curl drives every HTTP call; jq parses the
+# /admin and /guarded slot envelopes and powers the precise-shape
+# json_assert helper; openssl computes capability_ids for the
+# /guarded test setup.
+need_cmd() {
+    command -v "$1" >/dev/null 2>&1 || {
+        printf 'missing required command: %s\n' "$1" >&2
+        exit 127
+    }
+}
+need_cmd curl
+need_cmd jq
+need_cmd openssl
+
 SOCK=${SOCK-/run/scopecache.sock}
 BASE=${BASE:-http://localhost}
+
+# Echo the chosen transport so the run output is self-describing.
+# A surprise mismatch (operator thinks they're testing the Caddy
+# adapter but SOCK still points at the standalone Unix socket)
+# shows up at the top of the log instead of being inferred from
+# the URL pattern in failing assertions.
+if [ -n "$SOCK" ]; then
+    printf 'transport: unix-socket %s, BASE=%s\n' "$SOCK" "$BASE"
+else
+    printf 'transport: TCP, BASE=%s\n' "$BASE"
+fi
+printf 'NOTE: this script destroys cache state (multiple /wipe calls). Do not run it against production.\n\n'
 
 # Per-process scratch file for the most recent curl response body.
 # Originally a hardcoded /tmp/body, which two parallel runs of this
