@@ -18,7 +18,9 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.25'
-          cache-dependency-path: go.sum
+          # Core module is stdlib-only — no go.sum exists. Disable the
+          # dependency cache so setup-go does not warn on a missing path.
+          cache: false
 
       - name: Verify gofmt
         run: |

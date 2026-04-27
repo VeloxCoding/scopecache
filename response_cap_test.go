@@ -152,28 +152,33 @@ func TestResponseCap_OtherEndpointsUnaffected(t *testing.T) {
 	}
 }
 
-// TestResponseCap_BoundaryAtCap exercises the boundary where the response
-// is right around the configured cap. Cap is set so the small `hit=false`
-// envelope fits (~80 bytes) but a multi-item body does not, verifying
-// that the wrapper's `written > cap` check is strict greater-than (a
-// response exactly at cap must pass).
+// TestResponseCap_BoundaryAtCap exercises the wrapper's behaviour around
+// the configured cap. We do NOT test exact equality (cap == body length)
+// because the response body contains a duration_us field whose width
+// varies with wall-clock jitter (80 µs vs 800 µs is one extra digit),
+// so the body produced by a second call against a cap measured from the
+// first call can be a few bytes larger than the calibration sample. CI
+// runners have enough variance to flip the strict `written > cap` check
+// over the boundary; localhost runs hide it. Test the two halves of the
+// contract that ARE deterministic: a response with comfortable headroom
+// passes, a response well above the cap fails.
 func TestResponseCap_BoundaryAtCap(t *testing.T) {
-	// Build a known-size response by hitting a missing scope: the body is
-	// stable across runs.
+	// Calibrate: measure /head?scope=missing under a generous cap.
 	h := newCappedHandler(25 << 20)
 	_, _, raw := doRequest(t, h, "GET", "/head?scope=missing", "")
 	bodyLen := int64(len(raw))
 
-	// Cap exactly at body length → must still pass.
-	h = newCappedHandler(bodyLen)
+	// Cap with a 32-byte margin above the measured body — absorbs any
+	// duration_us width drift between calibration and the real call.
+	h = newCappedHandler(bodyLen + 32)
 	if code, _, body := doRequest(t, h, "GET", "/head?scope=missing", ""); code != 200 {
-		t.Fatalf("at-cap code=%d want 200, body=%s", code, body)
+		t.Fatalf("margin-above-cap code=%d want 200, body=%s", code, body)
 	}
 
-	// Cap one below → must fail.
-	h = newCappedHandler(bodyLen - 1)
+	// Cap at half the measured size — definitely too small, must 507.
+	h = newCappedHandler(bodyLen / 2)
 	if code, _, body := doRequest(t, h, "GET", "/head?scope=missing", ""); code != http.StatusInsufficientStorage {
-		t.Fatalf("below-cap code=%d want 507, body=%s", code, body)
+		t.Fatalf("well-below-cap code=%d want 507, body=%s", code, body)
 	}
 }
 
