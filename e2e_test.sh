@@ -496,11 +496,13 @@ admin_call 'mc: wipe for clean slate'   200 /wipe
 
 # Happy path: write, then read it back inside the same batch, then aggregate.
 # The /get at index 1 must see the /append from index 0 — proves sequential
-# dispatch (not parallel, not snapshot-isolated).
+# dispatch (not parallel, not snapshot-isolated). /stats was previously
+# the third read here; it moved to /admin in v0.5.17, so the batch ends
+# with /tail which observes the just-appended item.
 call 'mc: mixed read/write/read'        200 POST   /multi_call \
-    '{"calls":[{"path":"/append","body":{"scope":"mc","id":"a","payload":{"v":1}}},{"path":"/get","query":{"scope":"mc","id":"a"}},{"path":"/tail","query":{"scope":"mc","limit":10}},{"path":"/stats"}]}'
+    '{"calls":[{"path":"/append","body":{"scope":"mc","id":"a","payload":{"v":1}}},{"path":"/get","query":{"scope":"mc","id":"a"}},{"path":"/tail","query":{"scope":"mc","limit":10}}]}'
 case $LAST_BODY in
-    *'"ok":true'*'"count":4'*) okmsg 'mc: outer ok=true, count=4' ;;
+    *'"ok":true'*'"count":3'*) okmsg 'mc: outer ok=true, count=3' ;;
     *) bad "mc happy outer: $LAST_BODY" ;;
 esac
 case $LAST_BODY in
@@ -512,11 +514,11 @@ case $LAST_BODY in
     *'"status":200'*'"hit":true'*'"seq":1'*) okmsg 'mc: /get inside batch saw the prior /append (sequential)' ;;
     *) bad "mc sequential dispatch: $LAST_BODY" ;;
 esac
-# /stats sub-call must see the new scope as item_count:1 — proves writes
-# in earlier slots are visible to /stats in a later slot.
+# /tail at index 2 must reflect the in-batch /append: items array length 1
+# with the just-written id. Confirms writes propagate across sequential slots.
 case $LAST_BODY in
-    *'"mc"'*'"item_count":1'*) okmsg 'mc: /stats slot reflects in-batch write' ;;
-    *) bad "mc stats slot: $LAST_BODY" ;;
+    *'"items":[{'*'"id":"a"'*) okmsg 'mc: /tail slot reflects in-batch write' ;;
+    *) bad "mc tail slot: $LAST_BODY" ;;
 esac
 
 # Empty calls array: 200 with count:0, results empty. N=0 calls produces
