@@ -282,6 +282,38 @@ func TestMultiCall_QueryNestedRejected(t *testing.T) {
 	}
 }
 
+// Pre-fix /multi_call validated the path whitelist up-front but built
+// each subURL inside the dispatch loop. A malformed query on calls[k]
+// then 400'd the whole batch only after calls[0..k-1] had committed.
+// Post-fix prepareSubCalls runs before any dispatch, so a side effect
+// at slot 0 cannot land if slot 1's query is unreachable.
+func TestMultiCall_NestedQueryRejectsBeforeSideEffects(t *testing.T) {
+	h, _ := newTestHandler(10)
+
+	// calls[0] is a valid /append on scope "preflight". calls[1] has a
+	// nested-object query that buildSubURL must reject. Without the fix
+	// the /append commits and the response is still 400.
+	body := `{
+		"calls": [
+			{"path": "/append", "body": {"scope": "preflight", "id": "a", "payload": {"v": 1}}},
+			{"path": "/get",    "query": {"scope": {"nested": true}}}
+		]
+	}`
+	code, _, raw := doRequest(t, h, "POST", "/multi_call", body)
+	if code != 400 {
+		t.Fatalf("nested-query batch: code=%d want 400, body=%s", code, raw)
+	}
+
+	// Verify nothing committed: scope "preflight" must not exist.
+	code, out, raw := doRequest(t, h, "GET", "/get?scope=preflight&id=a", "")
+	if code != 200 {
+		t.Fatalf("post-batch /get: code=%d body=%s", code, raw)
+	}
+	if hit, _ := out["hit"].(bool); hit {
+		t.Errorf("calls[0] /append leaked despite calls[1] rejection: %s", raw)
+	}
+}
+
 // --- sub-call response cap ----------------------------------------------------
 
 // TestMultiCall_SubCallResponseTooLarge fills a scope with items large enough

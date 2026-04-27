@@ -280,6 +280,45 @@ func TestGuarded_RejectsBodyAndQueryScopeSmuggle(t *testing.T) {
 	}
 }
 
+// /guarded runs prepareSubCalls AFTER scope rewrite, so a malformed
+// query at calls[k] still rejects the whole batch before calls[0..k-1]
+// commit. Same regression class as the /multi_call and /admin tests.
+func TestGuarded_NestedQueryRejectsBeforeSideEffects(t *testing.T) {
+	h, _ := newTestHandler(10)
+	provisionTenantScope(t, h, "tok-prep", "events")
+	capID := computeCapForTest(testServerSecret, "tok-prep")
+
+	// calls[1] uses a nested-object on `id`, not on `scope`. The scope-
+	// rewrite pre-pass rejects non-string scopes already (see
+	// TestGuarded_RejectsNestedScope), so to exercise the buildSubURL
+	// pre-pass specifically, the malformed field has to be one rewrite
+	// doesn't touch.
+	body := `{
+		"token": "tok-prep",
+		"calls": [
+			{"path": "/append", "body": {"scope": "events", "id": "a", "payload": {"v": 1}}},
+			{"path": "/get",    "query": {"scope": "events", "id": {"nested": true}}}
+		]
+	}`
+	code, _, raw := doRequest(t, h, "POST", "/guarded", body)
+	if code != 400 {
+		t.Fatalf("nested-query batch: code=%d want 400, body=%s", code, raw)
+	}
+
+	// Verify calls[0] /append did not commit: the scope only has the
+	// _provisioned sentinel, no item with id="a".
+	probe := `{"calls":[{"path":"/get","query":{"scope":"_guarded:` + capID + `:events","id":"a"}}]}`
+	code, out, raw := doRequest(t, h, "POST", "/admin", probe)
+	if code != 200 {
+		t.Fatalf("probe: code=%d body=%s", code, raw)
+	}
+	results := out["results"].([]interface{})
+	getResp := results[0].(map[string]interface{})["body"].(map[string]interface{})
+	if hit, _ := getResp["hit"].(bool); hit {
+		t.Errorf("calls[0] /append leaked despite calls[1] rejection: %s", raw)
+	}
+}
+
 // --- whitelist enforcement ----------------------------------------------------
 
 func TestGuarded_WhitelistMiss(t *testing.T) {

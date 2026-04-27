@@ -201,6 +201,17 @@ func (api *API) handleGuarded(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Step 7.5: pre-build subURLs and bodies after scope rewrite so a
+	// malformed query value (nested object/array) on calls[k] rejects
+	// the whole batch before calls[0..k-1] commit any side effect.
+	// Rewrite already mutated call.Body/call.Query in place, so the
+	// prepared URLs reflect the per-tenant scope.
+	prepared, err := prepareSubCalls(calls, api.guardedCallSpecs)
+	if err != nil {
+		badRequest(w, started, err.Error())
+		return
+	}
+
 	// Step 8-9: dispatch via shared loop, strip prefix from each result body.
 	respCap := api.store.maxResponseBytes
 	bodyBudget := respCap - multiCallEnvelopeOverhead - int64(len(calls))*multiCallSlotOverhead
@@ -211,24 +222,12 @@ func (api *API) handleGuarded(w http.ResponseWriter, r *http.Request) {
 	results := make([]multiCallResult, 0, len(calls))
 	var bodyBytesUsed int64
 
-	for _, call := range calls {
-		spec := api.guardedCallSpecs[call.Path]
-
-		subURL, err := buildSubURL(call.Path, call.Query)
-		if err != nil {
-			badRequest(w, started, err.Error())
-			return
-		}
-
+	for _, p := range prepared {
 		var subReq *http.Request
-		if spec.method == http.MethodGet {
-			subReq = httptest.NewRequest(spec.method, subURL, nil)
+		if p.spec.method == http.MethodGet {
+			subReq = httptest.NewRequest(p.spec.method, p.subURL, nil)
 		} else {
-			body := []byte(call.Body)
-			if len(body) == 0 {
-				body = []byte("{}")
-			}
-			subReq = httptest.NewRequest(spec.method, subURL, bytes.NewReader(body))
+			subReq = httptest.NewRequest(p.spec.method, p.subURL, bytes.NewReader(p.body))
 			subReq.Header.Set("Content-Type", "application/json")
 		}
 		// Mark as admin-context so the inner handler skips the public
@@ -238,7 +237,7 @@ func (api *API) handleGuarded(w http.ResponseWriter, r *http.Request) {
 
 		rec := httptest.NewRecorder()
 		crw := newCappedResponseWriter(rec, respCap, time.Now())
-		spec.handler(crw, subReq)
+		p.spec.handler(crw, subReq)
 		crw.flush()
 
 		status := rec.Code

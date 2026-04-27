@@ -80,6 +80,36 @@ func TestAdmin_WhitelistMissRejectsBatch(t *testing.T) {
 	}
 }
 
+// /admin runs through the same prepareSubCalls pre-pass as /multi_call,
+// so a malformed query at calls[k] must reject the whole batch before
+// calls[0..k-1] commit. Same regression class as the /multi_call test.
+func TestAdmin_NestedQueryRejectsBeforeSideEffects(t *testing.T) {
+	h, _ := newTestHandler(10)
+
+	body := `{
+		"calls": [
+			{"path": "/append", "body": {"scope": "_admin-preflight", "id": "a", "payload": {"v": 1}}},
+			{"path": "/get",    "query": {"scope": {"nested": true}}}
+		]
+	}`
+	code, _, raw := doRequest(t, h, "POST", "/admin", body)
+	if code != 400 {
+		t.Fatalf("nested-query batch: code=%d want 400, body=%s", code, raw)
+	}
+
+	// /admin /get on the would-be scope: still must not exist.
+	probe := `{"calls":[{"path":"/get","query":{"scope":"_admin-preflight","id":"a"}}]}`
+	code, out, raw := doRequest(t, h, "POST", "/admin", probe)
+	if code != 200 {
+		t.Fatalf("probe: code=%d body=%s", code, raw)
+	}
+	results := out["results"].([]interface{})
+	getResp := results[0].(map[string]interface{})["body"].(map[string]interface{})
+	if hit, _ := getResp["hit"].(bool); hit {
+		t.Errorf("calls[0] /append leaked despite calls[1] rejection: %s", raw)
+	}
+}
+
 func TestAdmin_BlocksMultiCallSelfReference(t *testing.T) {
 	h, _ := newTestHandler(10)
 

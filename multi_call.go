@@ -134,6 +134,54 @@ func buildSubURL(path string, query map[string]json.RawMessage) (string, error) 
 	return path + "?" + vals.Encode(), nil
 }
 
+// preparedCall is the post-validation shape of one sub-call: the
+// dispatch loop only consumes these, never raw multiCallEntry. Holding
+// the assembled subURL and the normalised body lets the dispatcher
+// fire blindly without any input-shape work that could produce 400 on
+// the way through.
+type preparedCall struct {
+	spec   subCallSpec
+	subURL string
+	body   []byte // nil for GET; for POST always non-empty (defaulted to "{}")
+}
+
+// prepareSubCalls is the shape-only pre-validation pass shared by
+// /multi_call, /admin, and /guarded. It walks every entry, builds the
+// subURL (which is the only place a malformed query value — nested
+// object/array — would surface), and returns either every sub-call
+// fully prepared or an error so the caller can 400 the whole batch
+// before any side effect lands.
+//
+// The caller has already validated each path against `specs`, so the
+// missing-spec check here is defence in depth — if the whitelist gets
+// out of sync with the dispatcher, this catches it instead of letting
+// the dispatcher panic on a nil handler.
+func prepareSubCalls(calls []multiCallEntry, specs map[string]subCallSpec) ([]preparedCall, error) {
+	prepared := make([]preparedCall, len(calls))
+	for i, call := range calls {
+		spec, ok := specs[call.Path]
+		if !ok {
+			return nil, fmt.Errorf("path '%s' (calls[%d]) is not allowed", call.Path, i)
+		}
+		subURL, err := buildSubURL(call.Path, call.Query)
+		if err != nil {
+			return nil, fmt.Errorf("calls[%d]: %s", i, err.Error())
+		}
+		var body []byte
+		if spec.method != http.MethodGet {
+			body = []byte(call.Body)
+			if len(body) == 0 {
+				// Handlers expect a JSON body; empty would parse-error
+				// with a misleading message. {} lets the handler's own
+				// validator produce the right "missing scope/payload".
+				body = []byte("{}")
+			}
+		}
+		prepared[i] = preparedCall{spec: spec, subURL: subURL, body: body}
+	}
+	return prepared, nil
+}
+
 // envelope-budgeting constants. multiCallEnvelopeOverhead covers the
 // outer JSON frame (`{"ok":true,"count":N,"approx_response_mb":...,
 // "duration_us":...,"results":[]}`) plus a couple of brackets and
@@ -185,6 +233,18 @@ func (api *API) handleMultiCall(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Pre-build every subURL and normalised body in a separate pass so
+	// a malformed query value (e.g. nested object/array) on calls[k]
+	// rejects the whole batch before calls[0..k-1] have committed. The
+	// dispatch loop below only handles handler-level errors, which are
+	// expected and slot-local; input-shape errors are batch-level and
+	// must land before any side effect.
+	prepared, err := prepareSubCalls(calls, api.multiCallSpecs)
+	if err != nil {
+		badRequest(w, started, err.Error())
+		return
+	}
+
 	respCap := api.store.maxResponseBytes
 	bodyBudget := respCap - multiCallEnvelopeOverhead - int64(len(calls))*multiCallSlotOverhead
 	if bodyBudget < 0 {
@@ -194,31 +254,12 @@ func (api *API) handleMultiCall(w http.ResponseWriter, r *http.Request) {
 	results := make([]multiCallResult, 0, len(calls))
 	var bodyBytesUsed int64
 
-	for _, call := range calls {
-		spec := api.multiCallSpecs[call.Path]
-
-		subURL, err := buildSubURL(call.Path, call.Query)
-		if err != nil {
-			// rawToQueryValue rejects nested objects/arrays. The whole
-			// batch fails — no useful semantics for "skip this slot,
-			// continue" when the input itself is malformed.
-			badRequest(w, started, err.Error())
-			return
-		}
-
+	for _, p := range prepared {
 		var subReq *http.Request
-		if spec.method == http.MethodGet {
-			subReq = httptest.NewRequest(spec.method, subURL, nil)
+		if p.spec.method == http.MethodGet {
+			subReq = httptest.NewRequest(p.spec.method, p.subURL, nil)
 		} else {
-			body := []byte(call.Body)
-			if len(body) == 0 {
-				// Handlers expect a JSON body; an empty body would
-				// produce a parse error with a misleading message.
-				// Sending {} lets the handler's own validator return
-				// the right "missing scope/payload" message.
-				body = []byte("{}")
-			}
-			subReq = httptest.NewRequest(spec.method, subURL, bytes.NewReader(body))
+			subReq = httptest.NewRequest(p.spec.method, p.subURL, bytes.NewReader(p.body))
 			subReq.Header.Set("Content-Type", "application/json")
 		}
 
@@ -229,7 +270,7 @@ func (api *API) handleMultiCall(w http.ResponseWriter, r *http.Request) {
 		// finalised slot body either way.
 		rec := httptest.NewRecorder()
 		crw := newCappedResponseWriter(rec, respCap, time.Now())
-		spec.handler(crw, subReq)
+		p.spec.handler(crw, subReq)
 		crw.flush()
 
 		status := rec.Code

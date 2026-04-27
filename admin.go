@@ -84,6 +84,14 @@ func (api *API) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Pre-build subURLs and bodies before any side effect can land.
+	// See prepareSubCalls in multi_call.go for the rationale.
+	prepared, err := prepareSubCalls(calls, api.adminCallSpecs)
+	if err != nil {
+		badRequest(w, started, err.Error())
+		return
+	}
+
 	respCap := api.store.maxResponseBytes
 	bodyBudget := respCap - multiCallEnvelopeOverhead - int64(len(calls))*multiCallSlotOverhead
 	if bodyBudget < 0 {
@@ -93,24 +101,12 @@ func (api *API) handleAdmin(w http.ResponseWriter, r *http.Request) {
 	results := make([]multiCallResult, 0, len(calls))
 	var bodyBytesUsed int64
 
-	for _, call := range calls {
-		spec := api.adminCallSpecs[call.Path]
-
-		subURL, err := buildSubURL(call.Path, call.Query)
-		if err != nil {
-			badRequest(w, started, err.Error())
-			return
-		}
-
+	for _, p := range prepared {
 		var subReq *http.Request
-		if spec.method == http.MethodGet {
-			subReq = httptest.NewRequest(spec.method, subURL, nil)
+		if p.spec.method == http.MethodGet {
+			subReq = httptest.NewRequest(p.spec.method, p.subURL, nil)
 		} else {
-			body := []byte(call.Body)
-			if len(body) == 0 {
-				body = []byte("{}")
-			}
-			subReq = httptest.NewRequest(spec.method, subURL, bytes.NewReader(body))
+			subReq = httptest.NewRequest(p.spec.method, p.subURL, bytes.NewReader(p.body))
 			subReq.Header.Set("Content-Type", "application/json")
 		}
 		// Mark the synthetic request as originating from /admin so the
@@ -120,7 +116,7 @@ func (api *API) handleAdmin(w http.ResponseWriter, r *http.Request) {
 
 		rec := httptest.NewRecorder()
 		crw := newCappedResponseWriter(rec, respCap, time.Now())
-		spec.handler(crw, subReq)
+		p.spec.handler(crw, subReq)
 		crw.flush()
 
 		status := rec.Code
