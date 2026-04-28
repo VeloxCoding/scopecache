@@ -58,21 +58,25 @@ type ScopeBuffer struct {
 }
 
 func NewScopeBuffer(maxItems int) *ScopeBuffer {
-	// items is grown on-demand by append (Go doubles capacity), not
-	// pre-sized to maxItems. Pre-sizing was an unsustainable allocation
-	// pattern under high scope-creation rates: at maxItems=50000 each
-	// new scope reserved ~3.6 MB upfront, and at 4k+ creates/sec that
-	// produced ~14 GB/s of slice allocation that the GC could not keep
-	// up with — `runtime.scanObject` accounted for >96% of CPU on a
-	// unique-scope /append benchmark. The cost trade is a handful of
-	// growth-doublings over the scope's lifetime (~12 for a scope that
-	// reaches 50k) instead of one large allocation that mostly stays
-	// unused. See phase-4 finding "Sharded scopes map: pre-existing-
-	// scope writes 2× faster, unique-scope writes barely" for the
-	// follow-up entry that traced this.
+	// items, byID and bySeq all grow on-demand. Pre-allocating any of
+	// them on every scope-create is the wrong default: a unique-scope-
+	// per-write workload creates millions of buffers, most of which
+	// hold one item and never need byID at all (items without an `id`
+	// have no byID entry). See:
+	//
+	//   - phase-4 finding "Sharded scopes map: pre-existing-scope
+	//     writes 2× faster, unique-scope writes barely" — traces the
+	//     items-slice pre-alloc that GC could not keep up with.
+	//   - the follow-up "Lazy maps in NewScopeBuffer" — extends the
+	//     same reasoning to byID and bySeq. Lazy bySeq saves the
+	//     create-time alloc on every scope; lazy byID skips the
+	//     allocation entirely on scopes whose items never carry an id.
+	//
+	// The write paths in this file (appendItem, upsertByID,
+	// counterAdd, replaceItemAtIndexLocked) lazily initialise these
+	// maps before assigning into them. Reads, deletes, len and range
+	// are nil-safe in Go and need no guard.
 	return &ScopeBuffer{
-		byID:      make(map[string]Item),
-		bySeq:     make(map[uint64]Item),
 		maxItems:  maxItems,
 		createdTS: nowUnixMicro(),
 	}
@@ -270,8 +274,14 @@ func (b *ScopeBuffer) appendItem(item Item) (Item, error) {
 	item.Seq = b.lastSeq
 
 	b.items = append(b.items, item)
+	if b.bySeq == nil {
+		b.bySeq = make(map[uint64]Item)
+	}
 	b.bySeq[item.Seq] = item
 	if item.ID != "" {
+		if b.byID == nil {
+			b.byID = make(map[string]Item)
+		}
 		b.byID[item.ID] = item
 	}
 	b.bytes += size
@@ -399,6 +409,8 @@ func (b *ScopeBuffer) upsertByID(item Item) (Item, bool, error) {
 			b.items[i].Ts = item.Ts
 
 			updated := b.items[i]
+			// b.byID hit above proves byID was already allocated; same for
+			// bySeq (every item that lives in byID also lives in bySeq).
 			b.bySeq[updated.Seq] = updated
 			b.byID[item.ID] = updated
 			b.bytes += delta
@@ -425,7 +437,13 @@ func (b *ScopeBuffer) upsertByID(item Item) (Item, bool, error) {
 	item.Seq = b.lastSeq
 
 	b.items = append(b.items, item)
+	if b.bySeq == nil {
+		b.bySeq = make(map[uint64]Item)
+	}
 	b.bySeq[item.Seq] = item
+	if b.byID == nil {
+		b.byID = make(map[string]Item)
+	}
 	b.byID[item.ID] = item
 	b.bytes += size
 
@@ -504,7 +522,13 @@ func (b *ScopeBuffer) counterAdd(scope, id string, by int64) (int64, bool, error
 	b.lastSeq++
 	item.Seq = b.lastSeq
 	b.items = append(b.items, item)
+	if b.bySeq == nil {
+		b.bySeq = make(map[uint64]Item)
+	}
 	b.bySeq[item.Seq] = item
+	if b.byID == nil {
+		b.byID = make(map[string]Item)
+	}
 	b.byID[id] = item
 	b.bytes += size
 
@@ -585,6 +609,9 @@ func (b *ScopeBuffer) replaceItemAtIndexLocked(i int, payload json.RawMessage, t
 		b.items[i].Ts = ts
 	}
 	updated := b.items[i]
+	// replaceItemAtIndexLocked is only reachable when the item already
+	// existed in this buffer, so bySeq and (when ID != "") byID have
+	// already been allocated by the original write that created it.
 	b.bySeq[updated.Seq] = updated
 	if updated.ID != "" {
 		b.byID[updated.ID] = updated
