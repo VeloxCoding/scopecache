@@ -1303,6 +1303,7 @@ RULES:
 - /multi_call accepts at most 10 sub-calls per batch by default (override with SCOPECACHE_MAX_MULTI_CALL_COUNT, positive int)
 - every byte-ish field in JSON responses (approx_store_mb, max_store_mb, approx_scope_mb, added_mb) is expressed in MiB with 4 decimals — one unit across /stats, /delete_scope_candidates and 507 responses
 - the listening socket path defaults to /run/scopecache.sock on Linux and $TMPDIR/scopecache.sock on macOS/Windows; override with SCOPECACHE_SOCKET_PATH
+- per-scope read-heat tracking (powers /delete_scope_candidates and the last_access_ts / last_7d_read_count / read_count_total fields on /stats) is on by default. Operators that don't use /delete_scope_candidates can turn it off (SCOPECACHE_DISABLE_READ_HEAT=1 on standalone, 'disable_read_heat yes' on the Caddy module) for a smaller hot-read overhead — measurable on minimal Caddy stacks (~5-7% on /get) and Go-direct usage (~40% in benchmarks); HTTP-fronted deployments with a thicker stack (FrankenPHP, multiple matchers, etc.) see the cache-side gain absorbed by the request-handling floor
 
 ENDPOINTS (public mux):
 GET  /help - show this help text
