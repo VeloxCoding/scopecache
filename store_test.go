@@ -1899,8 +1899,8 @@ func TestRecordRead_KeepsReadsWithinWindow(t *testing.T) {
 	buf.recordRead(microsOnDay(1000))
 	buf.recordRead(microsOnDay(1001))
 
-	if buf.last7DReadCount != 2 {
-		t.Fatalf("last7DReadCount=%d want 2 (buggy code would reset on day change)", buf.last7DReadCount)
+	if buf.last7DReadCount.Load() != 2 {
+		t.Fatalf("last7DReadCount=%d want 2 (buggy code would reset on day change)", buf.last7DReadCount.Load())
 	}
 }
 
@@ -1911,15 +1911,15 @@ func TestRecordRead_ExpiresBucketsOutsideWindow(t *testing.T) {
 	buf.recordRead(microsOnDay(1001))
 	buf.recordRead(microsOnDay(1002))
 
-	if buf.last7DReadCount != 3 {
-		t.Fatalf("pre-window last7DReadCount=%d want 3", buf.last7DReadCount)
+	if buf.last7DReadCount.Load() != 3 {
+		t.Fatalf("pre-window last7DReadCount=%d want 3", buf.last7DReadCount.Load())
 	}
 
 	// Jump to day 1010 — all prior reads are > 6 days old.
 	buf.recordRead(microsOnDay(1010))
 
-	if buf.last7DReadCount != 1 {
-		t.Fatalf("after expiry last7DReadCount=%d want 1", buf.last7DReadCount)
+	if buf.last7DReadCount.Load() != 1 {
+		t.Fatalf("after expiry last7DReadCount=%d want 1", buf.last7DReadCount.Load())
 	}
 }
 
@@ -1932,8 +1932,8 @@ func TestRecordRead_ReusesBucketSlotAcross7DayCycle(t *testing.T) {
 	buf.recordRead(microsOnDay(1007))
 
 	// Day 1000's read is now outside the rolling window (>= 7 days old).
-	if buf.last7DReadCount != 1 {
-		t.Fatalf("last7DReadCount=%d want 1 (old slot should have been expired)", buf.last7DReadCount)
+	if buf.last7DReadCount.Load() != 1 {
+		t.Fatalf("last7DReadCount=%d want 1 (old slot should have been expired)", buf.last7DReadCount.Load())
 	}
 }
 
@@ -1950,8 +1950,8 @@ func TestStats_Last7DReadCount_ExpiresWithoutNewReads(t *testing.T) {
 	buf.recordRead(microsOnDay(1000))
 	buf.recordRead(microsOnDay(1000))
 
-	if buf.last7DReadCount != 3 {
-		t.Fatalf("pre-stats last7DReadCount=%d want 3", buf.last7DReadCount)
+	if buf.last7DReadCount.Load() != 3 {
+		t.Fatalf("pre-stats last7DReadCount=%d want 3", buf.last7DReadCount.Load())
 	}
 
 	// Eight days later — no fresh recordRead, so the cached field
@@ -1959,7 +1959,7 @@ func TestStats_Last7DReadCount_ExpiresWithoutNewReads(t *testing.T) {
 	st := buf.stats(microsOnDay(1008))
 	if st.Last7DReadCount != 0 {
 		t.Errorf("stats(day 1008).Last7DReadCount=%d want 0; cached field=%d (stale)",
-			st.Last7DReadCount, buf.last7DReadCount)
+			st.Last7DReadCount, buf.last7DReadCount.Load())
 	}
 
 	// Boundary check: at day 1006 (6 days after the reads, still in
@@ -1982,16 +1982,16 @@ func TestRecordRead_RollingWindowSum(t *testing.T) {
 	buf.recordRead(microsOnDay(1006))
 	buf.recordRead(microsOnDay(1006))
 
-	if buf.last7DReadCount != 6 {
-		t.Fatalf("last7DReadCount=%d want 6", buf.last7DReadCount)
+	if buf.last7DReadCount.Load() != 6 {
+		t.Fatalf("last7DReadCount=%d want 6", buf.last7DReadCount.Load())
 	}
 
 	// Read on day 1007 — day 1000 falls out of window (1007-6=1001, 1000 < 1001).
 	buf.recordRead(microsOnDay(1007))
 
 	// Expected: 0 from day 1000, 1 from day 1003, 3 from day 1006, 1 from day 1007 = 5.
-	if buf.last7DReadCount != 5 {
-		t.Fatalf("last7DReadCount=%d want 5 (day 1000's 2 reads should expire)", buf.last7DReadCount)
+	if buf.last7DReadCount.Load() != 5 {
+		t.Fatalf("last7DReadCount=%d want 5 (day 1000's 2 reads should expire)", buf.last7DReadCount.Load())
 	}
 }
 

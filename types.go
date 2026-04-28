@@ -3,6 +3,7 @@ package scopecache
 import (
 	"encoding/json"
 	"fmt"
+	"sync/atomic"
 	"time"
 )
 
@@ -206,9 +207,16 @@ type ItemsRequest struct {
 	Items []Item `json:"items"`
 }
 
+// ScopeReadHeatBucket is one slot in the per-scope rolling-7-day read-
+// heat ring buffer. Day is the unix-day this slot is currently
+// representing (0 = empty); Count is the number of reads recorded on
+// that day. Both fields are atomic so the read-hot path
+// (ScopeBuffer.recordRead) can update them without taking the scope
+// write lock — see the lock-free state machine in recordRead for the
+// claim/expire protocol.
 type ScopeReadHeatBucket struct {
-	Day   int64
-	Count uint64
+	Day   atomic.Int64
+	Count atomic.Uint64
 }
 
 type Candidate struct {

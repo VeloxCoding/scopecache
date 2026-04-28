@@ -268,3 +268,132 @@ func BenchmarkStore_TsRange_FullScope_Worst(b *testing.B) {
 		}
 	}
 }
+
+// --- Parallel read-path benchmarks ----------------------------------
+//
+// These were added to profile the read path under real concurrency
+// (32 cores in the bench host). The bare lookup methods (getByID,
+// getBySeq, tailOffset, sinceSeq, tsRange) only take buf.mu.RLock(),
+// so they should scale linearly with cores. The HTTP-equivalent paths
+// (/get, /render, /head, /tail, /ts_range) additionally call
+// buf.recordRead() after a successful lookup, which takes
+// buf.mu.Lock() — a write lock on the same mutex the readers were
+// just on. The "_WithRecordRead" suffix on benches below tells you
+// whether that second lock is included.
+//
+// Run with -cpuprofile -memprofile -blockprofile to find what
+// dominates the parallel read path.
+
+// BenchmarkStore_GetBySeq_Parallel mirrors GetByID_Parallel but on the
+// bySeq map. Same RLock + map lookup; included so the two read paths
+// can be compared side by side.
+func BenchmarkStore_GetBySeq_Parallel(b *testing.B) {
+	store, scopes, _ := benchStore(b, 100, 1000, 512)
+	numScopes := len(scopes)
+	const itemsPerScope = 1000
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			scope := scopes[i%numScopes]
+			seq := uint64((i % itemsPerScope) + 1)
+			buf, _ := store.getScope(scope)
+			_, _ = buf.getBySeq(seq)
+			i++
+		}
+	})
+}
+
+// BenchmarkStore_GetByID_Parallel_WithRecordRead is the bench above
+// plus the recordRead(now) call that /get and /render perform on a hit.
+// recordRead takes buf.mu.Lock() (write lock), serialising every read
+// on a given scope. The delta between this and GetByID_Parallel
+// quantifies the heat-bucket cost on the hot read path.
+func BenchmarkStore_GetByID_Parallel_WithRecordRead(b *testing.B) {
+	store, scopes, ids := benchStore(b, 100, 1000, 512)
+	numScopes := len(scopes)
+	itemsPerScope := len(ids) / numScopes
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			scope := scopes[i%numScopes]
+			id := ids[i%itemsPerScope]
+			buf, _ := store.getScope(scope)
+			if _, ok := buf.getByID(id); ok {
+				buf.recordRead(nowUnixMicro())
+			}
+			i++
+		}
+	})
+}
+
+// BenchmarkStore_Tail_Parallel measures /tail-style reads (most-recent
+// items) at limit=10 — the typical small-window read pattern.
+// tailOffset takes RLock, slices b.items[start:end], copies into a
+// fresh slice, returns. Per-call slice alloc + copy is the dominant
+// per-op cost.
+func BenchmarkStore_Tail_Parallel(b *testing.B) {
+	store, scopes, _ := benchStore(b, 100, 1000, 512)
+	numScopes := len(scopes)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			scope := scopes[i%numScopes]
+			buf, _ := store.getScope(scope)
+			_, _ = buf.tailOffset(10, 0)
+			i++
+		}
+	})
+}
+
+// BenchmarkStore_Head_Parallel measures /head-style reads (oldest-
+// first with afterSeq cursor). sinceSeq does sort.Search + slice copy
+// under RLock.
+func BenchmarkStore_Head_Parallel(b *testing.B) {
+	store, scopes, _ := benchStore(b, 100, 1000, 512)
+	numScopes := len(scopes)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			scope := scopes[i%numScopes]
+			buf, _ := store.getScope(scope)
+			_, _ = buf.sinceSeq(0, 10)
+			i++
+		}
+	})
+}
+
+// BenchmarkStore_TsRange_Parallel measures /ts_range under concurrency.
+// Cost is O(n) scan over b.items under RLock; with limit=10 on a
+// 1000-item scope where every item matches, the scan early-exits at
+// the 11th match. Multiple readers hold RLock concurrently, so this
+// should scale with cores up to RLock cache-line contention.
+func BenchmarkStore_TsRange_Parallel(b *testing.B) {
+	buf := benchTsScope(b, 1000)
+	since := int64(0)
+	until := int64(1 << 62)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			_, _ = buf.tsRange(&since, &until, 10)
+		}
+	})
+}

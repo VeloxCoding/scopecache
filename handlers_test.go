@@ -1192,9 +1192,7 @@ func TestRender_HitBumpsReadHeat_MissDoesNot(t *testing.T) {
 	_ = doRawRequest(t, h, "GET", "/render?scope=s&id=nonexistent") // miss — must not count
 
 	buf, _ := api.store.getScope("s")
-	buf.mu.RLock()
-	got := buf.last7DReadCount
-	buf.mu.RUnlock()
+	got := buf.last7DReadCount.Load()
 	if got != 2 {
 		t.Errorf("last_7d_read_count=%d want 2 (two hits, miss must not count)", got)
 	}
@@ -1613,7 +1611,7 @@ func TestRace_ParallelMixedWorkload(t *testing.T) {
 		buf.mu.RLock()
 		sumBufBytes += buf.bytes
 		totalItemsWalked += int64(len(buf.items))
-		totalReadCount += buf.readCountTotal
+		totalReadCount += buf.readCountTotal.Load()
 
 		if got, want := len(buf.bySeq), len(buf.items); got != want {
 			t.Errorf("scope %q: len(bySeq)=%d != len(items)=%d", scopeName, got, want)

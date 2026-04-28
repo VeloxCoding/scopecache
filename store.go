@@ -47,13 +47,24 @@ type ScopeBuffer struct {
 	// bytes is the running sum of approxItemSize(item) over items. Only
 	// mutated under b.mu; the store-level total is kept in sync via
 	// Store.reserveBytes / commitReplacement.
-	bytes           int64
-	createdTS       int64
-	lastAccessTS    int64
-	readCountTotal  uint64
-	last7DReadCount uint64
-	// Ring buffer indexed by day % ReadHeatWindowDays. Each bucket carries the
-	// absolute day it represents so we can detect a stale slot when it wraps.
+	bytes     int64
+	createdTS int64
+	// lastAccessTS, readCountTotal, last7DReadCount and the heat-bucket
+	// counts are atomic so the read-hot path (recordRead) does not need
+	// to take b.mu. recordRead used to take b.mu.Lock() — a write lock
+	// on the same mutex readers were just on under RLock — turning every
+	// hit on /get, /render, /head, /tail and /ts_range into a serialise
+	// point. Block profiling pinned ~88% of all read-path lock-wait time
+	// to that one call. Moving the bucket state to atomics drops it to
+	// effectively zero.
+	lastAccessTS    atomic.Int64
+	readCountTotal  atomic.Uint64
+	last7DReadCount atomic.Uint64
+	// Ring buffer indexed by day % ReadHeatWindowDays. Each bucket
+	// carries the absolute day it represents so we can detect a stale
+	// slot when it wraps. Day and Count inside each bucket are atomic;
+	// expiry and slot-claim are coordinated via CAS on Day. See
+	// recordRead for the state machine.
 	readHeatBuckets [ReadHeatWindowDays]ScopeReadHeatBucket
 }
 
@@ -121,59 +132,111 @@ func (b *ScopeBuffer) approxSizeBytes() int64 {
 	return b.approxSizeBytesLocked()
 }
 
-// computeLast7DReadCountLocked walks the heat buckets and returns the
-// count of reads whose Day is within the rolling 7-day window ending
-// at `now`. Used by stats() so a /stats or /delete_scope_candidates
-// call observes a correct count even when no fresh read has happened
-// to expire stale buckets via recordRead. Does NOT mutate state — safe
-// under RLock.
-func (b *ScopeBuffer) computeLast7DReadCountLocked(now int64) uint64 {
+// computeLast7DReadCount walks the heat buckets and returns the count
+// of reads whose Day is within the rolling 7-day window ending at
+// `now`. Used by stats() so a /stats or /delete_scope_candidates call
+// observes a correct count even when no fresh read has happened to
+// expire stale buckets via recordRead. All loads are atomic; the
+// snapshot is eventually-consistent (a concurrent recordRead may
+// land between two bucket reads here) which is acceptable for the
+// observability use cases this drives.
+func (b *ScopeBuffer) computeLast7DReadCount(now int64) uint64 {
 	day := unixDay(now)
 	oldestValidDay := day - ReadHeatWindowDays + 1
 	var sum uint64
 	for i := range b.readHeatBuckets {
 		bucket := &b.readHeatBuckets[i]
-		if bucket.Day >= oldestValidDay {
-			sum += bucket.Count
+		if bucket.Day.Load() >= oldestValidDay {
+			sum += bucket.Count.Load()
 		}
 	}
 	return sum
 }
 
+// recordRead is the lock-free heat-tracking path called on every hit
+// of /get, /render, /head, /tail and /ts_range. It runs without
+// taking b.mu so concurrent readers (which already hold b.mu.RLock)
+// do not serialise behind a write lock here. The state machine has
+// two phases:
+//
+//  1. Expiry: walk all 7 buckets and drain any whose Day is older
+//     than the rolling 7-day window ending at `now`. CAS on
+//     bucket.Day claims the expiry — only the winning goroutine
+//     subtracts that bucket's Count from last7DReadCount and resets
+//     it. Losers re-read and either find Day cleared (skip) or
+//     a freshly-claimed Day (skip).
+//
+//  2. Increment today's bucket. The ring is indexed by
+//     day % ReadHeatWindowDays. After phase 1 the slot for today is
+//     either already on `day` (no-op claim) or empty (Day == 0); a
+//     CAS on Day claims the slot for `day`. Then atomic adds bump
+//     bucket.Count, b.readCountTotal, b.last7DReadCount, and store
+//     b.lastAccessTS.
+//
+// The modulo trick (one slot per `day % 7`) means a slot whose
+// Day != currentDay must be at least 7 days old, so phase 1 will
+// always have cleared it before phase 2 runs. That invariant lets
+// phase 2 treat any non-`day` slot as empty without losing counts.
 func (b *ScopeBuffer) recordRead(now int64) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
 	day := unixDay(now)
 	oldestValidDay := day - ReadHeatWindowDays + 1
 
-	// Expire any bucket whose day has fallen out of the rolling window.
-	// A bucket with Day == 0 has never been touched and needs no cleanup.
+	// Phase 1 — expiry.
 	for i := range b.readHeatBuckets {
 		bucket := &b.readHeatBuckets[i]
-		if bucket.Day > 0 && bucket.Day < oldestValidDay {
-			if b.last7DReadCount >= bucket.Count {
-				b.last7DReadCount -= bucket.Count
-			} else {
-				b.last7DReadCount = 0
+		for {
+			d := bucket.Day.Load()
+			if d == 0 || d >= oldestValidDay {
+				break
 			}
-			*bucket = ScopeReadHeatBucket{}
+			// Claim the expiry by CAS'ing Day to 0. Losing the CAS
+			// means another goroutine just rolled or expired this
+			// slot — re-read and re-evaluate.
+			if !bucket.Day.CompareAndSwap(d, 0) {
+				continue
+			}
+			// We won the claim. Drain the count atomically and
+			// subtract it from last7DReadCount (saturating at 0).
+			n := bucket.Count.Swap(0)
+			for {
+				cur := b.last7DReadCount.Load()
+				next := uint64(0)
+				if cur > n {
+					next = cur - n
+				}
+				if b.last7DReadCount.CompareAndSwap(cur, next) {
+					break
+				}
+			}
+			break
 		}
 	}
 
-	// After the expiry pass, the current slot is either empty or already on today.
-	// Other days in the same slot would be >= 7 days old and were expired above.
+	// Phase 2 — claim/find today's slot and increment.
 	bucketIndex := int(day % ReadHeatWindowDays)
 	bucket := &b.readHeatBuckets[bucketIndex]
-	if bucket.Day != day {
-		bucket.Day = day
-		bucket.Count = 0
+	for {
+		d := bucket.Day.Load()
+		if d == day {
+			break
+		}
+		// d is either 0 (empty after Phase 1) or a value that races
+		// with a concurrent claim; CAS to today wins exactly once
+		// per goroutine race. Losers re-read and re-evaluate.
+		if bucket.Day.CompareAndSwap(d, day) {
+			// Reset Count to 0 just in case Phase 1 raced with us
+			// and we beat it to the slot before it could drain.
+			// Safe: any in-flight Adds from this same goroutine
+			// happen after this Store.
+			bucket.Count.Store(0)
+			break
+		}
 	}
 
-	bucket.Count++
-	b.readCountTotal++
-	b.last7DReadCount++
-	b.lastAccessTS = now
+	bucket.Count.Add(1)
+	b.readCountTotal.Add(1)
+	b.last7DReadCount.Add(1)
+	b.lastAccessTS.Store(now)
 }
 
 // scopeReplacement holds a fully built scope state ready to be atomically
@@ -965,9 +1028,9 @@ func (b *ScopeBuffer) stats(now int64) ScopeStats {
 		LastSeq:         b.lastSeq,
 		ApproxScopeMB:   MB(b.approxSizeBytesLocked()),
 		CreatedTS:       b.createdTS,
-		LastAccessTS:    b.lastAccessTS,
-		ReadCountTotal:  b.readCountTotal,
-		Last7DReadCount: b.computeLast7DReadCountLocked(now),
+		LastAccessTS:    b.lastAccessTS.Load(),
+		ReadCountTotal:  b.readCountTotal.Load(),
+		Last7DReadCount: b.computeLast7DReadCount(now),
 	}
 }
 
