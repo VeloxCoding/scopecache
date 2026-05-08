@@ -60,6 +60,8 @@ Measuring that difference and showing the resulting performance benefits is the 
 
 ## 4. Docker and CPU Settings
 
+A self-contained reproduction recipe for the ScopeCache side of this benchmark — Dockerfile, Caddyfile, wrk Lua script, seed script, docker-compose — lives in [benchmark_roundtrip_setup.md](benchmark_roundtrip_setup.md). It works on Linux native and Windows/macOS Docker Desktop (with documented platform caveats).
+
 All three benchmarks run in their own single-container Docker setup. This is deliberate: it keeps container-to-container network latency out of the measurement.
 
 Common settings:
