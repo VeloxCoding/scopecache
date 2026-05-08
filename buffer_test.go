@@ -1535,3 +1535,86 @@ func TestBuildReplacementState_SeqFromOne(t *testing.T) {
 		t.Fatal("bySeq missing seq 1")
 	}
 }
+
+// shrinkIfSparseLocked rebuilds the items slice + maps when the
+// scope has gone substantially sparse — defined as cap > 1024 AND
+// len < cap/4. Without it, draining 99% of a 100k-item scope leaves
+// the 100k-element backing array + map buckets pinned until the
+// next refill cycle. This test pushes a buffer past the threshold,
+// drains heavily, and asserts the slice cap actually came down.
+func TestBuffer_ShrinkIfSparseLocked_RebuildsSliceAndMaps(t *testing.T) {
+	const N = 4096
+	buf := newscopeBuffer(N)
+
+	for i := 1; i <= N; i++ {
+		if _, err := buf.appendItem(newItem("s", fmt.Sprintf("id-%d", i), nil)); err != nil {
+			t.Fatalf("append %d: %v", i, err)
+		}
+	}
+	preCap := cap(buf.items)
+	if preCap < shrinkMinCap*2 {
+		t.Fatalf("test invalid: pre-shrink cap %d below threshold-times-two %d", preCap, shrinkMinCap*2)
+	}
+
+	// Drain enough that len drops below cap/4. Single-item deletes
+	// to exercise the deleteIndexLocked → shrinkIfSparseLocked path
+	// (deleteUpToSeq's own make-fresh-slice already shrinks the
+	// items slice independently).
+	keep := preCap/shrinkSparseRatio - 4
+	for i := 1; i <= N-keep; i++ {
+		if _, err := buf.deleteByID(fmt.Sprintf("id-%d", i)); err != nil {
+			t.Fatalf("delete id-%d: %v", i, err)
+		}
+	}
+
+	if got := cap(buf.items); got >= preCap {
+		t.Errorf("slice cap did not shrink after drain: got %d, pre %d (sparse-rebuild missed)", got, preCap)
+	}
+	// After shrink the surviving items must still be reachable via
+	// every address path — sanity-check both maps + slice consistency.
+	if len(buf.items) != keep {
+		t.Errorf("post-drain len(items)=%d want %d", len(buf.items), keep)
+	}
+	if len(buf.byID) != keep {
+		t.Errorf("post-drain len(byID)=%d want %d (map should be re-sized to len)", len(buf.byID), keep)
+	}
+	if len(buf.bySeq) != keep {
+		t.Errorf("post-drain len(bySeq)=%d want %d", len(buf.bySeq), keep)
+	}
+	// Spot-check that the kept items address-resolve.
+	for _, item := range buf.items {
+		if _, ok := buf.byID[item.ID]; !ok {
+			t.Errorf("byID lost id=%s after rebuild", item.ID)
+		}
+		if _, ok := buf.bySeq[item.Seq]; !ok {
+			t.Errorf("bySeq lost seq=%d after rebuild", item.Seq)
+		}
+	}
+}
+
+// Negative case: a buffer with cap below shrinkMinCap must NOT
+// rebuild even when drained heavily. Avoids spurious allocation
+// churn on small buffers where retention is bounded anyway.
+func TestBuffer_ShrinkIfSparseLocked_SkipsBelowMinCap(t *testing.T) {
+	buf := newscopeBuffer(100)
+	// Fewer items than shrinkMinCap so cap stays below the threshold.
+	for i := 1; i <= 50; i++ {
+		if _, err := buf.appendItem(newItem("s", fmt.Sprintf("id-%d", i), nil)); err != nil {
+			t.Fatalf("append %d: %v", i, err)
+		}
+	}
+	preCap := cap(buf.items)
+	if preCap > shrinkMinCap {
+		t.Skipf("buffer grew past shrinkMinCap (cap=%d) under N=50; test invariant changed", preCap)
+	}
+
+	// Drain to 1 item.
+	for i := 1; i <= 49; i++ {
+		if _, err := buf.deleteByID(fmt.Sprintf("id-%d", i)); err != nil {
+			t.Fatalf("delete: %v", err)
+		}
+	}
+	if cap(buf.items) != preCap {
+		t.Errorf("small buffer rebuilt unnecessarily: pre=%d post=%d", preCap, cap(buf.items))
+	}
+}

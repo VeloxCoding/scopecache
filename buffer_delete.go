@@ -54,6 +54,57 @@ func (b *scopeBuffer) deleteIndexLocked(i int) {
 	}
 	b.lastWriteTS = now
 	b.resetIfEmptyLocked()
+	b.shrinkIfSparseLocked()
+}
+
+// shrinkIfSparseLocked rebuilds the items slice and the bySeq/byID
+// maps when the slice has gone substantially sparse — defined as
+// cap > shrinkMinCap AND len < cap/shrinkSparseRatio. Without this,
+// a drain that reduces a 100k-item scope to a handful keeps the
+// 100k-element slice backing array and the corresponding map
+// bucket arrays alive (Go maps don't shrink on delete).
+//
+// Conservative thresholds — only fires on visibly-sparse buffers,
+// not on minor churn. After a rebuild the new slice cap equals len,
+// so a follow-up delete must again accumulate enough sparsity
+// before another rebuild fires; amortised cost is O(1) per delete.
+//
+// PRECONDITION: caller holds b.mu and the delete logic has already
+// updated b.bytes / counters.
+const (
+	shrinkMinCap      = 1024
+	shrinkSparseRatio = 4 // len < cap/4 → rebuild
+)
+
+func (b *scopeBuffer) shrinkIfSparseLocked() {
+	if cap(b.items) <= shrinkMinCap {
+		return
+	}
+	if len(b.items)*shrinkSparseRatio >= cap(b.items) {
+		return
+	}
+	// Rebuild items slice with cap = len so the high-water backing
+	// array becomes GC-eligible.
+	newItems := make([]Item, len(b.items))
+	copy(newItems, b.items)
+	// Rebuild maps from the surviving items so map bucket arrays
+	// also shrink. Pre-size by len(newItems) — a slight over-
+	// allocation when many items have empty IDs is cheaper than
+	// growing the map back up via subsequent appends.
+	newBySeq := make(map[uint64]Item, len(newItems))
+	var newByID map[string]Item
+	for i := range newItems {
+		newBySeq[newItems[i].Seq] = newItems[i]
+		if newItems[i].ID != "" {
+			if newByID == nil {
+				newByID = make(map[string]Item, len(newItems))
+			}
+			newByID[newItems[i].ID] = newItems[i]
+		}
+	}
+	b.items = newItems
+	b.bySeq = newBySeq
+	b.byID = newByID
 }
 
 // resetIfEmptyLocked drops the high-watermark backing storage when a
