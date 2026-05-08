@@ -63,37 +63,22 @@ type Handler struct {
 	// payload), "full" (events with payload). Empty string = "off".
 	EventsMode string `json:"events_mode,omitempty"`
 	// SubscriberCommand is the absolute path to an executable invoked
-	// by the in-core subscriber bridge on every wake-up from the
-	// reserved scopes (`_events`, `_inbox`). Empty (default) = no
-	// subscriber spawned. Set = one subscriber goroutine per reserved
-	// scope, each invoking the command with SCOPECACHE_SCOPE set to
-	// `_events` or `_inbox` so a single command can branch on which
-	// scope fired. The "command" can be a shell script, a compiled
-	// binary, or anything else exec.Command can run. See
-	// scopecache.Gateway.StartSubscriber for the contract.
+	// by the in-core subscriber bridge on every wake-up from a
+	// reserved scope (`_events`, `_inbox`). Empty (default) = no
+	// subscriber spawned. The script receives SCOPECACHE_SCOPE in env
+	// to branch on which reserved scope fired. Full contract on
+	// scopecache.Gateway.StartSubscriber.
 	SubscriberCommand string `json:"subscriber_command,omitempty"`
 	// InitCommand is the absolute path to an executable invoked once
-	// at Provision time, after the cache has been constructed and the
-	// reserved scopes (`_events`, `_inbox`) are pre-created. Empty
-	// (default) = no init command. Set = the helper runs sync inside
-	// Provision, blocking the rest of Caddy's start-up until the
-	// command exits.
-	//
-	// The script is given SCOPECACHE_SOCKET_PATH pointing to a
-	// per-instance private Unix socket that the adapter binds for the
-	// duration of init. Inside the script, write into THIS Caddy
-	// instance's cache with `curl --unix-socket "$SCOPECACHE_SOCKET_PATH"`
-	// — Caddy's normal HTTP listeners aren't bound yet during
-	// Provision, but the private socket is. After the script exits the
-	// private socket is torn down and Caddy starts listening normally.
-	// Use case: rebuild the cache from a source of truth at boot. See
-	// scopecache.Gateway.RunInitCommand for the full contract.
+	// at Provision time, before Caddy starts listening. The script
+	// reaches the cache via `curl --unix-socket "$SCOPECACHE_SOCKET_PATH"`
+	// against a per-instance private socket the adapter binds for
+	// the duration of init. Empty (default) = no init script. Full
+	// contract on scopecache.Gateway.RunInitCommand and RFC §2.7.
 	InitCommand string `json:"init_command,omitempty"`
 	// InitTimeoutSec caps how long the init command may run before
 	// the helper SIGKILLs its process group. 0 (default) = no
-	// timeout — only Caddy reload / shutdown cancels the script.
-	// Recommended for production: a value high enough for your
-	// largest realistic source-of-truth rebuild, plus margin.
+	// timeout; Caddy reload / shutdown still cancels the script.
 	InitTimeoutSec int `json:"init_timeout_sec,omitempty"`
 
 	api             *scopecache.API
@@ -139,22 +124,18 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	h.mux = http.NewServeMux()
 	h.api.RegisterRoutes(h.mux)
 
-	// Boot-time init command (private-socket adapter contract +
-	// subscribers-AFTER-init rationale live in init_command.go's
-	// file-header). Provision blocks until the script exits — Caddy
-	// keeps the previous instance serving during reload, so a long
-	// init does not interrupt service. ctx cancellation on reload /
-	// shutdown SIGKILLs the script's whole process group; a failure
-	// is logged and ignored (empty cache is still a working cache).
+	// Run init before subscribers so init-created `_events` noise is
+	// wiped before drains start. Provision blocks until the script
+	// exits; Caddy keeps the previous instance serving during reload
+	// so a long init does not interrupt service. A failure is logged
+	// and ignored (empty cache is still a working cache).
 	if h.InitCommand != "" {
 		if err := h.runInitWithPrivateSocket(ctx, gw); err != nil {
 			caddy.Log().Named("scopecache.init").Sugar().Warnf("init: %v", err)
 		}
 	}
 
-	// Subscribers start AFTER init — RunInitCommand wipes `_events`
-	// itself, and `_inbox` was unreachable to external writers during
-	// init, so subscribers register against an empty stream.
+	// Subscribers start after init. See RFC §2.7.
 	h.stopSubscribers = gw.StartReservedSubscribers(
 		h.SubscriberCommand,
 		caddy.Log().Named("scopecache.subscriber").Sugar().Infof,
@@ -162,16 +143,11 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	return nil
 }
 
-// runInitWithPrivateSocket implements the standalone-symmetric
-// init contract (init_command.go file-header): bind a per-instance
-// temp Unix socket serving the cache routes, run the init command
-// with SCOPECACHE_SOCKET_PATH pointing at it, tear the socket down.
-//
-// ctx propagates into RunInitCommand so Caddy reload / shutdown
-// SIGKILLs a hung script's whole process group. h.InitTimeoutSec
-// > 0 wraps ctx with an additional hard deadline. Temp dir is
-// 0o700 (MkdirTemp default) so other users on the host can't reach
-// the socket.
+// runInitWithPrivateSocket binds a per-instance temp Unix socket
+// (0o700 dir from MkdirTemp), runs the init command with
+// SCOPECACHE_SOCKET_PATH pointing at it, then tears the socket
+// down. ctx cancellation kills a hung script's whole process group;
+// h.InitTimeoutSec > 0 wraps ctx with a hard deadline.
 func (h *Handler) runInitWithPrivateSocket(ctx context.Context, gw *scopecache.Gateway) error {
 	logf := caddy.Log().Named("scopecache.init").Sugar().Infof
 	logger := caddy.Log().Named("scopecache.init").Sugar()
@@ -328,9 +304,10 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	return nil
 }
 
-// validateConfig rejects values the standalone binary's env-var parsers
-// would have ignored with a warning (negative integers, unknown
-// events_mode strings).
+// validateConfig rejects values the standalone binary's env-var
+// parsers would have ignored with a warning (negative integers,
+// unknown events_mode strings).
+//
 // maxConfigMB / maxConfigKB / maxConfigSec are the upper bounds
 // beyond which a later unit conversion in Provision would silently
 // overflow int64:
@@ -340,9 +317,8 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 //   - InitTimeoutSec:            `time.Duration(value) * time.Second`
 //     (seconds → nanoseconds).
 //
-// Operationally absurd values, but rejecting them turns "silent
-// wrong cap" into "loud configuration error" — the cheaper failure
-// mode.
+// These values are not practical, but rejecting them prevents a
+// silently-wrong cap.
 const (
 	maxConfigMB  = math.MaxInt64 >> 20                // ~8.79 trillion MiB
 	maxConfigKB  = math.MaxInt64 >> 10                // ~9 quadrillion KiB
@@ -350,22 +326,26 @@ const (
 )
 
 func (h *Handler) validateConfig() error {
+	// value/upper are int64 so the seconds bound (~292 years, fits
+	// int64) does not need an int(maxConfigSec) cast that could
+	// overflow on a 32-bit build. Caddy is practically 64-bit Linux
+	// today, but the int64 typing is the cheap correctness move.
 	for _, e := range []struct {
 		key      string
-		value    int
-		upper    int
+		value    int64
+		upper    int64
 		upperFmt string
 	}{
 		// scope_max_items / inbox_max_items are plain int counts —
 		// no unit conversion, no upper bound check beyond
 		// non-negative. upper == 0 disables the bound check for
 		// those rows.
-		{"scope_max_items", h.ScopeMaxItems, 0, ""},
-		{"max_store_mb", h.MaxStoreMB, maxConfigMB, "MiB"},
-		{"max_item_mb", h.MaxItemMB, maxConfigMB, "MiB"},
-		{"inbox_max_items", h.InboxMaxItems, 0, ""},
-		{"inbox_max_item_kb", h.InboxMaxItemKB, maxConfigKB, "KiB"},
-		{"init_timeout_sec", h.InitTimeoutSec, int(maxConfigSec), "seconds"},
+		{"scope_max_items", int64(h.ScopeMaxItems), 0, ""},
+		{"max_store_mb", int64(h.MaxStoreMB), maxConfigMB, "MiB"},
+		{"max_item_mb", int64(h.MaxItemMB), maxConfigMB, "MiB"},
+		{"inbox_max_items", int64(h.InboxMaxItems), 0, ""},
+		{"inbox_max_item_kb", int64(h.InboxMaxItemKB), maxConfigKB, "KiB"},
+		{"init_timeout_sec", int64(h.InitTimeoutSec), maxConfigSec, "seconds"},
 	} {
 		if e.value < 0 {
 			return fmt.Errorf("%s must be zero or a positive integer (got %d); 0 falls back to the compile-time default", e.key, e.value)

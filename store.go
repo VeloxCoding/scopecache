@@ -44,11 +44,8 @@ import (
 )
 
 // numShards splits the scope map into independently-locked shards.
-// Power of 2 so the modulo collapses to a bitmask.
-//
-// Multi-shard operations (/wipe, /rebuild, /warm) MUST acquire shard
-// locks in ascending shard-index order to avoid deadlock with each
-// other.
+// Power of 2 so the modulo collapses to a bitmask. Multi-shard
+// lock-order rule lives in the file header.
 const (
 	numShards = 32
 	shardMask = numShards - 1
@@ -61,10 +58,8 @@ type scopeShard struct {
 
 type store struct {
 	// shards splits the scope map into numShards independently-locked
-	// buckets. Per-scope hot paths (getOrCreate, lookup, delete) take
-	// only one shard's lock; multi-shard ops take a sorted subset in
-	// ascending index order. Replaced the original store-wide RWMutex
-	// that serialised every scope creation through one queue.
+	// buckets. Per-scope hot paths take one shard's lock; multi-shard
+	// ops take an ascending subset (see lockAllShards / lockShards).
 	shards   [numShards]scopeShard
 	hashSeed maphash.Seed
 
@@ -107,21 +102,15 @@ type store struct {
 
 	// totalBytes is the authoritative byte counter for admission
 	// control: Σ approxItemSize over items + scopeBufferOverhead per
-	// allocated scope. Atomic so write paths reserve against the
-	// global budget without touching the store-level mutex; writes
-	// that would push it past maxStoreBytes are rejected with
-	// StoreFullError. Surfaced as approx_store_mb on /stats — the
-	// number a client sees in a 507, the value reported by /stats,
-	// and the comparand on the next write all describe the same
-	// accounting model.
+	// allocated scope. Surfaced as approx_store_mb on /stats; the
+	// 507-comparand, the /stats value, and the next-write check all
+	// describe the same accounting model.
 	//
-	// Leaner than scopeBuffer.approxSizeBytes: the per-scope estimate
-	// folds in Go map/slice overhead, which admission control
-	// deliberately does NOT charge against the cap (cap arithmetic
-	// stays layout-independent). scopeBufferOverhead is the one
-	// per-scope item that IS charged — closes the empty-scope-spam
-	// DoS. Trade-off: approx_store_mb under-reports real memory
-	// pressure at very high scope counts.
+	// Per-scope Go map/slice overhead is intentionally OUTSIDE this
+	// counter — admission-control arithmetic stays layout-independent.
+	// scopeBufferOverhead is the one per-scope cost that IS charged
+	// (closes the empty-scope-spam DoS). Trade-off: approx_store_mb
+	// under-reports real memory pressure at very high scope counts.
 	totalBytes atomic.Int64
 
 	// totalItems and scopeCount mirror the totalBytes lockstep
@@ -198,14 +187,9 @@ func (s *store) bumpLastWriteTS(nowUs int64) {
 	}
 }
 
-// reservedScopeNames lists the cache-reserved scope names that are
-// pre-created at boot, re-created after /wipe and /rebuild, and
-// protected from scope-level destruction. Item-level operations
-// (/append, /delete, /delete_up_to, /get, /head, /tail, /render)
-// remain open on these scopes — the drainer pattern requires
-// /delete_up_to and /tail on _events to function, and apps freely
-// /append into _inbox. See types.go for per-scope rationale and
-// CLAUDE.md "Two reserved scopes" for the principle.
+// reservedScopeNames is the canonical list dispatched through
+// isReservedScope, maxItemBytesFor, and maxItemsFor. See RFC §2.6
+// for the reservation contract and §2.7 for boot-time pre-creation.
 var reservedScopeNames = [...]string{EventsScopeName, InboxScopeName}
 
 // reservedScopesOverhead is the byte cost of pre-creating every
@@ -215,9 +199,8 @@ var reservedScopeNames = [...]string{EventsScopeName, InboxScopeName}
 const reservedScopesOverhead = int64(len(reservedScopeNames)) * scopeBufferOverhead
 
 // isReservedScope reports whether scope is a cache-reserved name.
-// Used by /delete_scope, /warm and /rebuild to reject scope-level
-// destructive operations targeting reserved scopes. See
-// reservedScopeNames for the full discipline.
+// Single source of truth for /delete_scope, /warm and /rebuild
+// rejection.
 func isReservedScope(scope string) bool {
 	for _, name := range reservedScopeNames {
 		if scope == name {
@@ -227,18 +210,14 @@ func isReservedScope(scope string) bool {
 	return false
 }
 
-// maxItemBytesFor returns the per-item byte cap that applies to writes
-// against scope. The reserved scopes have caps decoupled from the
-// global one (see types.go EventsConfig / InboxConfig and RFC §2.6):
+// maxItemBytesFor returns the per-item byte cap that applies to
+// writes against scope: eventsMaxItemBytes for `_events`,
+// inboxMaxItemBytes for `_inbox`, maxItemBytes otherwise. Cap
+// derivation lives in newStore; reservation contract in RFC §2.6.
 //
-//   - `_events` uses eventsMaxItemBytes (= MaxItemBytes + eventsItemEnvelopeOverhead)
-//   - `_inbox`  uses inboxMaxItemBytes  (operator-tunable, default 64 KiB)
-//   - everything else uses maxItemBytes (the global Config.MaxItemBytes)
-//
-// Called by handlers that mutate items (currently /append) right before
-// the validator's checkItemSize. Other write handlers (/upsert,
-// /update, /counter_add) reject reserved scopes at the validator
-// before reaching this path, so they always see the global cap.
+// Called only by /append in production: the other write handlers
+// reject reserved scopes at the validator and always see the global
+// cap.
 func (s *store) maxItemBytesFor(scope string) int64 {
 	switch scope {
 	case EventsScopeName:
@@ -270,13 +249,9 @@ func (s *store) maxItemBytesAnyScope() int64 {
 }
 
 // maxItemsFor returns the per-scope item-count cap to install on a
-// freshly-created buffer for scope. Mirrors maxItemBytesFor's
-// per-reserved-scope dispatch, with one extra wrinkle: `_events`
-// returns the unboundedScopeMaxItems sentinel so its appendItem path
-// skips the count cap entirely (best-effort observability — only the
-// global byte budget gates writes there). Used by
-// initReservedScopes(Locked) to install the right cap at boot /
-// after wipe / after rebuild.
+// freshly-created buffer for scope: unboundedScopeMaxItems for
+// `_events` (best-effort observability, byte-budget-gated only),
+// inboxMaxItems for `_inbox`, defaultMaxItems otherwise.
 func (s *store) maxItemsFor(scope string) int {
 	switch scope {
 	case EventsScopeName:
@@ -297,19 +272,14 @@ func (s *store) maxItemsFor(scope string) int {
 const unboundedScopeMaxItems = 0
 
 // initReservedScopes pre-creates every entry in reservedScopeNames
-// at newStore time. Idempotent. For paths that already hold all-
-// shard write locks (wipe, rebuildAll), use initReservedScopesLocked
-// — calling this version under those locks would deadlock.
+// at newStore time. Idempotent. Paths holding all-shard write locks
+// (wipe, rebuildAll) call initReservedScopesLocked — this version
+// would deadlock under those locks.
 //
-// Byte-budget reservation is unconditional (Config.WithDefaults
-// clamps MaxStoreBytes to at least reservedScopesOverhead so the
-// reserved scopes always fit), matching the post-wipe re-init path
-// so the two paths share invariants.
-//
-// Boot-time pre-creation is NOT cache activity: s.lastWriteTS is
-// NOT bumped and per-scope buf.lastWriteTS is reset to 0. A polling
-// client using lastWriteTS as "have I seen this cache before"
-// expects 0 on a fresh boot; the first real write advances both.
+// Boot-time pre-creation is silent on s.lastWriteTS and resets per-
+// scope buf.lastWriteTS to 0 so a fresh store reports
+// last_write_ts = 0 — the "have I seen this cache before" sentinel
+// for polling clients works regardless of reserved-scope creation.
 func (s *store) initReservedScopes() {
 	for _, name := range reservedScopeNames {
 		sh := s.shardFor(name)
@@ -328,14 +298,9 @@ func (s *store) initReservedScopes() {
 
 // initReservedScopesLocked re-creates the reserved scopes assuming
 // the caller holds every shard's write lock (wipe, rebuildAll).
-// Idempotent: a scope that survived the caller's reset (defensive
-// against rebuildAll input slipping through validation) is left
-// alone, no double-reserve.
-//
-// Does NOT bump s.lastWriteTS — the surrounding wipe / rebuildAll
-// already bumped for the destructive event. Per-scope buf.lastWriteTS
-// is aligned with that same tick: re-creation is part of the same
-// logical operation, not a separate one.
+// Idempotent. Per-scope buf.lastWriteTS aligns with the surrounding
+// destructive event's tick — same logical operation, not a separate
+// one — and s.lastWriteTS was already bumped by the caller.
 func (s *store) initReservedScopesLocked() {
 	for _, name := range reservedScopeNames {
 		sh := s.shardFor(name)
@@ -419,16 +384,10 @@ func (s *store) shardsForScopes(scopes []string) []*scopeShard {
 	return out
 }
 
-// lockAllShards / unlockAllShards / lockShards / unlockShards are the
-// helpers every multi-shard mutation MUST use. They encode the
-// ascending-shard-index lock order that the `numShards` comment block
-// above declares — relying on each call-site to spell out the loop
-// correctly is exactly how a future op silently introduces a deadlock
-// against /wipe, /rebuild, or /warm.
-//
-// Unlock order is forward. Go's sync.Mutex has no unlock-order
-// requirement; the only correctness constraint is consistent ascending
-// acquisition (see the numShards comment block above).
+// lockAllShards / unlockAllShards / lockShards / unlockShards are
+// the helpers every multi-shard mutation MUST use. Acquisition is
+// ascending shard-index order (see file header); release order is
+// not load-bearing.
 
 // lockAllShards locks every shard in ascending index order. Used by
 // /wipe and /rebuild.
@@ -571,10 +530,9 @@ func (s *store) getOrCreateScopeTrackingCreated(scope string) (*scopeBuffer, boo
 	//
 	// Race-loss path (a concurrent goroutine inserted the same scope
 	// while we were allocating) discards the unused buffer for GC and
-	// makes no reservation. In the unique-scope-per-write workload
-	// that drove this rewrite, race-loss is essentially never (every
-	// scope name is distinct); in same-scope writes the caller hits
-	// the RLock fast-path above and never reaches this branch.
+	// makes no reservation. Race-loss is rare in unique-scope-per-
+	// write workloads (every scope name distinct); same-scope writes
+	// hit the RLock fast-path above instead.
 	preBuf := s.newscopeBuffer()
 
 	sh.mu.Lock()
@@ -1097,20 +1055,13 @@ type reservedScopeEntry struct {
 }
 
 // stats returns the store-wide aggregate snapshot in O(1) — four
-// atomic loads. No shard walks, no per-scope fan-out: every counter
-// is maintained incrementally on the write paths (see the
-// totalItems/scopeCount comment block on *Store for the lockstep
-// discipline). Configured caps (MaxStoreBytes, etc.) are NOT echoed
-// here — they are static config and belong on /help (or a future
-// dedicated /config endpoint), not in a per-call state response.
+// atomic loads, no shard walks. Configured caps (MaxStoreBytes, etc.)
+// are NOT echoed here; they are static config and belong on /help.
 //
-// Each load is independent, so a concurrent burst of /append + /delete
-// can produce a snapshot where (scope_count, total_items, approx_store_mb)
-// reflect three slightly different instants. That's the same caveat
-// the previous shard-walking version carried (and weaker — it walked
-// shards sequentially, releasing locks between them). /stats has
-// always been an approximation; this version is honest about it
-// without paying the per-scope enumeration cost.
+// Each load is independent, so a concurrent burst of /append +
+// /delete can produce a snapshot where (scope_count, total_items,
+// approx_store_mb) reflect three slightly different instants. /stats
+// is an advisory snapshot.
 func (s *store) stats() storeStats {
 	return storeStats{
 		ScopeCount:       int(s.scopeCount.Load()),

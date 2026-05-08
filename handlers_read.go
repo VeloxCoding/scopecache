@@ -1,7 +1,7 @@
 // Read handlers on the public mux:
 //
-//   - /head      — oldest-first window, optional after_seq cursor
-//   - /tail      — newest-first window, optional offset
+//   - /head      — window after a seq cursor, oldest-first
+//   - /tail      — window at the newest end, oldest-first within
 //   - /get       — single-item lookup by id or seq, JSON envelope
 //   - /render    — single-item raw payload, no JSON envelope
 //
@@ -23,12 +23,14 @@ import (
 
 // writeItemsHit assembles and writes the success response for a
 // list-returning read endpoint (/head, /tail). HTTP shape + per-
-// response byte cap only — read-heat stamping lives in Store.head /
-// Store.tail.
+// response byte cap only — read-heat stamping lives in store.head /
+// store.tail.
 //
-// `extra` slots between `count` and `truncated` so /tail can carry
-// its `offset` field at the right wire position; /head passes nil.
-// Field order is load-bearing — do not reorder.
+// extra slots between count and truncated so /tail can carry its
+// offset field at the right wire position; /head passes nil. The
+// fixed ok / hit / count / [extra] / truncated / items order is
+// what clients and log scanners see — keep new fields in their
+// correct slot rather than appending.
 func (api *API) writeItemsHit(
 	w http.ResponseWriter,
 	started time.Time,
@@ -64,11 +66,10 @@ func (api *API) writeItemsHit(
 // writeItemsMiss writes the canonical "scope does not exist" response
 // for a list-returning read endpoint. Same field order as
 // writeItemsHit's success path; truncated is always false; items is
-// the sentinel empty slice (NOT nil — `[]Item{}` marshals as `[]`,
+// the sentinel empty slice (not nil — `[]Item{}` marshals as `[]`,
 // nil would marshal as `null` and break clients that iterate). Goes
-// through the same cap-aware writer as the hit path so an absurdly
-// small per-response cap rejects misses too — preserves the symmetry
-// the cap-test suite relies on.
+// through the same cap-aware writer as the hit path so cap behaviour
+// stays symmetric across hit and miss responses.
 func (api *API) writeItemsMiss(
 	w http.ResponseWriter,
 	started time.Time,

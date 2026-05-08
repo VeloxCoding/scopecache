@@ -1,8 +1,9 @@
-// validation.go owns shape validation for every public entry point —
-// HTTP request bodies via the handler layer and Go-API arguments via
-// Gateway. Validators decode-then-check; on rejection they return
-// errors wrapped with ErrInvalidInput so handlers can map them to a
-// 400 response with errors.Is.
+// validation.go owns shape validation for every public write/delete
+// entry point. Validators run at the top of each *store method, so
+// both HTTP traffic (which arrives via the handler layer) and Go-API
+// traffic (which arrives via *Gateway → *store) hit the same gate.
+// On rejection validators return errors wrapped with ErrInvalidInput
+// so handlers can map them to 400 via errors.Is.
 //
 // Conventions baked in here:
 //
@@ -10,18 +11,20 @@
 //     validateUpdateItem, validateCounterAddRequest, validateDelete*)
 //     defer wrapValidation so every return path picks up the
 //     ErrInvalidInput wrap. Add a new validator with the same shape.
-//   - Reads are PERMISSIVE: invalid scope/id at the Gateway boundary
-//     silently miss with hit=false. Strict shape validation runs only
-//     at the HTTP layer (parseLookupTarget); validators in this file
-//     are the WRITE / DELETE path's gates.
+//   - Reads are permissive: invalid scope/id at the Gateway boundary
+//     silently miss with hit=false. Strict shape validation runs
+//     only at the HTTP layer (parseLookupTarget); validators in this
+//     file are the write/delete path's gates.
 //   - HTTP status mapping is the handler's responsibility: 400 for
 //     ErrInvalidInput, 409 for *CounterPayloadError /
 //     *ScopeDetachedError, 507 for *ScopeFullError /
 //     *ScopeCapacityError / *StoreFullError. Validators only signal
 //     "shape is wrong"; capacity / conflict signals come from store.go.
 //   - checkItemSize owns the renderBytes precompute for write paths,
-//     so the buffer-write code never re-runs json.Unmarshal on the
-//     same bytes.
+//     so the normal validated write path does not re-run
+//     json.Unmarshal on the same bytes. Buffer-write code keeps a
+//     defensive recompute for internal callers / tests that bypass
+//     the validator.
 
 package scopecache
 
@@ -122,7 +125,7 @@ func validateIDOrSeq(endpoint, id string, seq uint64) error {
 }
 
 // validatePayload enforces the two-part payload contract (RFC §4.1):
-// payload must be present (not missing, not literal `null`) AND must
+// payload must be present (not missing, not literal `null`) and must
 // be syntactically valid JSON.
 //
 // The HTTP path's encoding/json decode catches malformed JSON during
@@ -131,10 +134,8 @@ func validateIDOrSeq(endpoint, id string, seq uint64) error {
 // in as-is. Without the explicit json.Valid check, invalid bytes
 // would be stored opaquely and re-served by /get, /head, /tail,
 // /render and `_events` envelopes, breaking any downstream consumer
-// that json.Unmarshals.
-//
-// Cost: one O(n) scan per write. ~30 ns on small payloads, ~5 µs on
-// 1 MiB — well below the HTTP path's per-request overhead.
+// that json.Unmarshals. json.Valid is a single linear scan and runs
+// only on writes.
 func validatePayload(p json.RawMessage) error {
 	if len(p) == 0 || bytes.Equal(bytes.TrimSpace(p), []byte("null")) {
 		return errors.New("the 'payload' field is required")
@@ -326,9 +327,9 @@ func validateCounterAddRequest(req counterAddRequest, maxItemBytes int64) (by in
 	}
 	// Cap pre-flight on the candidate counter shape: non-nil counter
 	// marker so approxItemSize charges counterCellOverhead instead of
-	// len(Payload). maxItemBytes <= 0 disables the check — fuzz
-	// callers pass 0 to exercise the shape rules without provisioning
-	// a realistic per-item budget.
+	// len(Payload). maxItemBytes <= 0 disables the check for
+	// internal/test callers that exercise shape rules without
+	// provisioning a realistic per-item budget.
 	if maxItemBytes > 0 {
 		candidate := Item{Scope: req.Scope, ID: req.ID, counter: &counterCell{}}
 		if size := approxItemSize(candidate); size > maxItemBytes {

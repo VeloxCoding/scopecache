@@ -1,89 +1,37 @@
-// Boot-time init-command bridge: a thin Go-side helper that invokes an
-// operator-supplied executable once, synchronously, after the cache is
-// fully constructed (NewGateway has pre-created the reserved scopes
-// `_events` and `_inbox` via initReservedScopes).
+// Boot-time init-command bridge: invokes an operator-supplied
+// executable once, synchronously, so the script can populate the
+// cache from a source of truth via the same HTTP endpoints any
+// other client uses (/append, /warm, /rebuild). The full boot-flow
+// contract — private socket, public-listener bind ordering,
+// subscriber start-after-init, failure handling — lives in
+// scopecache-core-rfc.md §2.7. This file owns the code-level
+// invariants only.
 //
-// Use case: rebuild the cache from a source of truth at boot. The
-// script exec.Run's into existence, queries a database / reads files /
-// hits a remote API, and writes the resulting state into the cache via
-// the same HTTP endpoints any other client uses (curl /append, /warm,
-// /rebuild). The cache itself never reads the source of truth — it
-// just provides the "now is the right moment to populate me" hook.
+// Adapter contract: both adapters wrap RunInitCommand in their own
+// runInitWithPrivateSocket helper that binds a temp AF_UNIX socket
+// serving the cache routes, sets SCOPECACHE_SOCKET_PATH in
+// extraEnv, runs the script, then tears the socket down. The
+// script reaches the cache via
+// `curl --unix-socket "$SCOPECACHE_SOCKET_PATH" http://localhost/...`
+// regardless of deployment shape.
 //
-// # Adapter contract: both adapters give the script a private socket
+// `_events` wipe: RunInitCommand always wipes `_events` after the
+// script exits (success or failure), so subscribers attaching after
+// init see an empty stream. Init writes auto-populate `_events`
+// with duplicates of the source-of-truth state; forwarding those
+// through a drain would loop the data back where it came from.
 //
-// Both the standalone and the Caddy adapter wrap RunInitCommand in
-// their own runInitWithPrivateSocket helper that:
+// Cancellation: ctx is the caller's cancellation handle (typically
+// a SIGINT/SIGTERM signal context, or caddy.Context for the
+// module). Cancellation SIGKILLs the entire process group via
+// configureProcessGroup so child processes from
+// `curl ... &; wait` shapes do not leak. No default timeout —
+// large-dataset rebuilds can legitimately take minutes; callers
+// wrap with context.WithTimeout when they want a hard cap.
 //
-//  1. Creates a temp directory (0o700 perms).
-//  2. Binds a temp AF_UNIX socket inside it serving the cache's
-//     HTTP routes.
-//  3. Sets SCOPECACHE_SOCKET_PATH=<that path> in extraEnv.
-//  4. Runs the init script.
-//  5. Tears the socket and temp dir down before returning.
-//
-// Effect: the script ALWAYS reaches the cache via
-// `curl --unix-socket "$SCOPECACHE_SOCKET_PATH" http://localhost/...`,
-// regardless of whether the operator configured a Unix-socket
-// standalone or a TCP-listening Caddy module. The same script body
-// works in both deployments.
-//
-// The PUBLIC listener (the operator-configured Unix socket on the
-// standalone, Caddy's HTTP listener on the module) is NOT bound
-// during init. External clients hitting it get connection-refused
-// instead of a half-populated cache. The public listener binds only
-// after RunInitCommand returns.
-//
-// Subscribers (`SCOPECACHE_SUBSCRIBER_COMMAND` /
-// `subscriber_command`) are started AFTER init. Two reasons:
-//
-//  1. Init is cache-state RESTORATION, not a domain action. The
-//     writes it performs auto-populate `_events` with duplicates of
-//     state that already exists at the source of truth. Forwarding
-//     those through a drain script would loop the data back to
-//     where init pulled it from. RunInitCommand wipes `_events`
-//     itself when it returns, so subscribers see an empty stream
-//     when they activate.
-//  2. `_inbox` is untouched during init — no external writers can
-//     reach the public listener yet, and init's purpose is
-//     restoration, not fan-in.
-//
-// Net result: when subscribers register there is no backlog. The
-// first wake-up fires on the first user-write once the public
-// listener is up. No initial-drain dance, no race against the
-// listener-bind window.
-//
-// # Cancellation and process group
-//
-// ctx is the cancellation handle the caller supplies — typically a
-// SIGINT/SIGTERM-aware context for the standalone (signalCtx) or the
-// caddy.Context passed into Provision for the module. Cancellation
-// causes the kernel to SIGKILL the entire process group (see
-// configureProcessGroup), so a script that backgrounds children
-// (`curl ... &; wait`) does not leak orphan processes when boot
-// gets interrupted. Callers that want a hard timeout wrap ctx with
-// context.WithTimeout themselves; the helper itself does not enforce
-// a default, since "rebuild from source of truth at boot" can
-// legitimately take many minutes on a large dataset.
-//
-// # Logging and error handling
-//
-// stdout/stderr are inherited so the operator sees the script's
-// output in their normal log stream. logf may be nil — the helper
-// then runs without lifecycle logging.
-//
-// Errors are logged AND returned: the caller decides whether a
-// failed init is fatal (abort startup) or recoverable (continue with
-// an empty cache). Both adapters currently log + continue — an empty
-// cache is still a working cache, and the next operator-triggered
-// rebuild (manual /rebuild, scheduled cron, next reload) will fix it.
-//
-// # Why this lives in core
-//
-// Same reason subscriber_command.go does: every realistic deployment
-// needs this exact bridge — running an operator script at
-// well-defined cache lifecycle points is the standard extension
-// hook. Stdlib-only (`os/exec`), no new dependencies.
+// Errors are logged and returned: the caller decides whether a
+// failed init is fatal or recoverable. stdout/stderr are inherited.
+// logf may be nil — the helper then runs without lifecycle logging.
 
 package scopecache
 

@@ -1,18 +1,14 @@
-// gateway.go owns *Gateway, the public Go-API for the cache. Every
-// in-process caller (adapters, addons, tests) talks to scopecache
-// through it; the underlying *store and its lowercase methods are
-// NOT part of the public contract. The per-type docstring below
-// carries the boundary contract (defensive cloning + counter-pointer
-// blocking); per-method comments do not repeat it.
+// gateway.go owns *Gateway, the public Go-API for the cache. The
+// godoc on the type itself carries the contract.
 
 package scopecache
 
-// Gateway is the public Go-API for the cache. ALL in-process callers
+// Gateway is the public Go-API for the cache. All in-process callers
 // — adapters (Caddy module, standalone), addons — talk to scopecache
 // via *Gateway. The underlying *store and its lowercase methods are
-// NOT part of the public contract.
+// not part of the public contract.
 //
-// Methods on Gateway are near-passthroughs to *store with ONE
+// Methods on Gateway are near-passthroughs to *store with one
 // invariant beyond delegation: defensive payload-byte cloning at
 // every boundary, plus blocking counter-pointer leaks in either
 // direction. See gateway_clone.go for the hazard description and
@@ -22,7 +18,7 @@ package scopecache
 // shape checks. Mutation logic lives in store.go, buffer_*.go,
 // events.go, subscribe.go.
 //
-// Pre-1.0: signatures may shift. Post-1.0: semver-stable.
+// Pre-1.0; signatures may break between minor versions.
 type Gateway struct {
 	store *store
 }
@@ -139,7 +135,7 @@ func (g *Gateway) Rebuild(grouped map[string][]Item) (int, int, error) {
 
 // --- Data-plane: reads ----------------------------------------------
 //
-// Reads are PERMISSIVE: invalid scope/id shapes (over-length, control
+// Reads are permissive: invalid scope/id shapes (over-length, control
 // chars, whitespace) silently miss with hit=false instead of erroring.
 // Strict validation lives at the HTTP layer (parseLookupTarget);
 // addons proxying HTTP inherit that.
@@ -157,37 +153,35 @@ func (g *Gateway) Head(scope string, afterSeq uint64, limit int) ([]Item, bool, 
 	return cloneItemsPayloads(items), truncated, found
 }
 
-// Tail returns up to `limit` newest items in `scope`, skipping the
-// first `offset` from the newest end.
+// Tail returns the window of newest `limit` items in `scope` after
+// skipping `offset` from the newest end. Items are in the cache's
+// native seq-ascending (oldest-first) order; clients sort by seq if
+// they want newest-first.
 // Returns (items, has_more, scope_found).
 func (g *Gateway) Tail(scope string, limit, offset int) ([]Item, bool, bool) {
 	items, hasMore, found := g.store.tail(scope, limit, offset)
 	return cloneItemsPayloads(items), hasMore, found
 }
 
-// GetByID returns the item at (scope, id).
-// Returns (item, hit).
+// GetByID returns (item, hit) at (scope, id).
 func (g *Gateway) GetByID(scope, id string) (Item, bool) {
 	item, hit := g.store.get(scope, id, 0)
 	return cloneItemPayload(item), hit
 }
 
-// GetBySeq returns the item at (scope, seq).
-// Returns (item, hit).
+// GetBySeq returns (item, hit) at (scope, seq).
 func (g *Gateway) GetBySeq(scope string, seq uint64) (Item, bool) {
 	item, hit := g.store.get(scope, "", seq)
 	return cloneItemPayload(item), hit
 }
 
-// RenderByID returns the rendered bytes for the item at (scope, id).
-// Returns (rendered, hit).
+// RenderByID returns (rendered_bytes, hit) for the item at (scope, id).
 func (g *Gateway) RenderByID(scope, id string) ([]byte, bool) {
 	rendered, hit := g.store.render(scope, id, 0)
 	return clonePayload(rendered), hit
 }
 
-// RenderBySeq returns the rendered bytes for the item at (scope, seq).
-// Returns (rendered, hit).
+// RenderBySeq returns (rendered_bytes, hit) for the item at (scope, seq).
 func (g *Gateway) RenderBySeq(scope string, seq uint64) ([]byte, bool) {
 	rendered, hit := g.store.render(scope, "", seq)
 	return clonePayload(rendered), hit

@@ -33,8 +33,8 @@
 //
 // Every parser follows the same shape: empty env var → compile-time
 // default; malformed / out-of-range / negative → log warning and fall
-// back to the default. A fat-fingered env var never prevents the
-// server from starting.
+// back to the default. An invalid env var never prevents the server
+// from starting.
 
 package main
 
@@ -357,10 +357,10 @@ func main() {
 	mux := http.NewServeMux()
 	api.RegisterRoutes(mux)
 
-	// HTTP timeouts sized for a local AF_UNIX cache. ReadTimeout
-	// covers a worst-case bulk body decode (~15-40s on a 1 GiB store
-	// at slow CPU); WriteTimeout must exceed it; IdleTimeout is the
-	// standard keep-alive kill.
+	// HTTP timeouts sized for a local AF_UNIX cache: generous enough
+	// for /rebuild bodies that approach the store cap, strict enough
+	// to reap stuck clients. WriteTimeout must exceed ReadTimeout;
+	// IdleTimeout is the standard keep-alive kill.
 	server := &http.Server{
 		Handler:           mux,
 		ReadHeaderTimeout: 3 * time.Second,

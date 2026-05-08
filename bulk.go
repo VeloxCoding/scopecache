@@ -146,25 +146,23 @@ func (s *store) replaceScopes(grouped map[string][]Item) (int, error) {
 		return 0, &ScopeCapacityError{Offenders: offenders}
 	}
 
-	// Phase 1.5 + Phase 2 run with every shard the batch touches held in
-	// write mode, in ascending shard-index order, to serialise against
-	// /delete_scope, /wipe, and /rebuild. Without that mutual exclusion
-	// the byte counter desyncs from Σ buf.bytes when one of those
-	// destructive ops fires between snapshot and commit:
+	// Phase 1.5 + Phase 2 run with every shard the batch touches held
+	// in write mode, in ascending shard-index order, to serialise
+	// against /delete_scope, /wipe, and /rebuild. Without that mutual
+	// exclusion the byte counter desyncs from Σ buf.bytes when one of
+	// those destructive ops fires between snapshot and commit:
 	//
-	//   - /wipe does totalBytes.Swap(0), erasing this batch's pre-reservation.
-	//     The drift comp then over-credits by oldSnapshot, leaving totalBytes
-	//     too high by exactly the original scope size.
+	//   - /wipe does totalBytes.Swap(0), erasing this batch's
+	//     pre-reservation; drift comp then over-credits by oldSnapshot.
 	//   - /rebuild does totalBytes.Store(newAggregate), same shape.
-	//   - /delete_scope's per-scope Add(-scopeBytes) happens to balance the
-	//     drift comp by accident, but only when the deleted scope's b.bytes
-	//     equals the snapshot — fragile, and we'd rather not depend on that.
+	//   - /delete_scope's per-scope Add(-scopeBytes) only balances
+	//     drift comp when the deleted scope's b.bytes equals the
+	//     snapshot — not a reliable invariant to depend on.
 	//
-	// /wipe and /rebuild lock every shard, so any subset we hold blocks
-	// them. /delete_scope locks one shard, so it serialises against us
-	// only when it targets a scope on a shard we hold; that is exactly
-	// the case where the drift would matter (delete on a scope in our
-	// batch).
+	// /wipe and /rebuild lock every shard, so any subset we hold
+	// blocks them. /delete_scope locks one shard, so it serialises
+	// against us only when it targets a scope on a shard we hold —
+	// exactly the case where drift would matter.
 	//
 	// Concurrent appends/updates/etc. on the SAME scopes /warm is replacing
 	// still proceed via getOrCreateScope: they take buf.mu, not the shard
@@ -249,11 +247,9 @@ func (s *store) replaceScopes(grouped map[string][]Item) (int, error) {
 	}
 	// Gate the emit on actual work. An empty input map produces n=0
 	// with no scope replacements; emitting `{op:"warm"}` then would
-	// wake every _events subscriber and add a no-op entry to the
-	// replay stream — pure noise. Mirrors the gate-on-success pattern
-	// every other write-event helper uses (emitDeleteScopeEvent only
-	// fires when the scope existed, single-item helpers only fire
-	// when their commit actually landed).
+	// wake every _events subscriber and add a no-op replay entry.
+	// Mirrors the gate-on-success pattern every other write-event
+	// helper uses.
 	if n > 0 {
 		s.emitWarmEvent()
 	}

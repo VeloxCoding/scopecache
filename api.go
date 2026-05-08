@@ -6,20 +6,14 @@
 package scopecache
 
 // APIConfig bundles the HTTP/transport-layer knobs adapters supply
-// to NewAPI. The split mirrors the boundary rule: Config carries
-// cache-internal limits, APIConfig carries everything that only
-// makes sense once a request is being served.
-//
-// Currently empty — the response-byte cap is derived from the
-// store's MaxStoreBytes (no separate knob), and multi-tenancy / auth
-// / batching belong in addon packages, not core. Kept (rather than
-// dropped) so the first new HTTP-layer knob lands without breaking
-// every adapter's `NewAPI(gw, scopecache.APIConfig{})` call site.
+// to NewAPI. Config carries cache-internal limits; APIConfig carries
+// everything that only makes sense once a request is being served.
+// Currently empty — kept as a forward-compat seat so adding the
+// first HTTP-layer knob does not break adapter call sites.
 type APIConfig struct{}
 
-// API is the HTTP layer in front of *store. Owns the request-shape
-// concerns the core deliberately knows nothing about (request- and
-// response-byte caps).
+// API is the HTTP layer in front of *store; field comments below
+// describe each cap.
 type API struct {
 	store *store
 	// maxBulkBytes is the per-request body cap for /warm and /rebuild,

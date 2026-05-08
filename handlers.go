@@ -40,11 +40,8 @@ import (
 // `return` immediately. Returns false on no match; caller falls
 // back to handler-specific error handling.
 //
-// `scopeForSFE` is plumbed into the single-element offenders list
-// on the *ScopeFullError path; pass "" for callers that cannot
-// produce sfe (/warm, /rebuild produce *ScopeCapacityError;
-// /update produces only *StoreFullError). The unused-param wart
-// beats splitting helpers that would duplicate the stfe block.
+// scopeForSFE is used only on the *ScopeFullError path (one-element
+// offenders list). Pass "" for callers that cannot produce one.
 func writeStoreCapacityError(w http.ResponseWriter, started time.Time, err error, scopeForSFE string) bool {
 	var sfe *ScopeFullError
 	if errors.As(err, &sfe) {
@@ -74,12 +71,8 @@ func writeStoreCapacityError(w http.ResponseWriter, started time.Time, err error
 //   - anything else    → 409 (orphan/race shape: *ScopeDetachedError,
 //     etc.)
 //
-// `scopeForSFE` plumbs into writeStoreCapacityError's offender list
-// — pass "" when the caller cannot produce *ScopeFullError.
-//
-// /counter_add and the delete handlers do NOT route through this
-// helper: counter has its own *CounterPayloadError / *CounterOverflowError
-// vocabulary, and deletes never produce capacity errors.
+// scopeForSFE plumbs into writeStoreCapacityError's offender list —
+// pass "" when the caller cannot produce *ScopeFullError.
 //
 // Caller invariant: err is non-nil. The helper writes exactly one
 // response; caller must `return` immediately afterward.
@@ -195,10 +188,7 @@ func writeJSONWithDuration(w http.ResponseWriter, code int, payload orderedField
 // size field just before the closing '}'. Self-referential — the
 // size includes the field's own bytes — but converges in 1-2
 // iterations because MB has 4-decimal precision (0.0001 MiB ≈ 104
-// bytes) and the patch only adds ~30 bytes total. Cost over
-// writeJSONWithDuration is one extra json.Marshal of the MB value
-// plus a few slice appends — well under 100 µs even for multi-MiB
-// responses.
+// bytes) and the patch only adds ~30 bytes total.
 func marshalWithApproxSize(payload orderedFields, started time.Time) ([]byte, orderedFields, error) {
 	payload = append(payload, kv{"duration_us", time.Since(started).Microseconds()})
 	bodyBytes, err := json.Marshal(payload)
@@ -253,11 +243,10 @@ func writeJSONWithMeta(w http.ResponseWriter, code int, payload orderedFields, s
 }
 
 // writeJSONWithMetaCap is writeJSONWithMeta with a per-response byte
-// cap baked in. Used on /head, /tail — endpoints whose
-// response can grow with limit × per-item-cap. Marshals the body
-// once, checks against maxBytes, and either emits the response or
-// replaces it with a 507 envelope. Replaces the older capResponse
-// middleware that buffered the handler's whole output a second time.
+// cap baked in. Used on /head, /tail — endpoints whose response can
+// grow with limit × per-item-cap. Marshals once, checks against
+// maxBytes, and either emits the response or replaces it with a 507
+// envelope.
 func writeJSONWithMetaCap(w http.ResponseWriter, code int, payload orderedFields, started time.Time, maxBytes int64) {
 	out, augmented, err := marshalWithApproxSize(payload, started)
 	if err != nil {
@@ -397,9 +386,9 @@ type scopeLimit struct {
 	Limit int
 }
 
-// parseScopeLimit validates scope and normalizes limit in the order every
-// caller expects (scope first, then limit), so the returned error matches
-// the handlers' historical behaviour.
+// parseScopeLimit validates scope and normalizes limit in fixed
+// order (scope first, then limit) to keep error ordering stable
+// across handlers.
 func parseScopeLimit(r *http.Request, endpoint string) (scopeLimit, error) {
 	query := r.URL.Query()
 	scope := query.Get("scope")
@@ -414,27 +403,26 @@ func parseScopeLimit(r *http.Request, endpoint string) (scopeLimit, error) {
 }
 
 func (api *API) RegisterRoutes(mux *http.ServeMux) {
-	// Single-item write paths.
 	mux.HandleFunc("/append", api.handleAppend)
 	mux.HandleFunc("/update", api.handleUpdate)
 	mux.HandleFunc("/upsert", api.handleUpsert)
 	mux.HandleFunc("/counter_add", api.handleCounterAdd)
 	mux.HandleFunc("/delete", api.handleDelete)
 	mux.HandleFunc("/delete_up_to", api.handleDeleteUpTo)
-	// Single-item / multi-item read paths.
-	// /head and /tail enforce the per-response cap inside their shared
-	// writer (writeJSONWithMetaCap, called from writeItemsHit) — no
-	// outer middleware needed.
+
+	// /head and /tail enforce the per-response cap inside their
+	// shared writer (writeJSONWithMetaCap, called from
+	// writeItemsHit) — no outer middleware needed.
 	mux.HandleFunc("/head", api.handleHead)
 	mux.HandleFunc("/tail", api.handleTail)
 	mux.HandleFunc("/get", api.handleGet)
 	mux.HandleFunc("/render", api.handleRender)
-	// Bulk and store-wide write paths.
+
 	mux.HandleFunc("/wipe", api.handleWipe)
 	mux.HandleFunc("/warm", api.handleWarm)
 	mux.HandleFunc("/rebuild", api.handleRebuild)
 	mux.HandleFunc("/delete_scope", api.handleDeleteScope)
-	// Observability.
+
 	mux.HandleFunc("/stats", api.handleStats)
 	mux.HandleFunc("/scopelist", api.handleScopeList)
 	mux.HandleFunc("/help", api.handleHelp)

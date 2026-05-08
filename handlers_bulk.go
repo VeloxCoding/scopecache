@@ -3,14 +3,13 @@
 //   - /warm     — replace the scopes in the request, leave others alone
 //   - /rebuild  — atomically replace the entire store
 //
-// Both decode an itemsRequest and route through Store.replaceScopes /
-// Store.rebuildAll. Per-item shape validation lives in those Store
+// Both decode an itemsRequest and route through store.replaceScopes /
+// store.rebuildAll. Per-item shape validation lives in those store
 // methods, so handlers decode, delegate, and map errors.
 //
-// /rebuild explicitly refuses an empty items array because that is
-// almost always a client bug rather than an intentional clear-
-// everything request — endpoint-specific HTTP policy, not a per-item
-// shape rule.
+// /rebuild explicitly refuses an empty items array — the intent is
+// ambiguous enough to reject (clear-everything vs missing-payload).
+// Clients that genuinely want to clear the cache use /wipe.
 
 package scopecache
 
@@ -36,8 +35,8 @@ func (api *API) handleWarm(w http.ResponseWriter, r *http.Request) {
 	grouped := groupItemsByScope(req.Items)
 	replacedScopes, err := api.store.replaceScopes(grouped)
 	if err != nil {
-		// /warm cannot produce *ScopeFullError (only single-item paths do);
-		// scopeForSFE is unused here.
+		// /warm produces only *ScopeCapacityError or *StoreFullError;
+		// no *ScopeFullError, so scopeForSFE is unused.
 		writeMutationError(w, started, err, "")
 		return
 	}
@@ -63,14 +62,14 @@ func (api *API) handleRebuild(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// An empty items[] would wipe the entire store. That is almost always a
-	// client bug (missing payload, wrong key, serialization glitch) rather
-	// than an intentional "clear everything" call. Refuse it explicitly;
-	// clients that really want to clear the cache should /delete_scope per
-	// scope or restart the service. This /rebuild-specific guard stays in
-	// the handler — it's an HTTP policy ("explicit-non-empty-required"),
-	// not a per-item shape check; Go-API callers of Gateway.Rebuild who
-	// want a wipe-shaped rebuild can pass an empty map intentionally.
+	// An empty items[] would wipe the entire store. The intent is
+	// ambiguous enough to reject — missing payload, wrong key, or
+	// serialization glitch all surface the same shape on the wire as
+	// a deliberate clear-everything call. /wipe is the explicit route
+	// for the latter. This guard is HTTP policy ("explicit-non-
+	// empty-required"), not a per-item shape check; Go-API callers
+	// of Gateway.Rebuild who want a wipe-shaped rebuild can pass an
+	// empty map intentionally.
 	if len(req.Items) == 0 {
 		badRequest(w, started, "the 'items' array must not be empty for the '/rebuild' endpoint")
 		return
@@ -79,8 +78,8 @@ func (api *API) handleRebuild(w http.ResponseWriter, r *http.Request) {
 	grouped := groupItemsByScope(req.Items)
 	rebuiltScopes, rebuiltItems, err := api.store.rebuildAll(grouped)
 	if err != nil {
-		// /rebuild cannot produce *ScopeFullError (only single-item paths
-		// do); scopeForSFE is unused here.
+		// /rebuild produces only *ScopeCapacityError or *StoreFullError;
+		// no *ScopeFullError, so scopeForSFE is unused.
 		writeMutationError(w, started, err, "")
 		return
 	}

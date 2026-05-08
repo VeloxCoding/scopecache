@@ -25,12 +25,6 @@
 // channel; the next loop iteration sees a single pending wake-up and
 // triggers one more command run. The command never runs concurrently
 // with itself.
-//
-// Lives in core (rather than as an addon) because every realistic
-// scopecache deployment needs this exact bridge — the script-runner
-// is the standard way to get items out of the cache and into a sink
-// of the operator's choosing. The implementation is stdlib-only
-// (`os/exec`) and has no dependencies beyond what core already pulls.
 
 package scopecache
 
@@ -54,37 +48,22 @@ import (
 //     which exits the goroutine's `for range` loop), and
 //  3. blocks until the goroutine has fully exited.
 //
-// Step 1 bounds shutdown latency. Without it a stuck curl, tarpitted
-// endpoint, or infinite-loop script would block stop forever —
-// stalling standalone shutdown past its 5s grace and stalling Caddy
-// reload via Cleanup. Cancel-on-stop trades graceful in-flight
-// completion for a hard upper bound: stop returns within OS-process-
-// kill latency regardless of what the command was doing. The HTTP-
-// roundtrip-orphan concern is addressed by ordering — adapters call
-// stopSubscribers BEFORE shutting the listener, so a killed curl
-// mid-request sees a normal "connection reset" against an open
-// socket, same as any other client crash.
+// Step 1 bounds shutdown latency: stop returns within OS-process-
+// kill latency regardless of what the command was doing. Adapters
+// call stopSubscribers before shutting the public listener so a
+// killed in-flight HTTP request sees a normal connection reset.
 //
-// stop is idempotent (Subscribe's unsub is, cancel-on-cancelled-
-// context is a no-op, reading from a closed `done` returns
-// immediately) so it's safe to wire both into a signal-handler AND
-// a `defer` backstop.
+// stop is idempotent — safe to wire both into a signal-handler and
+// a defer backstop.
 //
 // Errors at start-up:
 //   - empty scope or command -> validation error
 //   - non-reserved scope -> wraps ErrInvalidSubscribeScope
 //   - duplicate subscribe -> wraps ErrAlreadySubscribed
 //
-// The command's exit code is logged but not interpreted: the bridge
-// never inspects items (the command owns the items via /tail and
-// /delete_up_to) so success/failure is irrelevant to the next
-// wake-up. Operators who want exponential backoff or alerting on
-// repeated failures build that into the command itself — that's
-// where the retry context lives anyway.
-//
-// The command path is not stat'd here. Operators may deploy the
-// command later and a missing file just produces a per-invocation
-// log line until it shows up.
+// The command's exit code is logged but not interpreted; the next
+// wake-up retries unconditionally. Backoff/alerting on repeated
+// failures lives in the command itself.
 func (gw *Gateway) StartSubscriber(scope, command string) (stop func(), err error) {
 	if scope == "" {
 		return nil, errors.New("scopecache: StartSubscriber: scope is required")
@@ -93,12 +72,9 @@ func (gw *Gateway) StartSubscriber(scope, command string) (stop func(), err erro
 		return nil, errors.New("scopecache: StartSubscriber: command is required")
 	}
 
-	// In-package caller — go directly to *store.Subscribe instead of
-	// the Gateway passthrough. Keeps the rule clean: external callers
-	// reach the cache through *Gateway, internal code reaches *store
-	// directly. Subscribe carries no payload bytes (returns a wake-up
-	// channel), so this bypass also makes explicit that the
-	// gateway_clone.go discipline is by design unrelated to this path.
+	// In-package caller — go directly to store.Subscribe instead of
+	// the Gateway passthrough. External callers reach the cache
+	// through *Gateway; internal code reaches *store directly.
 	ch, unsub, err := gw.store.Subscribe(scope)
 	if err != nil {
 		return nil, fmt.Errorf("scopecache: StartSubscriber: subscribe %s: %w", scope, err)
@@ -134,36 +110,22 @@ func (gw *Gateway) StartSubscriber(scope, command string) (stop func(), err erro
 	return stop, nil
 }
 
-// StartReservedSubscribers wires the in-core subscriber bridge to
-// every reserved scope (`_events` and `_inbox`) when command is
-// non-empty, returning a single stop function that tears down each
-// subscription in reverse start-order. This is the helper the
-// standalone binary (cmd/scopecache) and the Caddy adapter
-// (caddymodule) both rely on, so the start-order, stop-order,
-// half-wired-on-error policy, and any future fixes live in one
-// place.
+// StartReservedSubscribers wires the bridge to every reserved scope
+// (`_events` and `_inbox`) when command is non-empty. Used by both
+// adapters (cmd/scopecache and caddymodule) so start/stop order and
+// error policy live in one place.
 //
-// Behaviour:
-//   - command == "" returns a no-op stop func and logs nothing — the
-//     operator just hasn't enabled the bridge.
-//   - On a per-scope subscribe error, logf is called with a "failed
-//     to subscribe to %s: %v" message and the loop continues. A half-
-//     wired bridge (e.g. _events succeeded, _inbox failed) is still
-//     useful — the operator sees the warning in their normal log
-//     stream and can fix it without taking the whole cache offline.
-//   - After the loop, logf is called once more with a summary
-//     "%d subscriber(s) active, command=%s". Operators rely on this
-//     line to confirm the bridge actually came up.
+//   - command == "" returns a no-op stop and logs nothing.
+//   - Per-scope subscribe errors are logged ("failed to subscribe
+//     to %s: %v") and the loop continues; a half-wired bridge is
+//     still useful and the operator can fix it without taking the
+//     cache offline.
+//   - A summary line ("%d subscriber(s) active, command=%s") fires
+//     after the loop so operators can confirm the bridge came up.
 //
-// logf must accept the standard fmt-style (string, ...any) shape;
-// callers wrap their preferred logger:
-//
-//	cmd/scopecache:  log.Printf
-//	caddymodule:     caddy.Log().Named("scopecache.subscriber").Sugar().Infof
-//
-// The summary and per-failure messages share the same level by design
-// — Caddy operators who want strict warn/error filtering can route
-// the "failed" substring elsewhere.
+// stop tears down subscriptions in reverse start-order. logf takes
+// the standard (string, ...any) shape; pass log.Printf or any
+// equivalent.
 func (g *Gateway) StartReservedSubscribers(command string, logf func(string, ...any)) func() {
 	if command == "" {
 		return func() {}
@@ -185,25 +147,17 @@ func (g *Gateway) StartReservedSubscribers(command string, logf func(string, ...
 	}
 }
 
-// runSubscriberCommand executes the configured command once, blocking
-// on its exit OR on cancellation of ctx (whichever fires first).
-// Stderr/stdout are inherited from the parent process so operators
-// can see the command's output in their normal log stream.
-// SCOPECACHE_SCOPE is passed via env so a single command can serve
-// both reserved scopes and branch on which one fired.
+// runSubscriberCommand executes the configured command once,
+// blocking on its exit or on ctx cancellation (whichever fires
+// first). Stdout/stderr are inherited so operators see the
+// command's output in their normal log stream. SCOPECACHE_SCOPE is
+// passed via env so a single command can serve both reserved
+// scopes and branch on which one fired.
 //
-// ctx is the per-subscriber context owned by StartSubscriber.
-// Cancellation makes the kernel SIGKILL the entire process group
-// (configureProcessGroup wires Setpgid + an override on cmd.Cancel
-// that targets -pid instead of pid) so a script that backgrounds
-// children — `curl ... & wait`, etc. — does not leak orphan
-// descendants when stop() fires. cmd.Run returns with a
-// "signal: killed" or context-cancelled error; the error is logged
-// like any other failure, then the goroutine sees the closed
-// wake-up channel and exits — bounded by OS kill latency instead
-// of the command's voluntary exit. See subscriber_command_unix.go
-// for the rationale; the _other.go fallback degrades to direct-
-// child kill on non-Unix builds.
+// configureProcessGroup wires cancellation to kill the whole
+// process group on Unix (no orphan children from `curl ... &; wait`
+// shapes); the non-Unix stub falls back to direct-child kill. See
+// subscriber_command_unix.go.
 func runSubscriberCommand(ctx context.Context, scope, command string) {
 	cmd := exec.CommandContext(ctx, command)
 	cmd.Env = append(os.Environ(), "SCOPECACHE_SCOPE="+scope)
@@ -212,11 +166,9 @@ func runSubscriberCommand(ctx context.Context, scope, command string) {
 	cmd.Stderr = os.Stderr
 	configureProcessGroup(cmd)
 	if err := cmd.Run(); err != nil {
-		// A non-zero exit, missing executable, signal-kill, or
-		// context-cancel all land here. Log + move on — the next
-		// wake-up will retry. Operators who want exponential backoff
-		// or alerting on repeated failures build that into their
-		// command (it's where the retry context lives anyway).
+		// Non-zero exit, missing executable, signal-kill, or
+		// context-cancel all land here. Log + move on; the next
+		// wake-up retries.
 		log.Printf("scopecache subscriber: %s (scope=%s): %v", command, scope, err)
 	}
 }

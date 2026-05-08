@@ -17,8 +17,8 @@
 //   2. **Slow path — Lock.** When the target item does not exist
 //      (create) or exists without a cell (promote), counterAdd takes
 //      b.mu.Lock to install the cell and adjust byte accounting.
-//      Slow-path is rare: every counter incurs it exactly once on
-//      creation, plus once more if a /upsert or /update strips the
+//      Slow-path is rare: a counter normally incurs it once on
+//      creation, plus once each time a /upsert or /update strips the
 //      cell mid-life. Subsequent increments are always fast-path.
 //
 // lastWriteTS semantics:
@@ -34,9 +34,8 @@
 //     getOrCreateScope (structural change, scope_count grew); the
 //     counter op itself is silent.
 //
-// Consumers who need "did this counter just change?" read cell.ts
-// via /get?id=X and observe item.Ts directly — that's the
-// granularity counters are observable at, by design.
+// Counter freshness is observable through item.Ts after
+// materialisation: /get?id=X returns the cell's current ts.
 
 package scopecache
 
@@ -163,8 +162,7 @@ func (b *scopeBuffer) counterAddSlow(scope, id string, by int64) (int64, bool, e
 
 		i, ok := b.indexBySeqLocked(existing.Seq)
 		if !ok {
-			// Unreachable under b.mu: b.byID confirmed the item exists
-			// and items/byID are kept in sync.
+			// Defensive: byID and items stay in sync under b.mu.
 			return 0, false, nil
 		}
 
@@ -180,10 +178,9 @@ func (b *scopeBuffer) counterAddSlow(scope, id string, by int64) (int64, bool, e
 		nowUs := time.Now().UnixMicro()
 		cell.ts.Store(nowUs)
 		promoted.counter = cell
-		// Payload and renderBytes are now stale-by-construction:
-		// readers materialise from cell.value at the boundary. Clear
-		// them so the byte accounting we compute matches the heap
-		// state we actually keep.
+		// The cell is now the source of truth; clear the stale
+		// payload bytes so byte accounting matches retained heap
+		// state and reads materialise from cell.value.
 		promoted.Payload = nil
 		promoted.renderBytes = nil
 		newSize := approxItemSize(promoted)

@@ -42,10 +42,10 @@ func (api *API) handleStats(w http.ResponseWriter, r *http.Request) {
 	// of the cache's reserved infrastructure scopes. Static config
 	// (DefaultLimit, MaxLimit, per-scope/per-item/store caps) lives
 	// on /help, not here — those values do not change between calls
-	// and re-emitting them on every poll is pure noise. last_write_ts
-	// lets a polling client decide "anything changed since I last
-	// looked?" with a single integer comparison instead of refetching
-	// state. duration_us is appended by the helper.
+	// and are not useful on every poll. last_write_ts lets a polling
+	// client decide "anything changed since I last looked?" with a
+	// single integer comparison instead of refetching state.
+	// duration_us is appended by the helper.
 	writeJSONWithDuration(w, http.StatusOK, orderedFields{
 		{"ok", true},
 		{"scope_count", st.ScopeCount},
@@ -57,11 +57,11 @@ func (api *API) handleStats(w http.ResponseWriter, r *http.Request) {
 	}, started)
 }
 
-// handleScopeList serves /scopelist — the per-scope counterpart of /stats.
-// /stats is store-wide aggregate (O(1)); /scopelist is per-scope detail with
-// alphabetical sort and cursor pagination, so even a 100k-scope store can be
-// walked in fixed-size pages without re-introducing the per-scope DoS that
-// got the old /stats shape stripped.
+// handleScopeList serves /scopelist — the per-scope counterpart of
+// /stats. /stats is store-wide aggregate (O(1)); /scopelist is
+// per-scope detail with alphabetical sort and cursor pagination, so
+// even a 100k-scope store can be walked in fixed-size pages without
+// making the response proportional to scope count.
 //
 // Query parameters:
 //   - prefix : optional, literal strings.HasPrefix filter on scope name
@@ -69,14 +69,15 @@ func (api *API) handleStats(w http.ResponseWriter, r *http.Request) {
 //   - after  : optional cursor; returns scopes with name > after (strict)
 //   - limit  : page size; defaults to DefaultLimit, clamped to MaxLimit
 //
-// Sort order is alphabetical, the only mode shipped: scope names don't move
-// once created, so the cursor stays stable under concurrent writes. The
-// next-page cursor is just the last `scope` field of the response — no
+// Sort order is alphabetical: scope names don't move once created,
+// so the cursor stays stable under concurrent writes. The next-page
+// cursor is just the last `scope` field of the response — no
 // dedicated next_cursor field, since the client already has it.
 //
-// Read-bookkeeping (§8) is NOT bumped on /scopelist hits: it is observability,
-// not a content read, and would otherwise corrupt eviction-candidate signals
-// that addons compute from read_count_total deltas.
+// Read-bookkeeping (§8) is not bumped on /scopelist hits: it is
+// observability, not a content read, and would otherwise corrupt
+// eviction-candidate signals that addons compute from
+// read_count_total deltas.
 func (api *API) handleScopeList(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
 
@@ -136,9 +137,9 @@ func (api *API) handleHelp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Placeholder until the dedicated /help finetune pass closer to v1.0;
-	// keeping a stale long-form here would just drift out of sync with
-	// the RFC. One-line pointer is the lowest-maintenance shape.
+	// /help intentionally links to the canonical RFC rather than
+	// duplicating the spec in code: a stale long-form here would
+	// drift out of sync with the source of truth.
 	helpText := "scopecache — see instructions at https://github.com/VeloxCoding/scopecache/blob/main/docs/scopecache-core-rfc.md\n"
 
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")

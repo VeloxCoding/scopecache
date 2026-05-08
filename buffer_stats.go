@@ -11,12 +11,14 @@ package scopecache
 // snapshots.
 //
 // NOT used for cap enforcement — admission control uses
-// Store.totalBytes (approxItemSize sum + scopeBufferOverhead per
+// store.totalBytes (approxItemSize sum + scopeBufferOverhead per
 // scope) so the 507 budget matches what reserveBytes accounts for.
 // Per-item Go heap overhead is intentionally outside the cap:
 // charging it would tie admission control to Go's internal data-
-// structure layout. Trade-off: approx_store_mb under-reports real
-// memory pressure at very high scope counts.
+// structure layout. Trade-off: the store-wide approx_store_mb on
+// /stats — derived from the cap-side total — therefore under-reports
+// real memory pressure at very high scope counts; the per-scope
+// approx_scope_mb this function surfaces does not.
 //
 // O(1) by construction: every term is a constant, a slice/map length,
 // or an incrementally-maintained counter (b.bytes, b.idKeyBytes).
@@ -66,7 +68,7 @@ type scopeStats struct {
 
 // stats returns a snapshot of this scope's metrics. All fields are
 // primitives the cache maintains directly (timestamps + monotonic
-// counters); time-windowed aggregations are addon territory.
+// counters); time-windowed aggregations are left to addons.
 func (b *scopeBuffer) stats() scopeStats {
 	b.mu.RLock()
 	defer b.mu.RUnlock()

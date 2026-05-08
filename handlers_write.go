@@ -2,12 +2,12 @@
 //
 //   - /append       — insert; rejects on dup id, capacity, or byte cap
 //   - /upsert       — insert-or-replace by id; replace-whole-item semantics
-//   - /update       — modify payload (and optional ts) at existing id/seq
+//   - /update       — modify payload at an existing id or seq
 //   - /counter_add  — atomic int64 add on existing id; auto-creates on miss
 //
-// All four decode an Item body, run shape validation, reject reserved
-// scope prefixes for non-admin callers, route through the matching
-// Store method (appendOne / upsertOne / counterAddOne / updateOne),
+// All four decode an Item body, run shape validation (which rejects
+// reserved scopes where applicable), route through the matching
+// store method (appendOne / upsertOne / counterAddOne / updateOne),
 // and map errors uniformly. /append, /upsert, /update use the shared
 // writeMutationError helper (handlers.go) — ErrInvalidInput → 400,
 // capacity → 507, else 409. /counter_add stays inline because it has
@@ -97,11 +97,10 @@ func (api *API) handleUpsert(w http.ResponseWriter, r *http.Request) {
 	}, started)
 }
 
-// handleCounterAdd atomically increments (or creates) a numeric counter at
-// scope+id by `by`. It is the only endpoint that reads or mutates a payload
-// as a typed value — every other write path treats payloads as opaque bytes.
-// Creates pay a fresh approxItemSize reservation; replaces pay only the byte
-// delta of the new integer representation.
+// handleCounterAdd atomically increments (or creates) a numeric
+// counter at scope+id by `by`. The only endpoint that reads or
+// mutates a payload as a typed value — every other write path
+// treats payloads as opaque bytes.
 func (api *API) handleCounterAdd(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
 
@@ -134,21 +133,21 @@ func (api *API) handleCounterAdd(w http.ResponseWriter, r *http.Request) {
 			badRequest(w, started, err.Error())
 			return
 		}
-		// Capacity-class errors (sfe + stfe). Counter-specific errors
-		// (cpe → 409, coe → 400) are handled inline below — they do
-		// not fit the helper because cpe maps to `conflict` and coe
-		// maps to `badRequest`, not to the scope/store-full responders.
+		// Capacity-class errors (*ScopeFullError + *StoreFullError).
+		// Counter-specific errors are handled inline below — they do
+		// not fit writeStoreCapacityError because *CounterPayloadError
+		// maps to 409 conflict and *CounterOverflowError maps to 400.
 		if writeStoreCapacityError(w, started, err, origScope) {
 			return
 		}
-		var cpe *CounterPayloadError
-		if errors.As(err, &cpe) {
-			conflict(w, started, cpe.Error())
+		var payloadErr *CounterPayloadError
+		if errors.As(err, &payloadErr) {
+			conflict(w, started, payloadErr.Error())
 			return
 		}
-		var coe *CounterOverflowError
-		if errors.As(err, &coe) {
-			badRequest(w, started, coe.Error())
+		var overflowErr *CounterOverflowError
+		if errors.As(err, &overflowErr) {
+			badRequest(w, started, overflowErr.Error())
 			return
 		}
 		conflict(w, started, err.Error())

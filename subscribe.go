@@ -3,7 +3,7 @@
 // mechanism by which a subscriber gets coalesced wake-up signals
 // when items land in `_events` or `_inbox`. The subscriber drains
 // the scope via Tail + DeleteUpTo in its own loop; this file owns
-// ONLY the wake-up channel + lifecycle.
+// the wake-up channel + lifecycle only.
 //
 // Implementation invariants:
 //
@@ -14,20 +14,20 @@
 //   - Single subscriber per reserved scope; a second Subscribe to
 //     the same scope returns ErrAlreadySubscribed. Multi-fan-out is
 //     the subscriber's job, not the cache's.
-//   - Subscriber state at Store level keyed by scope name, NOT on
+//   - Subscriber state at Store level keyed by scope name, not on
 //     `*scopeBuffer`. Survives /wipe and /rebuild buffer churn
 //     transparently — drainer doesn't reconnect across destructive
 //     ops; cursor-rewind detection on the next Tail is enough.
 //   - Single-slot, size-1 buffered channel with non-blocking send +
-//     drop-on-full. 10k writes while subscriber is busy coalesce to
-//     one wake-up; subscriber re-Tails and processes the batch via
-//     cursor.
+//     drop-on-full. Many writes while subscriber is busy coalesce
+//     to one wake-up; subscriber re-Tails and processes the batch
+//     via cursor.
 //   - Close-on-unsub with lock-discipline: unsub() takes subsMu
 //     .Lock, removes the map entry, then close(ch) — all under the
 //     same Lock. Notify takes subsMu.RLock through the select-send
-//     (microseconds, non-blocking). Send-on-closed-channel cannot
-//     happen because the channel is only closed AFTER the map entry
-//     is gone.
+//     (brief, non-blocking). Send-on-closed-channel cannot happen
+//     because the channel is only closed after the map entry is
+//     gone.
 //
 // Lock-order:
 //
@@ -75,12 +75,7 @@ type subscriber struct {
 //     (`_events`, `_inbox` are the only valid targets).
 //   - ErrAlreadySubscribed    — scope already has a subscriber.
 //
-// The returned channel survives /wipe and /rebuild: the subscriber
-// slot lives at Store level (keyed by scope name, NOT on the
-// underlying *scopeBuffer), so destructive ops drop+recreate the
-// reserved scope buffer underneath without disturbing the
-// subscription. Wipe/rebuild detection is the subscriber's job via
-// cursor-rewind on the next Tail (lastSeq < persisted cursor).
+// Channel survives /wipe and /rebuild — see file-header.
 func (s *store) Subscribe(scope string) (<-chan struct{}, func(), error) {
 	if !isReservedScope(scope) {
 		return nil, nil, ErrInvalidSubscribeScope
@@ -135,19 +130,19 @@ func (s *store) unsubscribe(scope string) {
 // notification already covers any subsequent write, and the
 // subscriber catches up via cursor on its next drain.
 //
-// Caller invariants (NOT re-checked here):
+// Caller invariants (not re-checked here):
 //
 //   - b.mu (the per-scopeBuffer write lock) has been released;
 //     notifySubscriber must not nest inside b.mu.
-//   - Called from Store.appendOne after a successful commit + emit.
-//     This is the ONLY call site, because every write that targets
+//   - Called from store.appendOne after a successful commit + emit.
+//     This is the only call site, because every write that targets
 //     `_events` or `_inbox` routes through appendOne (validator
 //     rejects /upsert /update /counter_add on reserved scopes).
 //
-// RLock is held through the select-send so unsub cannot run concurrently
-// (which would close the channel underneath the send and panic). The
-// non-blocking select is microseconds, so holding RLock through it is
-// cheap.
+// RLock is held through the select-send so unsub cannot run
+// concurrently (which would close the channel underneath the send
+// and panic). The non-blocking select is brief enough that holding
+// RLock through it costs nothing in practice.
 func (s *store) notifySubscriber(scope string) {
 	s.subsMu.RLock()
 	if sub, ok := s.subscribers[scope]; ok {

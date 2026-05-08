@@ -11,8 +11,8 @@ package scopecache
 //
 // readCountTotal is a monotonic lifetime count; lastAccessTS is the
 // microsecond timestamp of the most recent read. Time-windowed
-// aggregations (rolling counts, decay, histograms) are addon policy,
-// not core primitives.
+// aggregations (rolling counts, decay, histograms) are left to
+// addons.
 func (b *scopeBuffer) recordRead(now int64) {
 	b.readCountTotal.Add(1)
 	b.lastAccessTS.Store(now)

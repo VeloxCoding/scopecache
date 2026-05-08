@@ -27,12 +27,24 @@ import (
 	"time"
 )
 
+// Defaults applied by Config.WithDefaults; the runtime caps the
+// adapter knobs feed in (env vars, Caddyfile keys) override these.
 const (
-	DefaultLimit  = 1000    // read response size when client omits ?limit
-	MaxLimit      = 10000   // hard ceiling on ?limit; higher values are clamped, not rejected
-	ScopeMaxItems = 100000  // per-scope capacity default; writes that would exceed this are rejected (507). Overridable via SCOPECACHE_SCOPE_MAX_ITEMS
-	MaxStoreMiB   = 100     // store-wide aggregate approxItemSize default in MiB; writes past this are rejected (507). Tuned for ~1 GB VPS footprints. Overridable via SCOPECACHE_MAX_STORE_MB
-	MaxItemBytes  = 1 << 20 // per-item cap default in bytes on approxItemSize (overhead + scope + id + payload). Overridable via SCOPECACHE_MAX_ITEM_MB (integer MiB)
+	// DefaultLimit is the response size when a client omits ?limit.
+	DefaultLimit = 1000
+	// MaxLimit is the ceiling on ?limit; higher values are clamped.
+	MaxLimit = 10000
+	// ScopeMaxItems is the per-scope item-count default. Writes that
+	// would exceed this are rejected with 507.
+	ScopeMaxItems = 100000
+	// MaxStoreMiB is the store-wide approxItemSize default in MiB.
+	// Writes past this are rejected with 507.
+	MaxStoreMiB = 100
+	// MaxItemBytes is the per-item approxItemSize default in bytes
+	// (overhead + scope + id + payload).
+	MaxItemBytes = 1 << 20
+	// MaxScopeBytes / MaxIDBytes are the validator's max byte length
+	// for the scope and id fields.
 	MaxScopeBytes = 256
 	MaxIDBytes    = 256
 
@@ -170,12 +182,12 @@ func ParseEventsMode(s string) (EventsMode, error) {
 	}
 }
 
-// EventsConfig holds the operator knob for the `_events` scope. Per-
-// item cap and item-count cap are intentionally NOT configurable: the
-// per-event cap stays coupled to MaxItemBytes (+ envelope slack) so
-// large user-writes never 507 on the auto-populate path, and the item
-// count cap is exempt because `_events` is observability, not user
-// state.
+// EventsConfig holds the operator knob for the `_events` scope.
+// Per-item cap and item-count cap are intentionally not configurable:
+// the per-event cap stays coupled to MaxItemBytes (+ envelope slack)
+// so large user-writes never 507 on the auto-populate path, and the
+// item-count cap is exempt because `_events` is observability, not
+// user state.
 type EventsConfig struct {
 	Mode EventsMode
 }
@@ -194,14 +206,9 @@ type InboxConfig struct {
 // replaced by the compile-time defaults. Called by NewGateway so
 // `Config{}` is a valid "all defaults" input.
 //
-// MaxStoreBytes also has a floor: it must hold the reserved scopes'
-// overhead (reservedScopesOverhead). Without the floor, a tiny
-// configured cap silently skips reserved-scope creation at boot
-// (initReservedScopes' reserveBytes gate fails) but post-wipe re-init
-// bypasses the cap unconditionally — leaving totalBytes past the
-// configured ceiling and Subscribe on `_events` failing on a fresh
-// cache. Only fires for absurdly small caps (under 2 KiB on the
-// default reserved-scope set); realistic MB/GB caps are untouched.
+// MaxStoreBytes is also clamped up to reservedScopesOverhead so the
+// reserved scopes always fit at boot — only fires for absurdly
+// small caps (under 2 KiB), realistic MB/GB caps are untouched.
 func (c Config) WithDefaults() Config {
 	if c.ScopeMaxItems <= 0 {
 		c.ScopeMaxItems = ScopeMaxItems
@@ -235,11 +242,13 @@ func (m MB) MarshalJSON() ([]byte, error) {
 }
 
 // Item is the on-the-wire shape of a cached entry. Payload is
-// json.RawMessage so the cache never inspects user bytes (contract)
-// and never walks the JSON tree to estimate item size (perf).
+// json.RawMessage: the cache stores it as opaque bytes and does not
+// parse arbitrary user payloads except on documented paths
+// (renderBytes precompute for JSON-string shortcuts in /render,
+// counter parsing in /counter_add).
 //
 // Ts is cache-owned (time.Now().UnixMicro()) and refreshed on every
-// write that touches the item; clients MUST NOT supply ts (400 on
+// write that touches the item; clients must not supply ts (400 on
 // any write endpoint). The field is observability only — not
 // searchable, not indexed, not used for ordering. Microsecond (not
 // millisecond) granularity keeps two writes inside the same ms
@@ -256,8 +265,7 @@ type Item struct {
 	// write-time for payloads whose first non-whitespace byte is `"`,
 	// nil otherwise (object/array/number/bool/null pass through to
 	// /render verbatim). Trades a one-shot Unmarshal + alloc at write
-	// for a saved Unmarshal at every /render hit (~2.4× faster on
-	// JSON-string payloads).
+	// for a saved Unmarshal at every /render hit.
 	//
 	// Unexported so encoding/json never marshals it: in-process state,
 	// not part of the wire format.
@@ -323,8 +331,9 @@ type deleteUpToRequest struct {
 }
 
 // counterAddRequest is the body of /counter_add. By is a pointer so
-// the handler can distinguish a missing field from an explicit zero
-// — the latter is a client bug and rejected with 400.
+// the handler can distinguish a missing field from an explicit zero;
+// the latter is rejected with 400 because it has no observable
+// effect.
 type counterAddRequest struct {
 	Scope string `json:"scope"`
 	ID    string `json:"id"`
@@ -445,10 +454,9 @@ func approxItemSize(item Item) int64 {
 	n += int64(len(item.Payload))
 	// renderBytes is heap-resident only for JSON-string payloads
 	// (precomputed at write time so /render skips a per-hit
-	// json.Unmarshal). Count it against the cap so approx_store_mb
-	// reflects the real memory budget and a cache full of HTML
-	// pages 507's at the right point — without this, a string-
-	// payload-heavy store reports ~half the memory it actually uses.
+	// json.Unmarshal). Counted against the cap so approx_store_mb
+	// reflects real memory; without this, a string-payload-heavy
+	// store would under-report by the renderBytes total.
 	n += int64(len(item.renderBytes))
 	return n
 }
@@ -484,7 +492,7 @@ const (
 // the given items. Used by the pre-flight check; see
 // multiItemEnvelopeMinBytes for the rationale.
 //
-// Counts only bytes that MUST appear on the wire: the envelope
+// Counts only bytes that must appear on the wire: the envelope
 // minimum, a fixed per-item skeleton cost, and the scope/id/payload
 // values written verbatim (JSON-string escaping only ADDS bytes
 // during marshal, never removes — so raw len() is an underestimate
@@ -500,10 +508,11 @@ func estimateMultiItemResponseBytes(items []Item) int64 {
 }
 
 // bulkRequestBytesFor returns the per-request body cap for /warm and
-// /rebuild, derived from the configured store cap. A full store must always
-// fit into a single bulk request; the extra 10% plus bulkRequestBytesOverhead
-// covers JSON framing (keys, quotes, array separators, wrapper object) and
-// provides a sane floor for very small store caps.
+// /rebuild, derived from the configured store cap. A full store must
+// always fit into a single bulk request; the extra 10% plus
+// bulkRequestBytesOverhead covers JSON framing (keys, quotes, array
+// separators, wrapper object) and provides a non-zero floor for very
+// small store caps.
 func bulkRequestBytesFor(maxStoreBytes int64) int64 {
 	return maxStoreBytes + maxStoreBytes/10 + bulkRequestBytesOverhead
 }

@@ -1,13 +1,12 @@
 // Cross-cutting helpers shared by scopeBuffer's mutation paths. The
-// `*Locked` suffix signals: caller MUST hold b.mu. Calling without
-// the lock is a race; calling with the lock then re-acquiring is a
-// deadlock — these do not lock themselves. precomputeRenderBytes is
-// pure and lock-agnostic.
+// `*Locked` suffix signals: caller MUST hold b.mu. These helpers
+// never lock internally. precomputeRenderBytes is pure and
+// lock-agnostic.
 //
 // The helpers centralise three concerns that previously drifted
 // across parallel call-sites: bytes-accounting, secondary-index
-// sync, and GC-zeroing of removed payloads. Forgetting any of them
-// leaks state silently.
+// sync, and counter-cell cleanup on payload-replace. Forgetting
+// any of them leaks state silently.
 
 package scopecache
 
@@ -86,9 +85,9 @@ func payloadAndRenderBytes(item Item) int64 {
 // items[i], syncs the secondary indexes, applies delta to b.bytes,
 // and stamps lastWriteTS.
 //
-// PRECONDITION: caller holds b.mu and i is valid. Bounds-check is
-// the caller's job — callers reach i via O(log n) binary-search or
-// guaranteed-hit lookups, and re-checking would defeat that.
+// PRECONDITION: caller holds b.mu and i is valid — callers derive i
+// from a checked lookup (indexBySeqLocked or a guaranteed-hit byID
+// resolution) just before the call.
 //
 // byID sync is conditional (id="" is legal on /append, so not every
 // item has a byID entry); bySeq is unconditional. Ts is always the
@@ -100,10 +99,10 @@ func (b *scopeBuffer) replaceItemAtIndexLocked(i int, payload json.RawMessage, t
 	b.items[i].Payload = payload
 	b.items[i].Ts = ts
 	b.items[i].renderBytes = renderBytes
-	// /update + /upsert replace the whole item shape: a previously-
-	// installed counter cell is no longer canonical. Clear it so
-	// subsequent /counter_add slow-path reaches the promote branch
-	// (parsing the new payload) instead of an orphaned cell.
+	// /update + /upsert replace the whole item shape; clear any
+	// prior counter cell so a subsequent /counter_add takes the
+	// promote branch on the new payload instead of using the
+	// orphaned cell.
 	b.items[i].counter = nil
 	updated := b.items[i]
 	// replaceItemAtIndexLocked is only reachable when the item already

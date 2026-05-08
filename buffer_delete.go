@@ -57,15 +57,14 @@ func (b *scopeBuffer) deleteIndexLocked(i int) {
 }
 
 // resetIfEmptyLocked drops the high-watermark backing storage when a
-// scope has just been drained to zero items. Without it, a 1k-item
-// scope that drains to empty keeps the N-element backing array (and
-// map bucket arrays — Go maps don't shrink on delete) alive — ~100
-// KiB until appendItem grows it again, idle between drain/refill
-// bursts in the write-buffer pattern.
+// scope has just been drained to zero items. Without it, drained
+// scopes retain the slice's full backing array and the maps' bucket
+// arrays (Go maps don't shrink on delete) until the next write
+// grows them.
 //
 // nil-ing is safe: write paths lazy-init the maps on first write
 // after a reset, and append() on a nil slice grows naturally.
-// b.lastSeq is intentionally NOT reset — the seq cursor must stay
+// b.lastSeq is intentionally not reset — the seq cursor must stay
 // monotonic across drain/refill cycles so downstream consumers
 // tracking it cannot observe a regression.
 //
@@ -79,8 +78,8 @@ func (b *scopeBuffer) resetIfEmptyLocked() {
 	b.bySeq = nil
 	b.byID = nil
 	// b.idKeyBytes is already zero — every removed item subtracted its
-	// id length on delete; an explicit assignment here is belt-and-
-	// braces against future delete-paths that forget the subtract.
+	// id length on delete; the explicit assignment is a defensive
+	// guard against future delete-paths that forget the subtract.
 	b.idKeyBytes = 0
 }
 
@@ -99,7 +98,7 @@ func (b *scopeBuffer) deleteByID(id string) (int, error) {
 
 	i, ok := b.indexBySeqLocked(existing.Seq)
 	if !ok {
-		// Unreachable under b.mu: b.byID confirmed the item exists and items/bySeq are kept in sync.
+		// Defensive: byID and items stay in sync under b.mu.
 		return 0, nil
 	}
 	b.deleteIndexLocked(i)
@@ -120,19 +119,20 @@ func (b *scopeBuffer) deleteBySeq(seq uint64) (int, error) {
 
 	i, ok := b.indexBySeqLocked(seq)
 	if !ok {
-		// Unreachable under b.mu: b.bySeq confirmed the item exists and items/bySeq are kept in sync.
+		// Defensive: bySeq and items stay in sync under b.mu.
 		return 0, nil
 	}
 	b.deleteIndexLocked(i)
 	return 1, nil
 }
 
-// deleteUpToSeq removes every item with Seq <= maxSeq. b.items is always
-// ordered ascending by Seq (appendItem assigns monotonic seqs and nothing
-// removes from the middle), so binary search finds the cut point in O(log n).
-// Returns the number of items removed and any *ScopeDetachedError if the
-// buffer was orphaned by /delete_scope, /wipe, or /rebuild before the
-// caller's mutation could land.
+// deleteUpToSeq removes every item with Seq <= maxSeq. b.items is
+// always ordered ascending by Seq — appendItem assigns monotonic
+// seqs, and the delete paths preserve relative order of the
+// remaining items — so binary search finds the cut point in
+// O(log n). Returns the number of items removed and any
+// *ScopeDetachedError if the buffer was orphaned by /delete_scope,
+// /wipe, or /rebuild before the caller's mutation could land.
 func (b *scopeBuffer) deleteUpToSeq(maxSeq uint64) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()

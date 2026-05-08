@@ -12,9 +12,10 @@
 // json.RawMessage.UnmarshalJSON copies its input by stdlib contract,
 // so every HTTP-decoded payload is already detached from the request
 // body. *API dispatches through *store directly (NewAPI extracts
-// gw.store), so HTTP traffic never pays the cloning cost levied here.
+// gw.store), so HTTP traffic does not pay the cloning cost in this
+// file.
 //
-// Unexported Item fields (renderBytes, counter) ALSO need clearing at
+// Unexported Item fields (renderBytes, counter) also need clearing at
 // the boundary, despite being unreachable to outside-package callers
 // directly. The hazard is round-tripping: a caller does
 //   item, _ := gw.GetByID("scope", "id")  // counter item — pointer rides on the Item
@@ -25,8 +26,8 @@
 // (under-counting MaxItemBytes), and the next read materialises from
 // the cell — silently returning the original counter value instead of
 // the supplied payload. Output-side clearing alone closes the hazard
-// (callers can never have set these fields themselves), but we clear
-// on input too as belt-and-braces.
+// (callers can never have set these fields themselves); input-side
+// clearing is a second guard.
 
 package scopecache
 

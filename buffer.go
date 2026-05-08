@@ -68,12 +68,12 @@ type scopeBuffer struct {
 	// check entirely. Only the reserved `_events` scope is created with
 	// the sentinel (best-effort observability gated by the global byte
 	// budget alone); every other scope, including `_inbox`, gets a
-	// concrete positive cap installed at create time. See
-	// Store.maxItemsFor in store.go for the per-scope dispatch.
+	// concrete positive cap installed at create time. See maxItemsFor
+	// in store.go for the per-scope dispatch.
 	maxItems int
 	// bytes is the running sum of approxItemSize(item) over items. Only
 	// mutated under b.mu; the store-level total is kept in sync via
-	// Store.reserveBytes (single-item write paths) and
+	// s.reserveBytes (single-item write paths) and
 	// scopeBuffer.commitReplacement (bulk /warm and /rebuild).
 	bytes int64
 	// idKeyBytes is the running sum of len(item.ID) over items with a
@@ -92,12 +92,10 @@ type scopeBuffer struct {
 	// /stats; distinct from lastAccessTS, which tracks reads.
 	lastWriteTS int64
 	// lastAccessTS and readCountTotal are atomic so the read-hot path
-	// (recordRead) does not need to take b.mu. recordRead used to take
-	// b.mu.Lock() — a write lock on the same mutex readers were just on
-	// under RLock — turning every hit on /get, /render, /head and /tail
-	// into a serialise point. Block profiling pinned ~88% of all
-	// read-path lock-wait time to that one call. Atomic stores drop it
-	// to effectively zero.
+	// (recordRead) stays lock-free. Taking b.mu here would serialise
+	// every /get, /render, /head and /tail hit against a single
+	// scope's mutex — the dominant lock-wait source on read-heavy
+	// workloads. Keep it atomic.
 	lastAccessTS   atomic.Int64
 	readCountTotal atomic.Uint64
 }

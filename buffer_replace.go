@@ -19,10 +19,11 @@
 //     by concurrent writes between snapshot and commit, but does NOT
 //     re-add the delta itself.
 //
-// The drift-handling math in commitReplacementPreReserved is the
-// subtlest correctness point in the cache; if you find yourself
-// editing it, run TestStore_ReplaceScopes_RaceVsWipe and
-// TestStore_ReplaceScopes_RaceVsRebuild repeatedly under stress.
+// The drift-handling math in commitReplacementPreReserved is
+// correctness-sensitive — concurrent writes between snapshot and
+// commit must reconcile against the batch's pre-reserved delta.
+// Re-run TestStore_ReplaceScopes_RaceVsWipe and
+// TestStore_ReplaceScopes_RaceVsRebuild under stress after changes.
 
 package scopecache
 
@@ -89,17 +90,18 @@ func buildReplacementState(items []Item) (scopeReplacement, error) {
 
 		lastSeq++
 		item := src
-		// Defensive clear of counter — Gateway clone strips it on
-		// /warm + /rebuild input, but a smuggled non-nil cell would
-		// make approxItemSize charge counterCellOverhead instead of
+		// Defensive clear of counter — public API boundaries strip
+		// it; clear here for internal callers / tests that built an
+		// Item directly. A smuggled non-nil cell would make
+		// approxItemSize charge counterCellOverhead instead of
 		// len(Payload), and post-warm reads would materialise from
 		// the orphaned cell.
 		item.counter = nil
 		item.Seq = lastSeq
 		item.Ts = nowUs
 		// /warm and /rebuild's per-item validateWriteItem already filled
-		// renderBytes for string payloads; recompute only when this helper
-		// is called from a path that bypassed the validator.
+		// renderBytes for string payloads; recompute defensively for
+		// internal callers / tests that bypass the validator.
 		if item.renderBytes == nil {
 			item.renderBytes = precomputeRenderBytes(item.Payload)
 		}
@@ -143,9 +145,11 @@ func sumItemBytes(items []Item) int64 {
 // commit: any bytes it added to the store counter are cancelled out by the
 // fresh delta, because its item is being replaced anyway.
 //
-// The caller must have already validated and built the replacement via
-// buildReplacementState — commitReplacement cannot fail, which is what lets
-// multi-scope /warm behave atomically.
+// The caller must have already validated and built the replacement
+// via buildReplacementState. Both commit variants are infallible
+// after that point — that's what lets the broader prepare-then-
+// commit pipeline (see file header) give /warm and /rebuild their
+// all-or-nothing semantics.
 func (b *scopeBuffer) commitReplacement(r scopeReplacement, newBytes int64) {
 	b.mu.Lock()
 	defer b.mu.Unlock()

@@ -18,13 +18,11 @@ import (
 // Without this, exec.CommandContext's default cancellation behaviour
 // is "SIGKILL Process.Pid" — which only targets the script the
 // bridge spawned. A subscriber script that backgrounds work
-// (`curl ... &; wait`, `python long_drain.py &; sleep 60`) would have
-// the shell wrapper killed but its children orphaned. They get
-// reparented to PID 1 and keep running, holding the cache socket open
-// and processing wake-ups long after the operator believes the
-// subscriber is gone.
+// (`curl ... &; wait`, `python long_drain.py &; sleep 60`) would
+// have the shell wrapper killed but its children orphaned and
+// reparented to PID 1, so they can keep running after stop returns.
 //
-// The fix is the standard Go incantation:
+// The setup has two parts:
 //
 //  1. SysProcAttr{Setpgid: true} makes the child the leader of a
 //     new process group with PGID == its own PID. (Pgid=0 is the
@@ -36,11 +34,9 @@ import (
 //     "this whole process group". Every descendant the script
 //     spawned within that group dies.
 //
-// cmd.Wait then returns (the direct child got SIGKILL'd), the bridge
-// goroutine sees the closed wake-up channel, and stop() returns
-// bounded by OS kill latency. Operators who want their backgrounded
-// children to outlive the subscriber (an unusual choice) must
-// `setsid` or `disown` inside the script to escape the group.
+// cmd.Wait then returns (the direct child got SIGKILL'd), the
+// bridge goroutine sees the closed wake-up channel, and stop()
+// returns bounded by OS kill latency.
 func configureProcessGroup(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error {
@@ -54,13 +50,9 @@ func configureProcessGroup(cmd *exec.Cmd) {
 			return nil
 		}
 		// Negative PID => kill every member of the group whose PGID
-		// equals the absolute value. Errors here are rare (PERM if
-		// the bridge dropped privileges between Start and Cancel,
-		// SRCH if the group is already empty); ignored — caller
-		// already treats the cancel as "process is gone or about to
-		// be." Killed children become zombies until reparented and
-		// reaped, but they are no longer running — observable via
-		// /proc/<pid>/status, not via kill(pid, 0).
+		// equals the absolute value. Errors are ignored: the caller
+		// already treats cancel as best-effort "process is gone or
+		// about to be."
 		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 	}
 }

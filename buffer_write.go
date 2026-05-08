@@ -6,14 +6,14 @@
 //   - updateBySeq   — same, addressed by seq
 //
 // All four take b.mu exclusively, check b.detached first, and route
-// their byte-budget reservation through Store.reserveBytes. Shared
+// their byte-budget reservation through s.reserveBytes. Shared
 // helpers (precomputeRenderBytes, indexBySeqLocked,
 // reservePayloadDeltaLocked, replaceItemAtIndexLocked) live in
 // buffer_locked.go. insertNewItemLocked at the bottom is the local
 // helper that collapses the fresh-insert pipeline shared by
 // appendItem and upsertByID's miss-branch.
 //
-// Every path stamps time.Now().UnixMicro() onto Item.Ts under b.mu
+// Every successful write stores a fresh microsecond Ts under b.mu
 // before storing or replacing — Ts contract lives on the Item type
 // in types.go.
 
@@ -65,8 +65,9 @@ func (b *scopeBuffer) upsertByID(item Item) (Item, bool, error) {
 
 	if existing, exists := b.byID[item.ID]; exists {
 		// validateUpsertItem fills item.renderBytes for string
-		// payloads; recompute only when the call came in via a
-		// Gateway path that bypassed the validator.
+		// payloads; recompute defensively for internal callers and
+		// tests that built an Item without going through the
+		// validator.
 		newRender := item.renderBytes
 		if newRender == nil {
 			newRender = precomputeRenderBytes(item.Payload)
@@ -124,7 +125,7 @@ func (b *scopeBuffer) upsertByID(item Item) (Item, bool, error) {
 // item refreshes ts to "when did the cache write this content."
 //
 // preRender is the validator's precomputed renderBytes for the new payload.
-// Pass nil from direct Gateway callers that bypass the validator path; the
+// Pass nil from internal callers / tests that bypass the validator; the
 // helper falls back to precomputeRenderBytes(payload) in that case.
 func (b *scopeBuffer) updateByID(id string, payload json.RawMessage, preRender []byte) (int, error) {
 	b.mu.Lock()
@@ -223,8 +224,8 @@ func (b *scopeBuffer) updateBySeq(seq uint64, payload json.RawMessage, preRender
 }
 
 // insertNewItemLocked is the shared fresh-insert pipeline used by
-// appendItem and upsertByID's miss-branch. The nine steps must stay
-// coherent across both paths:
+// appendItem and upsertByID's miss-branch. Pipeline order is
+// intentional and must stay coherent across both paths:
 // ts-stamp → renderBytes precompute → size → store-byte reservation
 // → seq assignment → b.items append → b.bySeq sync → b.byID sync
 // (when ID != "") → b.bytes update.
@@ -252,8 +253,9 @@ func (b *scopeBuffer) insertNewItemLocked(item Item, nowUs int64) (Item, error) 
 	// cell instead of the new payload bytes.
 	item.counter = nil
 	item.Ts = nowUs
-	// validator's checkItemSize normally fills renderBytes already.
-	// Recompute only when a direct Gateway caller bypassed it.
+	// validator's checkItemSize normally fills renderBytes already;
+	// the recompute is a defensive fallback for internal callers /
+	// tests that built an Item without going through the validator.
 	if item.renderBytes == nil {
 		item.renderBytes = precomputeRenderBytes(item.Payload)
 	}

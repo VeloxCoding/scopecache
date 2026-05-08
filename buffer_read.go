@@ -1,7 +1,7 @@
 // Read paths on *scopeBuffer:
 //
-//   - tailOffset  — newest-first window with offset (drives /tail)
-//   - sinceSeq    — oldest-first window with after-seq cursor (drives /head)
+//   - tailOffset  — window at the newest end, oldest-first within (drives /tail)
+//   - sinceSeq    — window after a seq cursor, oldest-first (drives /head)
 //   - getByID     — single-item lookup by id (drives /get?id=, /render)
 //   - getBySeq    — single-item lookup by seq (drives /get?seq=)
 //
@@ -13,8 +13,8 @@
 //
 // Every read path runs returned items through materialiseCounter so
 // consumers see the cell's current value/ts rather than the stored
-// (stale-by-design) Payload bytes. A single atomic load + fresh
-// strconv on counters, no-op otherwise.
+// (stale-by-design) Payload bytes. Cheap on counters, no-op
+// otherwise.
 
 package scopecache
 
@@ -45,11 +45,16 @@ func materialiseCountersInPlace(items []Item) []Item {
 	return items
 }
 
-// tailOffset returns the newest-first window `[start, end)` of b.items and a
-// hasMore flag. hasMore is true when older items exist before the window (i.e.
-// start > 0), signalling to the caller that the response is clipped at the
-// oldest end. It does NOT signal truncation at the newest end (that is what
-// offset already describes to the client).
+// tailOffset returns the window of newest `limit` items after
+// skipping `offset` from the newest end. The window is the slice
+// b.items[start:end] preserved in its native seq-ascending
+// (oldest-first) order; clients sort by seq if they want
+// newest-first.
+//
+// hasMore is true when older items exist before the window (i.e.
+// start > 0), signalling to the caller that the response is clipped
+// at the oldest end. It does NOT signal truncation at the newest end
+// (that is what offset already describes to the client).
 func (b *scopeBuffer) tailOffset(limit int, offset int) ([]Item, bool) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
