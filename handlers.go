@@ -226,7 +226,7 @@ func marshalWithApproxSize(payload orderedFields, started time.Time) ([]byte, or
 // writeJSONWithMeta is writeJSONWithDuration plus an approx_response_mb
 // field. Used on read-item endpoints whose response size is bounded by
 // the operation (e.g. /get is single-item). For limit-scaled endpoints
-// (/head, /tail) use writeJSONWithMetaCap instead, which
+// (/head, /tail, /scopelist) use writeJSONWithMetaCap instead, which
 // rejects oversized bodies up-front.
 func writeJSONWithMeta(w http.ResponseWriter, code int, payload orderedFields, started time.Time) {
 	out, augmented, err := marshalWithApproxSize(payload, started)
@@ -243,10 +243,10 @@ func writeJSONWithMeta(w http.ResponseWriter, code int, payload orderedFields, s
 }
 
 // writeJSONWithMetaCap is writeJSONWithMeta with a per-response byte
-// cap baked in. Used on /head, /tail — endpoints whose response can
-// grow with limit × per-item-cap. Marshals once, checks against
-// maxBytes, and either emits the response or replaces it with a 507
-// envelope.
+// cap baked in. Used on /head, /tail and /scopelist — endpoints
+// whose response can grow with a limit × per-row product. Marshals
+// once, checks against maxBytes, and either emits the response or
+// replaces it with a 507 envelope.
 func writeJSONWithMetaCap(w http.ResponseWriter, code int, payload orderedFields, started time.Time, maxBytes int64) {
 	out, augmented, err := marshalWithApproxSize(payload, started)
 	if err != nil {
@@ -309,15 +309,15 @@ func storeFull(w http.ResponseWriter, started time.Time, e *StoreFullError) {
 }
 
 // responseTooLarge writes the 507 envelope used by the cap-protected
-// read endpoints (/head, /tail) when the marshalled body would exceed
-// the per-response cap. Body shape mirrors the other 507 helpers
-// (storeFull, scopeFull): {ok, error, approx_response_mb,
-// max_response_mb, duration_us}.
+// read endpoints (/head, /tail, /scopelist) when the marshalled
+// body would exceed the per-response cap. Body shape mirrors the
+// other 507 helpers (storeFull, scopeFull): {ok, error,
+// approx_response_mb, max_response_mb, duration_us}.
 //
-// Side effects already applied by the handler are NOT rolled back. This
-// matches every other 507 in the cache: 2xx is not durability, and 507
-// does not roll back. In practice the cap-protected endpoints are
-// read-only, so there is nothing to roll back.
+// Side effects already applied by the handler are not rolled back.
+// This matches every other 507 in the cache: 2xx is not durability,
+// and 507 does not roll back. In practice the cap-protected
+// endpoints are read-only, so there is nothing to roll back.
 func responseTooLarge(w http.ResponseWriter, started time.Time, written, cap int64) {
 	writeJSONWithDuration(w, http.StatusInsufficientStorage, orderedFields{
 		{"ok", false},

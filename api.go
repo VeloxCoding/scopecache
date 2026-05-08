@@ -33,14 +33,15 @@ type API struct {
 	// payload its semantic validator would have accepted.
 	maxSingleBytes int64
 
-	// maxResponseBytes is the per-response byte cap for /head, /tail —
-	// endpoints whose response can grow with limit × per-item-cap.
-	// Derived from store.maxStoreBytes (not operator-configurable):
-	// any single scope is bounded by the store budget, so a response
-	// cap equal to the store cap guarantees every full-scope read
-	// fits in one response — including drainer reads of `_events` which
-	// must never be artificially capped (drainer lag → silent event
-	// drop is the failure mode, not a 507 on tail).
+	// maxResponseBytes is the per-response byte cap for /head, /tail,
+	// and /scopelist — endpoints whose response size scales with a
+	// limit × per-item-cap (or per-scope row) product. Derived from
+	// store.maxStoreBytes (not operator-configurable): any single
+	// scope is bounded by the store budget, so a response cap equal
+	// to the store cap guarantees every full-scope read fits in one
+	// response — including drainer reads of `_events` which must
+	// never be artificially capped (drainer lag → silent event drop
+	// is the failure mode, not a 507 on tail).
 	maxResponseBytes int64
 }
 
