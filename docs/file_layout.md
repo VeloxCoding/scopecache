@@ -95,6 +95,7 @@ caddy_module/                         (root module github.com/VeloxCoding/scopec
 │
 ├── docs/
 │   ├── scopecache-core-rfc.md        ── canonical core spec (operator-facing)
+│   ├── scopecache-addon-guarded.md   ── per-addon RFC for addons/guarded/
 │   └── file_layout.md                ── this file
 │
 ├── deploy/

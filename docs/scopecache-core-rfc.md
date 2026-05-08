@@ -2571,9 +2571,11 @@ non-goal entirely.
 
 - **Authentication and authorization.** Tokens, signatures, mTLS,
   bearer headers, capability checks — none of this is core. Addons
-  (e.g. the `guarded` addon for bearer-token access — see §11 — or
+  (e.g. the `guarded` addon for bearer-token access — see
+  [scopecache-addon-guarded.md](scopecache-addon-guarded.md) — or
   an operator-elevated dispatcher addon) add request-context-aware
-  access policy on top of the public Go API.
+  access policy on top of the public Go API. See §11 for the
+  generic addon framework.
 - **Multi-tenancy.** Per-tenant scope isolation, prefix rewrites,
   scope-name conventions tied to tenant identity. Live in addons.
 - **Batch dispatch.** Combining N sub-calls into one HTTP roundtrip
@@ -2623,21 +2625,19 @@ non-goal entirely.
 
 ## 11. Addons
 
-Addons extend scopecache without changing the core. They live as Go
-sub-packages under `addons/<name>/`, import the public `*Gateway`
-surface (§7), and register their own HTTP routes alongside the core
-routes. Both standard adapters — the standalone binary
-(`cmd/scopecache`) and the Caddy module (`caddymodule`) — call each
-addon's `RegisterRoutes(mux, gw)` after their own core route
-registration, so addons ship with the standard package and need no
-separate install.
+Addons extend scopecache without changing the core. They live as
+Go sub-packages under `addons/<name>/`, import the public
+`*Gateway` surface (§7), and register their own HTTP routes
+alongside the core routes. Both standard adapters — the
+standalone binary (`cmd/scopecache`) and the Caddy module
+(`caddymodule`) — call each addon's `RegisterRoutes(mux, gw)`
+after their own core route registration, so addons ship with the
+standard package and need no separate install.
 
 The boundary rules from §1.4 apply: an addon may only read or
 mutate through the public Gateway methods. It may not reach into
 core internals, and it may not relax core invariants (validation,
 capacity, reserved-scope semantics).
-
-### 11.1 Anatomy of an addon
 
 A minimal addon is one Go file plus its tests:
 
@@ -2665,154 +2665,7 @@ api.RegisterRoutes(mux)              // core routes
 myaddon.RegisterRoutes(mux, gw)      // addon routes
 ```
 
-This shape is deliberately small. An addon is just code that uses
-the public Go API and exposes additional HTTP. It can do anything
-the core supports — access gates, batch dispatchers, drainers,
-rate limiters — without the core needing to know.
-
-### 11.2 Example addon: `guarded`
-
-`addons/guarded/` is treated as the example addon. It exposes a
-single token-gated tail endpoint, `/guarded-tail`, that confines a
-token holder to scopes prefixed with that token's capability ID.
-The plaintext token never reaches the cache; only its hash does.
-
-#### Token model
-
-A **capability ID** (`capID`) is `base64url(sha256(token))` — the
-full SHA-256 of the bearer token, base64url-encoded without
-padding, 43 characters long. The operator chooses each plaintext
-token (any length, any character set); only the cache and the
-client need the plaintext, and the cache never stores it.
-
-Operator workflow:
-
-- **Issue a token.** Compute `capID = base64url(sha256(token))`,
-  then `POST /upsert` an item into the `_tokens` scope:
-  ```json
-  {"scope":"_tokens","id":"<capID>","payload":{}}
-  ```
-  The payload is opaque to the addon — operators may store audit
-  metadata (issued_at, label) for their own bookkeeping; the addon
-  never inspects it.
-- **Revoke a token.** `POST /delete` on `(_tokens, <capID>)`.
-- The addon never writes to `_tokens` — it is a read-only access gate.
-
-`_tokens` is **not** one of the core's two reserved scopes (see
-§2.6). The core makes no special promise about `_tokens`; its
-contract is owned by this addon. The leading underscore is the
-same naming convention used for other addon-managed infrastructure
-scopes.
-
-#### Scope namespacing
-
-When a client calls `GET /guarded-tail?scope=foo` with a valid
-bearer token, the addon dispatches the underlying tail to
-`<capID>:foo` — never to `foo`. A token holder cannot reach scopes
-outside their capID prefix; conversely, a capID has no way to
-guess another capID's prefix.
-
-The capID prefix is stripped from `item.scope` on the response so
-the client sees only its own scope name. The hash never appears on
-the wire to the client.
-
-#### `GET /guarded-tail`
-
-Token-gated tail. Mirrors core `/tail` (§6.4) semantics on a scope
-confined to the token's capability prefix. Returns 200 in both the
-hit and miss case.
-
-**Headers**
-
-| header          | required | notes                                                                |
-|-----------------|----------|----------------------------------------------------------------------|
-| `Authorization` | yes      | `Bearer <token>` scheme; `sha256(token)` is looked up in `_tokens`   |
-
-**Query parameters**
-
-| parameter | type   | default | notes                                                |
-|-----------|--------|---------|------------------------------------------------------|
-| `scope`   | string | —       | required; the lookup runs against `<capID>:<scope>`  |
-| `limit`   | int    | 1000    | clamped to ≤ 10000                                   |
-| `offset`  | int    | 0       | skip this many items from the tail before reading    |
-
-**Response (200, hit)**
-
-```json
-{
-  "ok": true,
-  "hit": true,
-  "count": 3,
-  "offset": 0,
-  "truncated": false,
-  "items": [
-    {"scope": "demo", "seq": 1, "ts": 1700000000000000, "payload": {"msg": "first"}},
-    {"scope": "demo", "seq": 2, "ts": 1700000000000001, "payload": {"msg": "second"}},
-    {"scope": "demo", "seq": 3, "ts": 1700000000000002, "payload": {"msg": "third"}}
-  ]
-}
-```
-
-`item.scope` is the client's input scope; the cache-internal
-`<capID>:<scope>` form is never serialised.
-
-**Response (200, miss — no token-prefixed scope, or scope empty)**
-
-```json
-{
-  "ok": true,
-  "hit": false,
-  "count": 0,
-  "offset": 0,
-  "truncated": false,
-  "items": []
-}
-```
-
-**Endpoint-specific errors**
-
-| status | error                                                  | when                                                          |
-|--------|--------------------------------------------------------|---------------------------------------------------------------|
-| 401    | `missing or malformed Authorization header`            | header missing, not Bearer scheme, or empty token             |
-| 401    | `invalid or unknown token`                             | token hashed to a capID that is not provisioned in `_tokens`  |
-| 400    | `the 'scope' query parameter is required`              | `scope` omitted                                               |
-| 400    | `the 'limit' parameter must be a positive integer`     | non-numeric or non-positive `limit`                           |
-| 400    | `the 'offset' parameter must be a non-negative integer`| non-numeric or negative `offset`                              |
-
-The access check runs before query parsing — a caller without a
-valid token does no shape-validation work and learns nothing about
-the addon's wire shape beyond what is publicly documented.
-
-**Side effects**
-
-A successful hit bumps the per-scope read-bookkeeping atomics (§9)
-on the cache-internal `<capID>:<scope>` scope, exactly like core
-`/tail`.
-
-**Example**
-
-```bash
-# operator issues a token (one-time)
-# id = base64url(sha256("123456")); compute with:
-#   echo -n 123456 | openssl dgst -sha256 -binary | openssl base64 -A | tr +/ -_ | tr -d =
-curl -s -X POST http://localhost:8080/upsert \
-  -H 'Content-Type: application/json' \
-  -d '{"scope":"_tokens","id":"jZae727K08KaOmKSgOaGzww_XVqGr_PKEgIMkjrcbJI","payload":{}}'
-
-# operator pre-populates a token-owned scope
-curl -s -X POST http://localhost:8080/append \
-  -H 'Content-Type: application/json' \
-  -d '{"scope":"jZae727K08KaOmKSgOaGzww_XVqGr_PKEgIMkjrcbJI:demo","payload":{"msg":"first"}}'
-
-# client uses the plaintext token; the addon does the hash + prefix
-curl -s 'http://localhost:8080/guarded-tail?scope=demo' \
-  -H 'Authorization: Bearer 123456'
-# → {"ok":true,"hit":true,"count":1,"offset":0,"truncated":false,"items":[{"scope":"demo","seq":1,"ts":...,"payload":{"msg":"first"}}]}
-```
-
-### 11.3 Adding your own addon
-
-The pattern from `guarded` generalises:
+To add a new addon:
 
 1. Create `addons/<name>/<name>.go`; expose
    `RegisterRoutes(mux *http.ServeMux, gw *scopecache.Gateway)`.
@@ -2825,9 +2678,13 @@ The pattern from `guarded` generalises:
    (`cmd/scopecache/main.go` and `caddymodule/module.go`) so it
    ships with the standard package.
 
-Addons that need their own infrastructure scopes (e.g. `_tokens`
-for `guarded`) should pick a leading-underscore name, document the
-contract on the addon, and let the operator provision the scope's
-contents through core endpoints. The core does not auto-create
-addon scopes — see §10.2 (`Reserved-scope enforcement` lives in
+Addons that need their own infrastructure scopes should pick a
+leading-underscore name, document the contract in the addon's
+own RFC, and let the operator provision the scope's contents
+through core endpoints. The core does not auto-create addon
+scopes — see §10.2 (`Reserved-scope enforcement` lives in
 operator policy).
+
+Per-addon contracts live in their own RFCs alongside this
+document. The first addon is `addons/guarded/` —
+[scopecache-addon-guarded.md](scopecache-addon-guarded.md).
