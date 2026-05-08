@@ -516,17 +516,28 @@ func estimateMultiItemResponseBytes(items []Item) int64 {
 // bulkRequestBytesOverhead covers JSON framing (keys, quotes, array
 // separators, wrapper object) and provides a non-zero floor for very
 // small store caps.
+//
+// Saturating add: caddymodule + standalone validate operator config
+// against maxConfigMB before unit-shift, but a pure Go-API caller
+// can hand NewGateway any int64 value for MaxStoreBytes including
+// math.MaxInt64. Plain `+` would wrap to a negative request cap;
+// addClampedInt64 saturates at math.MaxInt64 so MaxBytesReader
+// keeps a sane upper bound.
 func bulkRequestBytesFor(maxStoreBytes int64) int64 {
-	return maxStoreBytes + maxStoreBytes/10 + bulkRequestBytesOverhead
+	return addClampedInt64(addClampedInt64(maxStoreBytes, maxStoreBytes/10), bulkRequestBytesOverhead)
 }
 
-// singleRequestBytesFor returns the per-request body cap for single-item
-// endpoints, derived from the configured per-item cap. The item cap is a
-// semantic limit on approxItemSize (enforced in the validator); this request
-// cap is a DoS guardrail on the raw HTTP body (enforced by MaxBytesReader).
-// The 4 KiB overhead covers JSON framing (keys, quotes, braces) on top of the
-// item bytes — scope and id are already counted inside approxItemSize, so the
+// singleRequestBytesFor returns the per-request body cap for
+// single-item endpoints, derived from the configured per-item cap.
+// The item cap is a semantic limit on approxItemSize (enforced in
+// the validator); this request cap is a DoS guardrail on the raw
+// HTTP body (enforced by MaxBytesReader). The 4 KiB overhead covers
+// JSON framing (keys, quotes, braces) on top of the item bytes —
+// scope and id are already counted inside approxItemSize, so the
 // framing is tiny and constant.
+//
+// Saturating add for the same reason as bulkRequestBytesFor: a pure
+// Go-API caller can hand any int64 value for MaxItemBytes.
 func singleRequestBytesFor(maxItemBytes int64) int64 {
-	return maxItemBytes + singleRequestBytesOverhead
+	return addClampedInt64(maxItemBytes, singleRequestBytesOverhead)
 }

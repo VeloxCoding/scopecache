@@ -3,6 +3,7 @@ package scopecache
 import (
 	"encoding/json"
 	"errors"
+	"math"
 	"testing"
 )
 
@@ -569,6 +570,30 @@ func TestBulkRequestBytesFor_ScalesWithStoreCap(t *testing.T) {
 		if got != want {
 			t.Errorf("storeBytes=%d: got %d want %d", storeBytes, got, want)
 		}
+	}
+}
+
+// Pure Go-API callers can hand NewGateway any int64 value for
+// MaxStoreBytes / MaxItemBytes. The adapter validators (caddymodule
+// + standalone) clamp before the unit-shift, but the request-cap
+// helpers themselves must saturate so a math.MaxInt64 input does
+// not wrap to a negative MaxBytesReader limit.
+func TestRequestCapHelpers_SaturateOnExtremeInput(t *testing.T) {
+	// bulkRequestBytesFor: maxStoreBytes + maxStoreBytes/10 + 16 MiB
+	// would wrap; the helper saturates at math.MaxInt64.
+	if got := bulkRequestBytesFor(math.MaxInt64); got != math.MaxInt64 {
+		t.Errorf("bulkRequestBytesFor(MaxInt64)=%d want %d (saturated)", got, int64(math.MaxInt64))
+	}
+	// singleRequestBytesFor: maxItemBytes + 4 KiB would wrap.
+	if got := singleRequestBytesFor(math.MaxInt64); got != math.MaxInt64 {
+		t.Errorf("singleRequestBytesFor(MaxInt64)=%d want %d (saturated)", got, int64(math.MaxInt64))
+	}
+	// Sanity: realistic inputs are unaffected by the saturation.
+	if got := bulkRequestBytesFor(100 << 20); got != (100<<20)+(100<<20)/10+bulkRequestBytesOverhead {
+		t.Errorf("bulkRequestBytesFor(100 MiB) saturation regressed plain arithmetic; got %d", got)
+	}
+	if got := singleRequestBytesFor(1 << 20); got != (1<<20)+singleRequestBytesOverhead {
+		t.Errorf("singleRequestBytesFor(1 MiB) saturation regressed plain arithmetic; got %d", got)
 	}
 }
 
