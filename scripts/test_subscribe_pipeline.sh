@@ -178,9 +178,10 @@ fi
 echo "ok   $file_count files persisted (one per message)"
 
 # Counter values 1..COUNT must each appear exactly once across all
-# files. Reads .payload.payload.n: the outer payload is the _events
-# envelope, the nested .payload is the original /append payload.
-unique_counters=$(cat "$OUTPUT_DIR"/*.json | jq -r '.payload.payload.n' | sort -n | uniq | wc -l | tr -d ' ')
+# files. Reads .payload.event.n: the outer payload is the _events
+# envelope (the writeEvent JSON), the nested .event is the original
+# /append payload that travels with EventsModeFull.
+unique_counters=$(cat "$OUTPUT_DIR"/*.json | jq -r '.payload.event.n' | sort -n | uniq | wc -l | tr -d ' ')
 if [ "$unique_counters" -ne "$COUNT" ]; then
     echo "FAIL: expected $COUNT unique counter values, got $unique_counters"
     exit 1

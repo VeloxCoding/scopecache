@@ -36,7 +36,10 @@ import "encoding/json"
 // writeEvent is the JSON shape of an entry's payload in the
 // reserved `_events` scope. The cache marshals one writeEvent per
 // committed mutation (when Mode != Off) and stores the marshaled
-// bytes as the entry's Item.Payload.
+// bytes as the entry's Item.Payload. The user-write's payload — when
+// it travels along on EventsModeFull — rides under the JSON key
+// `event` rather than `payload`, so a /tail _events response does
+// not surface "payload" at two nesting levels.
 //
 // Action-payload, not result-payload: the cache logs the inputs the
 // caller sent, never the result it computed. /counter_add events
@@ -47,12 +50,12 @@ import "encoding/json"
 //
 // Field shape per op:
 //
-//	append       — scope, id?, seq, ts, payload?
-//	upsert       — scope, id, seq, ts, payload?
-//	update       — scope, id|seq, payload?      (no ts; updateByID/Seq don't return it)
-//	counter_add  — scope, id, by                (no payload, no ts)
-//	delete       — scope, id|seq                (no payload, no ts)
-//	delete_up_to — scope, max_seq               (no id, no per-item seq, no payload, no ts)
+//	append       — scope, id?, seq, ts, event?
+//	upsert       — scope, id, seq, ts, event?
+//	update       — scope, id|seq, event?        (no ts; updateByID/Seq don't return it)
+//	counter_add  — scope, id, by                (no event, no ts)
+//	delete       — scope, id|seq                (no event, no ts)
+//	delete_up_to — scope, max_seq               (no id, no per-item seq, no event, no ts)
 //	warm         — ts                           (no scope: /warm replaces multiple scopes;
 //	                                             list omitted to avoid wire bloat)
 //	delete_scope — scope, ts                    (the scope being deleted)
@@ -70,14 +73,14 @@ import "encoding/json"
 // /delete_up_to with max_seq=0 is a no-op (assignments start at 1)
 // and we skip emitting on count=0 anyway.
 type writeEvent struct {
-	Op      string          `json:"op"`
-	Scope   string          `json:"scope,omitempty"`
-	ID      string          `json:"id,omitempty"`
-	Seq     uint64          `json:"seq,omitempty"`
-	Ts      int64           `json:"ts,omitempty"`
-	Payload json.RawMessage `json:"payload,omitempty"`
-	By      *int64          `json:"by,omitempty"`
-	MaxSeq  uint64          `json:"max_seq,omitempty"`
+	Op     string          `json:"op"`
+	Scope  string          `json:"scope,omitempty"`
+	ID     string          `json:"id,omitempty"`
+	Seq    uint64          `json:"seq,omitempty"`
+	Ts     int64           `json:"ts,omitempty"`
+	Event  json.RawMessage `json:"event,omitempty"`
+	By     *int64          `json:"by,omitempty"`
+	MaxSeq uint64          `json:"max_seq,omitempty"`
 }
 
 // emitEvent is the shared back-half: Notify-mode payload strip +
@@ -96,7 +99,7 @@ func (s *store) emitEvent(evt writeEvent) {
 		// Drainers waking up on Notify re-fetch from cache state,
 		// which is faster and cheaper than carrying the payload
 		// inline twice (in the user scope and in `_events`).
-		evt.Payload = nil
+		evt.Event = nil
 	}
 	body, err := json.Marshal(evt)
 	if err != nil {
@@ -124,12 +127,12 @@ func (s *store) emitAppendEvent(scope, id string, seq uint64, ts int64, payload 
 		return
 	}
 	s.emitEvent(writeEvent{
-		Op: "append", Scope: scope, ID: id, Seq: seq, Ts: ts, Payload: payload,
+		Op: "append", Scope: scope, ID: id, Seq: seq, Ts: ts, Event: payload,
 	})
 }
 
 // emitUpsertEvent — same envelope as /append (scope, id, seq, ts,
-// payload). The created-vs-replaced distinction is not on the wire:
+// event). The created-vs-replaced distinction is not on the wire:
 // action-logging captures "upsert this id with this payload",
 // regardless of prior cache state.
 func (s *store) emitUpsertEvent(scope, id string, seq uint64, ts int64, payload json.RawMessage) {
@@ -137,7 +140,7 @@ func (s *store) emitUpsertEvent(scope, id string, seq uint64, ts int64, payload 
 		return
 	}
 	s.emitEvent(writeEvent{
-		Op: "upsert", Scope: scope, ID: id, Seq: seq, Ts: ts, Payload: payload,
+		Op: "upsert", Scope: scope, ID: id, Seq: seq, Ts: ts, Event: payload,
 	})
 }
 
@@ -151,7 +154,7 @@ func (s *store) emitUpdateEvent(scope, id string, seq uint64, payload json.RawMe
 		return
 	}
 	s.emitEvent(writeEvent{
-		Op: "update", Scope: scope, ID: id, Seq: seq, Payload: payload,
+		Op: "update", Scope: scope, ID: id, Seq: seq, Event: payload,
 	})
 }
 

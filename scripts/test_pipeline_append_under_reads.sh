@@ -137,7 +137,7 @@ if [ "$file_count" -ne "$COUNT" ]; then
 fi
 echo "ok   $file_count files persisted (one per message)"
 
-unique_counters=$(cat "$OUTPUT_DIR"/*.json | jq -r '.payload.payload.n' | sort -n | uniq | wc -l | tr -d ' ')
+unique_counters=$(cat "$OUTPUT_DIR"/*.json | jq -r '.payload.event.n' | sort -n | uniq | wc -l | tr -d ' ')
 if [ "$unique_counters" -ne "$COUNT" ]; then
     echo "FAIL: expected $COUNT unique counter values in files, got $unique_counters"
     exit 1

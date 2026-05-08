@@ -1093,7 +1093,7 @@ if [ "${EXPECT_EVENTS:-}" = "full" ]; then
     json_assert 'events: counter_add carries by=7 (increment, not value)' '
         (.items[3].payload.op == "counter_add")
         and (.items[3].payload.by == 7)
-        and (.items[3].payload | has("payload") | not)
+        and (.items[3].payload | has("event") | not)
     '
     json_assert 'events: delete_up_to carries max_seq=1 (cursor, not count)' '
         (.items[6].payload.op == "delete_up_to")
