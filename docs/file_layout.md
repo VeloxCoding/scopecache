@@ -88,9 +88,13 @@ caddy_module/                         (root module github.com/VeloxCoding/scopec
 │   ├── module.go                     ── package caddymodule (init runs behind private temp socket during Provision)
 │   └── module_test.go
 │
+├── addons/                           (Go sub-packages built on the public *Gateway; mounted by both adapters)
+│   └── guarded/
+│       ├── guarded.go                ── /guarded-tail (bearer-token access; capID = base64url(sha256(token)))
+│       └── guarded_test.go
+│
 ├── docs/
 │   ├── scopecache-core-rfc.md        ── canonical core spec (operator-facing)
-│   ├── scopecache-rfc-old.md         ── v0.7.16-era snapshot, kept for distinct-design reference
 │   └── file_layout.md                ── this file
 │
 ├── deploy/
@@ -98,12 +102,8 @@ caddy_module/                         (root module github.com/VeloxCoding/scopec
 │   └── Caddyfile.caddyscope          ── working Caddy + scopecache demo
 │
 ├── scripts/
-│   ├── bench.sh                      ── repeatable single-version bench driver
-│   ├── bench_stats_oneoff.sh         ── one-off /stats benchmark helper
-│   ├── e2e_test.sh                   ── end-to-end curl suite (full HTTP-surface coverage)
-│   ├── run_e2e.sh                    ── wraps e2e against standalone + caddyscope
-│   ├── drain_events.sh               ── reference subscriber-command (POSIX shell, drains _events)
-│   └── e2e_subscriber.sh             ── end-to-end test for the subscriber bridge
+│   └── drain_events.sh               ── reference subscriber-command (POSIX shell, drains _events;
+│                                        the other scripts in this dir are gitignored, local-only)
 │
 ├── archive/                          (gitignored; pre-strip handler files for reference)
 ├── harness/                          (gitignored; live FrankenPHP harness)
@@ -113,7 +113,7 @@ caddy_module/                         (root module github.com/VeloxCoding/scopec
     └── sync-caddymodule-tag.yml      (auto-bumps caddymodule pin on tag push)
 ```
 
-When add-ons start landing, they will appear under `addons/<name>/` as Go sub-packages (Phase C). The folder doesn't exist today; nothing currently fits the addon shape better than living in core.
+Addons live under `addons/<name>/` as Go sub-packages built on the public `*Gateway`. The first one is [`addons/guarded/`](../addons/guarded/) — bearer-token access for `/tail`. Both adapters (standalone + Caddy module) call each addon's `RegisterRoutes(mux, gw)` after their own core route registration, so addons ship standard with the package. See RFC §11 for the addon contract and worked example.
 
 ## Core file split: lock discipline, not handler grouping
 
@@ -135,7 +135,7 @@ The actual boundary:
   `getScope`. Every HTTP handler routes through one of these methods —
   handlers do decode + validate + one Store call + respond, no direct
   `*scopeBuffer` access. Eviction-candidate ranking is no longer a
-  core concern (see Phase C `scopecache/heat/` addon).
+  core concern (planned `addons/heat/` addon).
 - **`bulk.go`** — **multi-shard mutations only**, which MUST acquire shard locks
   in ascending shard-index order to avoid deadlock with each other (see the
   `numShards` comment block at the top of `store.go`, plus the `lockAllShards`/
@@ -205,7 +205,7 @@ When adding a new core endpoint *(rare — core is feature-complete; bug fixes a
 - A piece of shared infra used by ≥ 2 handler files → `handlers.go`.
 - Always add the matching `*Gateway` method so Go callers and HTTP callers stay symmetric.
 
-When adding request-context-aware behaviour (auth, tenants, batch dispatch, write-only ingestion shapes, custom routing): build it as an addon under `addons/<name>/`, not in core. See §1.4 of the core RFC and Phase C below.
+When adding request-context-aware behaviour (auth, tenants, batch dispatch, write-only ingestion shapes, custom routing): build it as an addon under `addons/<name>/`, not in core. See §1.4 and §11 of the core RFC.
 
 ## Public API surface of `package scopecache`
 

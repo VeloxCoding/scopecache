@@ -2,10 +2,8 @@
 
 > **Status: pre-v1.0 draft.** All sections (§1–§10) are in place.
 > Wording, structure, and detail levels remain open for revision.
-> [scopecache-rfc-old.md](scopecache-rfc-old.md) is kept as a
-> historical reference for the v0.7.16-era multi-tenant gateway
-> design; addon-specific RFCs will land alongside this document as
-> the addon sub-packages ship.
+> Addon-specific RFCs will land alongside this document as the
+> addon sub-packages ship.
 
 ---
 
