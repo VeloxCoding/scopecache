@@ -7,7 +7,6 @@ Volledige boomstructuur en uitleg per bestand-familie. CLAUDE.md verwijst hierhe
 ```
 caddy_module/                         (root module github.com/VeloxCoding/scopecache)
 ├── go.mod                            (stdlib-only)
-├── go.work                           (binds root + caddymodule for local dev)
 ├── Dockerfile                        (standalone binary)
 ├── Dockerfile.caddyscope             (xcaddy build: Caddy + scopecache module)
 ├── docker-compose.yml

@@ -23,3 +23,10 @@
 # §7.11) ships with the repo.
 /scripts/*
 !/scripts/drain_events.sh
+# go.work + go.work.sum bind root + caddymodule for local dev (so a single
+# `go test ./...` run sees both modules without round-tripping through
+# proxy.golang.org). Per Go's own docs this file is per-machine and
+# should not be committed; consumers (`go install`, `xcaddy --with …`)
+# resolve through go.mod / caddymodule/go.mod alone.
+/go.work
+/go.work.sum
