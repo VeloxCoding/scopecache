@@ -62,12 +62,6 @@ A working Caddy + scopecache demo is in
 
 ## Performance
 
-Around 75,000 HTTP requests per second on commodity hardware over a
-loopback Unix socket; see [scripts/bench.sh](scripts/bench.sh) for the
-harness and `bench-results/` for tagged runs.
-
-### Roundtrip benchmark vs Redis-backed routes
-
 A side-by-side benchmark comparing three HTTP read paths under
 identical `wrk -t4 -c64 -d5s` load on the same host (50,000-item
 dataset, 10 runs averaged):
