@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# install_and_benchmark.sh — populate and smoke-benchmark a running
+# run_benchmark.sh — populate and smoke-benchmark a running
 # scopecache instance from any client host.
 #
 # Steps currently implemented:
@@ -32,10 +32,10 @@
 #
 # Examples:
 #
-#   ./install_and_benchmark.sh                          # local, 50k items + bench
-#   URL=http://1.2.3.4 ./install_and_benchmark.sh       # against remote VPS
-#   STEPS=2 ./install_and_benchmark.sh                  # bench only
-#   WRK_DURATION=30s WRK_CONNECTIONS=200 ./install_and_benchmark.sh
+#   ./run_benchmark.sh                          # local, 50k items + bench
+#   URL=http://1.2.3.4 ./run_benchmark.sh       # against remote VPS
+#   STEPS=2 ./run_benchmark.sh                  # bench only
+#   WRK_DURATION=30s WRK_CONNECTIONS=200 ./run_benchmark.sh
 #
 # Runs anywhere with curl + awk + (for step 2) wrk. Linux, WSL, the
 # dev container. macOS has BSD date so the millisecond timing in step

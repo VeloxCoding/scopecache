@@ -8,7 +8,7 @@ sudo bash install_caddyscope.sh
 ```
 
 Klaar — Caddy + scopecache draait, `/help` is getest, `wrk` is
-geïnstalleerd. Daarna kan dezelfde gebruiker `install_and_benchmark.sh`
+geïnstalleerd. Daarna kan dezelfde gebruiker `run_benchmark.sh`
 ophalen en zien wat de cache aankan.
 
 ## Knoppen om aan te draaien

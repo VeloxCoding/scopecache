@@ -9,7 +9,7 @@
 #   3. Write /etc/caddy/Caddyfile (back up any existing one first)
 #   4. Write /etc/systemd/system/caddy.service, reload + enable + start
 #   5. Smoke-test http://localhost:<PORT>/help
-#   6. apt install -y wrk (so install_and_benchmark.sh can run later)
+#   6. apt install -y wrk (so run_benchmark.sh can run later)
 #
 # Usage:
 #   sudo ./install_caddyscope.sh
@@ -29,7 +29,7 @@
 #
 # After this script finishes the cache is reachable on
 # http://<vps-ip>:<PORT>/. To validate end-to-end with a real
-# workload, fetch and run scripts/install_and_benchmark.sh from the
+# workload, fetch and run scripts/run_benchmark.sh from the
 # same repo.
 
 set -euo pipefail
@@ -219,9 +219,9 @@ echo "    -d '{\"scope\":\"demo\",\"payload\":{\"msg\":\"hello\"}}'"
 echo "  curl 'http://localhost:${PORT}/tail?scope=demo'"
 echo
 echo "Benchmark it:"
-echo "  wget https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/main/scripts/install_and_benchmark.sh"
-echo "  chmod +x install_and_benchmark.sh"
-echo "  ./install_and_benchmark.sh"
+echo "  wget https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/main/scripts/run_benchmark.sh"
+echo "  chmod +x run_benchmark.sh"
+echo "  ./run_benchmark.sh"
 echo
 echo "Service control:"
 echo "  systemctl status caddy --no-pager"
