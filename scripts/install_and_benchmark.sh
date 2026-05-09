@@ -23,7 +23,7 @@
 #   URL=http://localhost     base URL of the cache (no trailing slash)
 #   COUNT=50000              how many items to insert in step 1
 #   SCOPE=benchmark          scope name to write into / read from
-#   WRK_THREADS=2            wrk worker threads in step 2
+#   WRK_THREADS=1            wrk worker threads in step 2
 #   WRK_CONNECTIONS=50       wrk concurrent connections in step 2
 #   WRK_DURATION=10s         wrk run duration in step 2
 #   STEPS=1,2                comma-separated step list (e.g. STEPS=2 to
@@ -46,7 +46,7 @@ set -euo pipefail
 URL="${URL:-http://localhost}"
 COUNT="${COUNT:-50000}"
 SCOPE="${SCOPE:-benchmark}"
-WRK_THREADS="${WRK_THREADS:-2}"
+WRK_THREADS="${WRK_THREADS:-1}"
 WRK_CONNECTIONS="${WRK_CONNECTIONS:-50}"
 WRK_DURATION="${WRK_DURATION:-10s}"
 STEPS="${STEPS:-1,2}"
@@ -177,12 +177,54 @@ function response(status)
     end
 end
 function done(summary, latency, requests)
+    -- wrk's --latency only prints 50/75/90/99 by default; emit p95
+    -- ourselves on stdout with a distinct prefix so the bash wrapper
+    -- can pull it out and reformat the summary.
+    io.write(string.format("P95_US %d\n", latency:percentile(95)))
     for s, n in pairs(bad_status) do
         io.stderr:write("BADSTATUS " .. s .. " " .. n .. "\n")
     end
 end
 LUA
 
-    wrk -t"$WRK_THREADS" -c"$WRK_CONNECTIONS" -d"$WRK_DURATION" --latency \
-        --timeout 2s -s "$LUA_PATH" "$URL"
+    # Capture wrk output and reformat into a condensed summary. The
+    # full wrk output (Thread Stats with stdev, Latency Distribution
+    # block, Transfer/sec, etc.) is suppressed; we keep only:
+    #   - per-thread Avg req/s (the "93.00k" style number)
+    #   - latency avg / p50 / p95 / max
+    #   - the "N requests in Ts, NMB read" totals line
+    wrk_out=$(wrk -t"$WRK_THREADS" -c"$WRK_CONNECTIONS" -d"$WRK_DURATION" \
+        --latency --timeout 2s -s "$LUA_PATH" "$URL" 2>&1)
+
+    # Parse fields. Each awk line bails on first match (exit) so this
+    # is one stream-pass per field; cheap.
+    lat_avg=$(printf '%s\n' "$wrk_out" | awk '/^[[:space:]]+Latency[[:space:]]/ {print $2; exit}')
+    lat_max=$(printf '%s\n' "$wrk_out" | awk '/^[[:space:]]+Latency[[:space:]]/ {print $4; exit}')
+    rps_avg=$(printf '%s\n' "$wrk_out" | awk '/^[[:space:]]+Req\/Sec[[:space:]]/ {print $2; exit}')
+    p50=$(printf '%s\n'    "$wrk_out" | awk '/^[[:space:]]+50%[[:space:]]/ {print $2; exit}')
+    p95_us=$(printf '%s\n' "$wrk_out" | awk '/^P95_US[[:space:]]/ {print $2; exit}')
+    totals=$(printf '%s\n' "$wrk_out" | awk '/^[[:space:]]+[0-9]+[[:space:]]requests in/ {sub(/^[[:space:]]+/, ""); print; exit}')
+
+    # Format p95 (in microseconds from Lua) the way wrk formats latencies.
+    fmt_us() {
+        awk -v v="${1:-0}" 'BEGIN {
+            if (v >= 1000000) printf "%.2fs", v/1000000
+            else if (v >= 1000) printf "%.2fms", v/1000
+            else printf "%dus", v
+        }'
+    }
+    p95=$(fmt_us "${p95_us:-0}")
+
+    printf '  Req/sec:  %s\n'                        "${rps_avg:-?}"
+    printf '  Latency:  avg=%s  p50=%s  p95=%s  max=%s\n' \
+        "${lat_avg:-?}" "${p50:-?}" "$p95" "${lat_max:-?}"
+    printf '  Total:    %s\n'                        "${totals:-?}"
+
+    # If wrk wrote anything to stderr (BADSTATUS lines, errors), pass
+    # it through so the operator notices.
+    bad_lines=$(printf '%s\n' "$wrk_out" | grep -E '^(BADSTATUS|wrk:|Socket errors:|Non-2xx)' || true)
+    if [ -n "$bad_lines" ]; then
+        printf '\n'
+        printf '%s\n' "$bad_lines"
+    fi
 fi
