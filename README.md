@@ -10,7 +10,7 @@ Redis - and similar in-memory data stores - are fast by themselve. But a typical
 
 By removing separate application and storage services from the request path, ScopeCache can reach a latency and throughput profile that traditional multi-service request paths cannot realistically match.
 
-ScopeCache deliberately keeps filtering limited. The core only addresses a few official top-level fields, which keeps it robust, predictable, and fast. But because scope names and IDs are plain strings, ScopeCache remains flexible enough for many real-world use cases.
+ScopeCache deliberately keeps filtering limited. The core only addresses a few official top-level fields, which keeps it robust, predictable, and fast. But ScopeCache remains flexible enough for many real-world use cases.
 
 For example, the following request returns the latest 100 reactions for thread `123`:
 
@@ -34,12 +34,11 @@ The second reason ScopeCache exists is [FrankenPHP](https://frankenphp.dev/).
 
 FrankenPHP shows how powerful a Caddy-based architecture can be when more of the web stack runs together. Its worker mode improves PHP performance by keeping application workers alive in memory, avoiding much of the overhead of traditional per-request PHP execution.
 
-It also makes distribution simpler: a PHP application can be packaged into a single binary that includes Caddy and Mercure for Server-Sent Events.
+FrankenPHP also makes distribution simpler: a PHP application can be packaged into a single binary that includes Caddy and Mercure for Server-Sent Events. No separate installation and configuration of a web server or PHP runtime is required.
 
-But when Redis is required for optimal performance, that model breaks down. Redis remains a separate service to run, secure, monitor, and maintain.
+But when Redis is required for optimal performance, that distribution model breaks down. Redis remains a separate service that must be run, secured, monitored, and maintained. It also cannot be compiled into the same single binary as the PHP application, web server, and Mercure. 
 
-ScopeCache applies the same architectural idea to hot data: keep it inside the webserver process, avoid unnecessary service boundaries. ScopeCache is a Caddy module which makes it possible to ship the webserver, PHP runtime, SSE hub, and data cache in one custom FrankenPHP/Caddy binary.
-
+FrankenPHP reduces one service boundary by bringing the PHP runtime closer to Caddy. ScopeCache applies a related idea to data: keep frequently accessed data inside the web server process and avoid an additional cache-service roundtrip on the read path. Also important: because ScopeCache is a Caddy module, it can be compiled into the same custom FrankenPHP/Caddy binary as Caddy, the PHP runtime, and the SSE hub.
 
 ## What it is: Core features and Addons
 
