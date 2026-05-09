@@ -24,6 +24,27 @@ ScopeCache is not an HTTP response cache like Varnish or Souin. It is a scope-ad
 
 ScopeCache can also act as a write buffer, with built-in support for change notifications so external scripts can drain, process, or persist events elsewhere.
 
+## Why ScopeCache Exists
+
+ScopeCache targets a very common kind of over-engineering: adding Redis for workloads that are really just “keep a few hot lists in RAM.” Latest thread messages, unread counters, inbox views, view counts, rate-limit buckets, rendered HTML fragments, small materialized views — many applications use Redis for exactly these patterns.
+
+Redis is excellent software, but for many of these cases it is more infrastructure than the problem requires. You get a full in-memory datastore with persistence options, pub/sub, Lua scripting, clustering, monitoring concerns, and its own operational failure modes, while the application may only need a few simple read/write operations.
+And Redis is still another service: something to run, update, secure, monitor, tune, and include in your deployment process.
+
+ScopeCache is built for cases where that extra service is unnecessary. When it runs inside Caddy, hot scope-addressed data can live in the same process as the webserver and be served directly from memory. The result is a shorter request path: higher throughput, lower latency, and fewer services to run, secure, monitor, and maintain.
+
+It is the mainstream reality of many web applications: Redis gets added because “that is what you do,” not because the application truly needs a separate general-purpose in-memory datastore.
+
+The second reason ScopeCache exists is [FrankenPHP](https://frankenphp.dev/).
+
+FrankenPHP shows how powerful a Caddy-based architecture can be when more of the web stack runs together. Its worker mode improves PHP performance by keeping application workers alive in memory, avoiding much of the overhead of traditional per-request PHP execution.
+
+It also makes distribution simpler: a PHP application can be packaged into a single binary that includes Caddy and Mercure for Server-Sent Events.
+
+But when Redis is required for optimal performance, that model breaks down. Redis remains a separate service to run, secure, monitor, and maintain.
+
+ScopeCache applies the same architectural idea to hot data: keep it inside the webserver process, avoid unnecessary service boundaries. ScopeCache is a Caddy module which makes it it possible to ship the webserver, PHP runtime, SSE hub, and data cache in one custom FrankenPHP/Caddy binary.
+
 
 ## What it is: Core features and Addons
 
@@ -67,30 +88,6 @@ Apart from the two convenience features mentioned above, the core is intentional
 - **Write / load:** `append`, `warm`, `rebuild`
 - **Cleanup:** `delete`, `delete_up_to`, `delete_scope`
 - **Observe:** `stats`, `scopelist`
-
-### Why ScopeCache Exists
-
-ScopeCache targets a very common kind of over-engineering: adding Redis for workloads that are really just “keep a few hot lists in RAM.”
-
-Latest thread messages, unread counters, inbox views, view counts, rate-limit buckets, rendered HTML fragments, small materialized views — many applications use Redis for exactly these patterns.
-
-Redis is excellent software, but for many of these cases it is more infrastructure than the problem requires. You get a full in-memory datastore with persistence options, pub/sub, Lua scripting, clustering, monitoring concerns, and its own operational failure modes, while the application may only need a few simple read/write operations.
-
-And Redis is still another service: something to run, update, secure, monitor, tune, and include in your deployment process.
-
-ScopeCache is built for cases where that extra service is unnecessary. When it runs inside Caddy, hot scope-addressed data can live in the same process as the webserver and be served directly from memory. The result is a shorter request path: higher throughput, lower latency, and fewer services to run, secure, monitor, and maintain.
-
-It is the mainstream reality of many web applications: Redis gets added because “that is what you do,” not because the application truly needs a separate general-purpose in-memory datastore.
-
-The second reason ScopeCache exists is [FrankenPHP](https://frankenphp.dev/).
-
-FrankenPHP shows how powerful a Caddy-based architecture can be when more of the web stack runs together. Its worker mode improves PHP performance by keeping application workers alive in memory, avoiding much of the overhead of traditional per-request PHP execution.
-
-It also makes distribution simpler: a PHP application can be packaged into a single binary that includes Caddy and Mercure for Server-Sent Events.
-
-But when Redis is required for optimal performance, that model breaks down. Redis remains a separate service to run, secure, monitor, and maintain.
-
-ScopeCache applies the same architectural idea to hot data: keep it inside the webserver process, avoid unnecessary service boundaries. ScopeCache is a Caddy module which makes it it possible to ship the webserver, PHP runtime, SSE hub, and data cache in one custom FrankenPHP/Caddy binary.
 
 ### ScopeCache 'internals'
 
