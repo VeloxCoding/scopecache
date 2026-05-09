@@ -152,6 +152,11 @@ if step_enabled 2; then
     # Heredoc expands ${SCOPE}, $seq_lo, $seq_hi at write time. Lua
     # itself sees concrete numbers and a literal scope string.
     cat > "$LUA_PATH" <<LUA
+-- bad_status lives at top level so it exists in BOTH the worker-
+-- thread Lua state (where response() writes) AND the master state
+-- (where done() reads). Defining it inside init() leaks it to
+-- workers only and panics done() with "table expected, got nil".
+bad_status = {}
 local thread_count = 0
 function setup(thread)
     thread:set("tid", thread_count)
@@ -161,7 +166,6 @@ function init(args)
     -- Each thread seeds its RNG independently so threads do not march
     -- in lock-step through the same sequence of seqs.
     math.randomseed(os.time() + (tid or 0) * 1000)
-    bad_status = {}
 end
 function request()
     local seq = math.random(${seq_lo}, ${seq_hi})
