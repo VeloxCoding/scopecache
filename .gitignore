@@ -22,10 +22,14 @@
 # tracked exceptions below ship with the repo:
 #   - drain_events.sh: StartSubscriber bridge reference, cited from
 #     docs/scopecache-core-rfc.md §7.11.
+#   - install_caddyscope.sh: one-shot fresh-VPS installer (Ubuntu/
+#     Debian) that downloads the caddyscope binary from a GitHub
+#     release, sets up the systemd unit, and verifies /help.
 #   - install_and_benchmark.sh: client-side helper to seed a running
 #     scopecache instance with a small dataset and report throughput.
 /scripts/*
 !/scripts/drain_events.sh
+!/scripts/install_caddyscope.sh
 !/scripts/install_and_benchmark.sh
 # go.work + go.work.sum bind root + caddymodule for local dev (so a single
 # `go test ./...` run sees both modules without round-tripping through
