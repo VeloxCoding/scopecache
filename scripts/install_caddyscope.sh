@@ -2,14 +2,18 @@
 # install_caddyscope.sh — fresh-VPS install of Caddy + scopecache module.
 #
 # Performs the full install in one shot, idempotently:
-#   0. apt update + apt upgrade
 #   1. Download caddyscope binary + SHA256SUMS from GitHub Releases,
 #      verify checksum, move into /usr/local/bin/caddy
 #   2. Create caddy:caddy system user/group (skip if already present)
 #   3. Write /etc/caddy/Caddyfile (back up any existing one first)
 #   4. Write /etc/systemd/system/caddy.service, reload + enable + start
 #   5. Smoke-test http://localhost:<PORT>/help
-#   6. apt install -y wrk (so run_benchmark.sh can run later)
+#   6. apt update + apt install -y wrk (so run_benchmark.sh can run later)
+#
+# This script does NOT run `apt upgrade` — that can take many minutes
+# on a stale VPS and is the operator's job, not the installer's. Run
+# `sudo apt update && sudo apt upgrade` separately if you want to
+# bring your system fully up to date before installing.
 #
 # Usage:
 #   sudo ./install_caddyscope.sh
@@ -64,13 +68,6 @@ if ! command -v curl >/dev/null 2>&1; then
     echo "curl is required and not installed; install it first (apt install -y curl)" >&2
     exit 1
 fi
-
-# --- step 0: apt update + upgrade ----------------------------------
-
-echo "[0/6] apt update + apt upgrade"
-apt-get update -qq
-DEBIAN_FRONTEND=noninteractive apt-get -y -qq -o Dpkg::Options::=--force-confdef \
-    -o Dpkg::Options::=--force-confold upgrade
 
 # --- step 1: download + verify binary ------------------------------
 
@@ -203,7 +200,12 @@ fi
 
 # --- step 6: install wrk -------------------------------------------
 
-echo "[6/6] installing wrk (benchmark tool)"
+# apt-get update lives here, NOT at the top of the script: nothing
+# else in this installer touches apt, and a stale apt cache from a
+# never-used VPS would only cause the wrk install in this very step
+# to fail with "Package wrk has no installation candidate".
+echo "[6/6] apt update + installing wrk (benchmark tool)"
+apt-get update -qq
 DEBIAN_FRONTEND=noninteractive apt-get install -y -qq wrk
 
 # --- done ----------------------------------------------------------
