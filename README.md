@@ -70,7 +70,7 @@ Apart from the two convenience features mentioned above, the core is intentional
 
 ### ScopeCache 'internals'
 
-ScopeCache deliberately limits filtering to three axes: `scope`, `id`, and `seq`. There is no query language, no joins, and no payload inspection (apart from JSON + UTF-8 validity checks at write time).
+ScopeCache deliberately limits filtering to three axes: `scope`, `id`, and `seq`. There is no query language, no joins, and no payload inspection (apart from JSON + UTF-8 validity checks at write time). There is no TTL system and when the configured memory limit is reached, ScopeCache fails writes explicitly with HTTP `507 Insufficient Storage` instead of silently deleting data in the background. 
 
 Internally, the top-level store is a 32-shard map keyed by scope name. A write may briefly touch a shard-level lock to find the
 scope, but after that the operation is handled by the scope's own buffer. That means unrelated scopes do not block each other during the actual data mutation.
@@ -84,6 +84,8 @@ Reads share a per-scope read-lock so multiple lookups run concurrently. On multi
 That performance is not accidental. It comes from both performance tuning and a deliberately small core: no query language, no joins, no payload inspection, and no application logic in the hot path. ScopeCache stays fast and predictable by rejecting features that would add flexibility at the cost of speed, simplicity, or stability.
 
 This limitation of the core functionality of ScopeCache is intentional: ScopeCache keeps the core small, stable, and predictable, while leaving higher-level behavior to modules and addons. The core and the two features are heavely tested, validated, optimized and benchmarked. 
+
+P.S. These number refers only to the internal in-process lookup, not to a full request through Caddy's routing, request parsing, response writing.  
 
 ### Addons
 
@@ -100,6 +102,8 @@ The gateway layer exists for three concrete reasons:
 The result: the core stays stable, fast, and predictable, while ScopeCache remains straightforward to extend for application-specific needs.
 
 For example, an authorization addon can validate a bearer token, map it to the scopes that token may access, and then return only the items from those allowed scopes — all without touching anything below `*Gateway`.
+
+There is no TTL system built into ScopeCache, but it is easy to implement lifecycle or draining behavior outside the core. ScopeCache includes a built-in subscription model, allowing an external process to be notified when new items are appended. That process can drain the new items, process them, and persist them elsewhere. Depending on the use case, draining can happen immediately or after a short delay — for example 0.5 seconds or longer — so items can be processed in batches.
 
 So, ScopeCache is built around a modular architecture. Addons interact with the cache through a clear built-in gateway API, instead of reaching directly into the internal core.
 For example, an authorization/access addon had been built that validates a bearer token and then returns only the items from the scopes that token is allowed to access.
