@@ -75,16 +75,17 @@ DEBIAN_FRONTEND=noninteractive apt-get -y -qq -o Dpkg::Options::=--force-confdef
 # --- step 1: download + verify binary ------------------------------
 
 if [ "$VERSION" = "latest" ]; then
-    # GitHub redirects /releases/latest to the newest tag URL; the tag
-    # is the trailing path component. NOTE: do NOT pass -L here — once
-    # curl follows the redirect, the final request is no longer a
-    # redirect and %{redirect_url} comes back empty. We want the raw
-    # 302 Location header.
-    VERSION=$(curl -fsS -o /dev/null -w '%{redirect_url}' \
-        "https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/latest" \
-        | sed 's|.*/tag/||')
+    # GitHub's REST API returns a JSON object with "tag_name": "vX.Y.Z"
+    # for the most recent release. Pull the tag with sed (no jq
+    # dependency). Unauthenticated rate limit is 60/h per IP — fine
+    # for an install script.
+    VERSION=$(curl -fsSL \
+        "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/latest" \
+        | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' \
+        | head -n1)
     if [ -z "$VERSION" ]; then
         echo "could not auto-detect the latest release tag" >&2
+        echo "  manually pin a version: VERSION=v0.8.X sudo $0" >&2
         exit 1
     fi
     echo "[1/6] downloading caddyscope-linux-${GO_ARCH} (resolved latest = ${VERSION})"
