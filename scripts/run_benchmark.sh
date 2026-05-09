@@ -25,7 +25,7 @@
 #   SCOPE=benchmark          scope name to write into / read from
 #   WRK_THREADS=1            wrk worker threads in step 2
 #   WRK_CONNECTIONS=50       wrk concurrent connections in step 2
-#   WRK_DURATION=10s         wrk run duration in step 2
+#   WRK_DURATION=5s          wrk run duration in step 2
 #   STEPS=1,2                comma-separated step list (e.g. STEPS=2 to
 #                            skip the fill and only run wrk against an
 #                            already-populated scope)
@@ -48,7 +48,7 @@ COUNT="${COUNT:-50000}"
 SCOPE="${SCOPE:-benchmark}"
 WRK_THREADS="${WRK_THREADS:-1}"
 WRK_CONNECTIONS="${WRK_CONNECTIONS:-50}"
-WRK_DURATION="${WRK_DURATION:-10s}"
+WRK_DURATION="${WRK_DURATION:-5s}"
 STEPS="${STEPS:-1,2}"
 
 step_enabled() {
@@ -142,7 +142,7 @@ if step_enabled 2; then
         exit 1
     fi
 
-    echo "step 2: GET /get?scope=${SCOPE}&seq=<random in ${seq_lo}..${seq_hi}>"
+    echo "step 2: Running for ${WRK_DURATION}: GET /get?scope=${SCOPE}&seq=<random>"
     echo "  wrk -t${WRK_THREADS} -c${WRK_CONNECTIONS} -d${WRK_DURATION} --latency"
     echo
 

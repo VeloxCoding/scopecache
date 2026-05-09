@@ -59,7 +59,7 @@ What it does:
 
 1. Fills scope `benchmark` with 50,000 small items via one bulk
    `/warm` request (typically <100 ms).
-2. Runs a 10-second `wrk` workload against
+2. Runs a 5-second `wrk` workload against
    `/get?scope=benchmark&seq=<random>` and reports req/sec plus
    latency p50, p95, max.
 
@@ -87,5 +87,5 @@ Available env vars:
 | `SCOPE`           | `benchmark`        | Scope name to write into / read from                 |
 | `WRK_THREADS`     | `1`                | wrk worker threads                                   |
 | `WRK_CONNECTIONS` | `50`               | wrk concurrent connections                           |
-| `WRK_DURATION`    | `10s`              | wrk run duration                                     |
+| `WRK_DURATION`    | `5s`               | wrk run duration                                     |
 | `STEPS`           | `1,2`              | Comma-separated step list (e.g. `STEPS=2`)           |
