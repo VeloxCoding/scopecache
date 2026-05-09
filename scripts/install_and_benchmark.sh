@@ -198,8 +198,11 @@ LUA
 
     # Parse fields. Each awk line bails on first match (exit) so this
     # is one stream-pass per field; cheap.
-    lat_avg=$(printf '%s\n' "$wrk_out" | awk '/^[[:space:]]+Latency[[:space:]]/ {print $2; exit}')
-    lat_max=$(printf '%s\n' "$wrk_out" | awk '/^[[:space:]]+Latency[[:space:]]/ {print $4; exit}')
+    # The `Latency` filter also requires $2 to start with a digit so it
+    # matches the data row ("Latency 499.50us 635.30us 13.96ms 91.70%")
+    # and not the "Latency Distribution" header that appears later.
+    lat_avg=$(printf '%s\n' "$wrk_out" | awk '/^[[:space:]]+Latency[[:space:]]/ && $2 ~ /^[0-9]/ {print $2; exit}')
+    lat_max=$(printf '%s\n' "$wrk_out" | awk '/^[[:space:]]+Latency[[:space:]]/ && $2 ~ /^[0-9]/ {print $4; exit}')
     rps_avg=$(printf '%s\n' "$wrk_out" | awk '/^[[:space:]]+Req\/Sec[[:space:]]/ {print $2; exit}')
     p50=$(printf '%s\n'    "$wrk_out" | awk '/^[[:space:]]+50%[[:space:]]/ {print $2; exit}')
     p95_us=$(printf '%s\n' "$wrk_out" | awk '/^P95_US[[:space:]]/ {print $2; exit}')
