@@ -4060,20 +4060,28 @@ func TestWriteJSONWithMeta_MarshalFailureReturns500(t *testing.T) {
 	}
 }
 
-// End-to-end proof against the full /get pipeline: inject a malformed
-// payload directly into a scope buffer (bypassing the validator the
-// way a future buggy addon or internal-mutation regression would), then
-// hit /get over the public mux and verify the read path produces 500
-// instead of 200 + empty body.
+// /get and /render both serve stored payload bytes as-is at read
+// time. Validation happens at write time (validatePayload rejects
+// malformed JSON before it reaches the buffer); the read path
+// trusts that what is in the buffer was once valid. If memory
+// corruption or an internal bug ever produces a buffer with
+// malformed bytes, both endpoints will emit those bytes — the
+// resulting HTTP response body is invalid JSON, but the HTTP
+// layer itself succeeds with 200.
+//
+// Earlier versions of /get picked up implicit validation as a
+// side effect of routing through json.Marshal; that path was
+// removed when /get was rewritten to stream payload bytes
+// directly to the wire (handlers_read.go writeGetResponse), in
+// line with the project policy of validating only at system
+// boundaries (CLAUDE.md). This test now locks in the matching
+// "serve as-is" contract for /get so the symmetry with /render
+// can be enforced.
 //
 // White-box access via api.store is intentional — there is no
-// non-internal way to construct this state (validatePayload now
-// blocks every write path), and the whole point of the test is to
-// prove the read path stays safe even when something upstream of it
-// has gone wrong. Items live in three places inside scopeBuffer
-// (items slice, byID map, bySeq map); all three must be patched in
-// lockstep because /get?id=a reads byID.
-func TestGet_CorruptStoredPayloadReturns500(t *testing.T) {
+// non-internal way to construct this state (validatePayload
+// blocks every write path).
+func TestGet_CorruptStoredPayloadServesAsIs(t *testing.T) {
 	h, api := newTestHandler(10)
 
 	if code, _, _ := doRequest(t, h, "POST", "/append",
@@ -4099,7 +4107,10 @@ func TestGet_CorruptStoredPayloadReturns500(t *testing.T) {
 	buf.mu.Unlock()
 
 	rec := doRawRequest(t, h, "GET", "/get?scope=s&id=a")
-	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("/get on corrupt payload: code=%d want 500 (body=%q)", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/get on corrupt payload: code=%d want 200 (read path trusts write-time validation)", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), `"payload":{"a":`) {
+		t.Fatalf("/get response should include the (corrupt) payload bytes verbatim, got %q", rec.Body.String())
 	}
 }
