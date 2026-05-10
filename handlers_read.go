@@ -208,30 +208,97 @@ func appendItemJSON(buf []byte, item Item) []byte {
 	return append(buf, '}')
 }
 
-// appendKVValue handles the value types extras can carry on the
-// list-read envelope. /tail's "offset" is an int; the switch
-// cases below cover every type the current callers pass. Anything
-// else falls through to json.Marshal so future extras don't
-// silently break the wire format.
+// appendKVValue encodes a value as JSON into buf, fast-path for the
+// scalar types orderedFields carries across read + write envelopes.
+// Coverage: nil/bool/int/int64/uint64/string/MB plus the two
+// in-package structs that appear nested inside response envelopes
+// (writeAck for /append + /upsert, []ScopeCapacityOffender for the
+// 507 capacity errors). Any other type falls through to json.Marshal
+// so the wire format stays byte-for-byte identical to the previous
+// path even if a future caller passes something exotic.
 func appendKVValue(buf []byte, v interface{}) []byte {
 	switch t := v.(type) {
+	case nil:
+		return append(buf, `null`...)
+	case bool:
+		if t {
+			return append(buf, `true`...)
+		}
+		return append(buf, `false`...)
 	case int:
 		return strconv.AppendInt(buf, int64(t), 10)
 	case int64:
 		return strconv.AppendInt(buf, t, 10)
 	case uint64:
 		return strconv.AppendUint(buf, t, 10)
-	case bool:
-		if t {
-			return append(buf, `true`...)
-		}
-		return append(buf, `false`...)
 	case string:
 		return appendJSONString(buf, t)
+	case MB:
+		// Matches MB.MarshalJSON's fmt.Sprintf("%.4f", v/1048576) byte-for-byte.
+		return strconv.AppendFloat(buf, float64(t)/1048576.0, 'f', 4, 64)
+	case writeAck:
+		return appendWriteAckJSON(buf, t)
+	case []ScopeCapacityOffender:
+		return appendOffendersJSON(buf, t)
 	default:
 		b, _ := json.Marshal(v)
 		return append(buf, b...)
 	}
+}
+
+// appendWriteAckJSON matches writeAck's struct-tag-derived JSON
+// shape: Scope/ID/Seq are dropped when zero-valued, Ts is always
+// emitted. Mirrors what json.Marshal(writeAck{...}) produces.
+func appendWriteAckJSON(buf []byte, a writeAck) []byte {
+	buf = append(buf, '{')
+	first := true
+	if a.Scope != "" {
+		buf = append(buf, `"scope":`...)
+		buf = appendJSONString(buf, a.Scope)
+		first = false
+	}
+	if a.ID != "" {
+		if !first {
+			buf = append(buf, ',')
+		}
+		buf = append(buf, `"id":`...)
+		buf = appendJSONString(buf, a.ID)
+		first = false
+	}
+	if a.Seq != 0 {
+		if !first {
+			buf = append(buf, ',')
+		}
+		buf = append(buf, `"seq":`...)
+		buf = strconv.AppendUint(buf, a.Seq, 10)
+		first = false
+	}
+	if !first {
+		buf = append(buf, ',')
+	}
+	buf = append(buf, `"ts":`...)
+	buf = strconv.AppendInt(buf, a.Ts, 10)
+	return append(buf, '}')
+}
+
+// appendOffendersJSON serialises the scope-capacity 507 body. Each
+// offender has all three fields (no omitempty), matching what
+// json.Marshal would produce.
+func appendOffendersJSON(buf []byte, offenders []ScopeCapacityOffender) []byte {
+	buf = append(buf, '[')
+	for i, o := range offenders {
+		if i > 0 {
+			buf = append(buf, ',')
+		}
+		buf = append(buf, `{"scope":`...)
+		buf = appendJSONString(buf, o.Scope)
+		buf = append(buf, `,"count":`...)
+		buf = strconv.AppendInt(buf, int64(o.Count), 10)
+		buf = append(buf, `,"cap":`...)
+		buf = strconv.AppendInt(buf, int64(o.Cap), 10)
+		buf = append(buf, '}')
+	}
+	return append(buf, ']')
 }
 
 func (api *API) handleHead(w http.ResponseWriter, r *http.Request) {

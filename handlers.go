@@ -4,8 +4,9 @@
 //     responder family: badRequest, conflict, scopeFull, storeFull,
 //     methodNotAllowed)
 //   - body decoding (decodeBody)
-//   - response shaping (orderedFields type + writeJSONWithDuration /
-//     writeJSONWithMeta / writeJSONWithMetaCap / marshalWithApproxSize)
+//   - response shaping (orderedFields type + writeJSONWithDuration,
+//     which builds the envelope manually via appendKVValue from
+//     handlers_read.go)
 //   - common request parsers (parseLookupTarget, parseScopeLimit)
 //   - mux registration (RegisterRoutes)
 //
@@ -20,7 +21,6 @@
 package scopecache
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
 	"io"
@@ -125,143 +125,38 @@ type kv struct {
 	V interface{}
 }
 
-func (o orderedFields) MarshalJSON() ([]byte, error) {
-	var buf bytes.Buffer
-	buf.WriteByte('{')
-	for i, f := range o {
-		if i > 0 {
-			buf.WriteByte(',')
-		}
-		key, err := json.Marshal(f.K)
-		if err != nil {
-			return nil, err
-		}
-		buf.Write(key)
-		buf.WriteByte(':')
-		val, err := json.Marshal(f.V)
-		if err != nil {
-			return nil, err
-		}
-		buf.Write(val)
-	}
-	buf.WriteByte('}')
-	return buf.Bytes(), nil
-}
-
-// marshalFailureBody is the safe envelope written when a response payload
-// fails to marshal. Pre-encoded so the error path itself cannot fail.
-var marshalFailureBody = []byte(`{"ok":false,"error":"the response failed to marshal"}` + "\n")
-
 func writeJSONWithDuration(w http.ResponseWriter, code int, payload orderedFields, started time.Time) {
-	payload = append(payload, kv{"duration_us", time.Since(started).Microseconds()})
-	// Marshal BEFORE WriteHeader so a marshal failure can still emit a clean
-	// 500 — the streaming `json.NewEncoder(w).Encode(payload)` shape this
-	// replaces would commit `code` (typically 200), start writing, then
-	// silently truncate when it hit a bad value, producing "200 + empty
-	// body" instead of a real error response.
+	// Manual envelope build — replaces the json.Marshal + reflect path.
+	// Each kv goes through appendKVValue (handlers_read.go), which has
+	// fast paths for every value type the write-endpoint envelopes
+	// carry (bool/int/int64/uint64/string/MB/writeAck/offenders) and
+	// falls through to json.Marshal for unknown types so the wire
+	// format stays byte-for-byte identical to the previous behaviour.
 	//
-	// In practice the only payload value that can fail today is a
-	// json.RawMessage holding malformed bytes; validatePayload now blocks
-	// that on the write paths (see validation.go), but the read path stays
-	// defensive in case a future addon, store-internal mutation, or
-	// reintroduced bug puts invalid bytes back into a stored Item.Payload.
-	body, err := json.Marshal(payload)
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		_, _ = w.Write(marshalFailureBody)
-		return
+	// duration_us is appended last and inline rather than via the
+	// orderedFields-append-then-marshal pattern so the int conversion
+	// doesn't need to flow through interface{} boxing.
+	body := make([]byte, 0, 192)
+	body = append(body, '{')
+	for i, kv := range payload {
+		if i > 0 {
+			body = append(body, ',')
+		}
+		body = append(body, '"')
+		body = append(body, kv.K...)
+		body = append(body, '"', ':')
+		body = appendKVValue(body, kv.V)
 	}
+	if len(payload) > 0 {
+		body = append(body, ',')
+	}
+	body = append(body, `"duration_us":`...)
+	body = strconv.AppendInt(body, time.Since(started).Microseconds(), 10)
+	body = append(body, '}', '\n')
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(code)
 	_, _ = w.Write(body)
-	_, _ = w.Write([]byte("\n"))
-}
-
-// marshalWithApproxSize is the shared splice helper used by
-// writeJSONWithMeta and writeJSONWithMetaCap. It marshals payload,
-// then appends a self-referential approx_response_mb field that
-// reports the body's own byte length back to the client. Returns
-// the spliced bytes plus the duration_us-augmented payload (the
-// caller may need it for a fallback path on marshal failure).
-//
-// Single-marshal + patch: marshal the body once, then splice in the
-// size field just before the closing '}'. Self-referential — the
-// size includes the field's own bytes — but converges in 1-2
-// iterations because MB has 4-decimal precision (0.0001 MiB ≈ 104
-// bytes) and the patch only adds ~30 bytes total.
-func marshalWithApproxSize(payload orderedFields, started time.Time) ([]byte, orderedFields, error) {
-	payload = append(payload, kv{"duration_us", time.Since(started).Microseconds()})
-	bodyBytes, err := json.Marshal(payload)
-	if err != nil {
-		return nil, payload, err
-	}
-
-	// bodyBytes ends in '}'. Strip it, append `,"approx_response_mb":N.NNNN}`.
-	// Iterate so the reported size includes the bytes we are about to add.
-	const fieldKey = `,"approx_response_mb":`
-	finalSize := len(bodyBytes) + len(fieldKey) + 8 // initial guess: 8-byte value
-	var valueBytes []byte
-	for i := 0; i < 3; i++ {
-		v, mErr := json.Marshal(MB(finalSize))
-		if mErr != nil {
-			break
-		}
-		valueBytes = v
-		candidate := len(bodyBytes) - 1 + len(fieldKey) + len(valueBytes) + 1
-		if candidate == finalSize {
-			break
-		}
-		finalSize = candidate
-	}
-
-	out := make([]byte, 0, finalSize+1)
-	out = append(out, bodyBytes[:len(bodyBytes)-1]...)
-	out = append(out, fieldKey...)
-	out = append(out, valueBytes...)
-	out = append(out, '}', '\n')
-
-	return out, payload, nil
-}
-
-// writeJSONWithMeta is writeJSONWithDuration plus an approx_response_mb
-// field. Used on read-item endpoints whose response size is bounded by
-// the operation (e.g. /get is single-item). For limit-scaled endpoints
-// (/head, /tail, /scopelist) use writeJSONWithMetaCap instead, which
-// rejects oversized bodies up-front.
-func writeJSONWithMeta(w http.ResponseWriter, code int, payload orderedFields, started time.Time) {
-	out, augmented, err := marshalWithApproxSize(payload, started)
-	if err != nil {
-		// orderedFields encoding cannot fail in practice (we control every
-		// value type); fall through to the simpler writer if it ever does.
-		writeJSONWithDuration(w, code, augmented[:len(augmented)-1], started)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(code)
-	_, _ = w.Write(out)
-}
-
-// writeJSONWithMetaCap is writeJSONWithMeta with a per-response byte
-// cap baked in. Used on /head, /tail and /scopelist — endpoints
-// whose response can grow with a limit × per-row product. Marshals
-// once, checks against maxBytes, and either emits the response or
-// replaces it with a 507 envelope.
-func writeJSONWithMetaCap(w http.ResponseWriter, code int, payload orderedFields, started time.Time, maxBytes int64) {
-	out, augmented, err := marshalWithApproxSize(payload, started)
-	if err != nil {
-		writeJSONWithDuration(w, code, augmented[:len(augmented)-1], started)
-		return
-	}
-
-	if int64(len(out)) > maxBytes {
-		responseTooLarge(w, started, int64(len(out)), maxBytes)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(code)
-	_, _ = w.Write(out)
 }
 
 func badRequest(w http.ResponseWriter, started time.Time, message string) {

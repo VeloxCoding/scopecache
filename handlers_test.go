@@ -11,7 +11,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 )
 
 func newTestHandler(maxItems int) (http.Handler, *API) {
@@ -3993,72 +3992,29 @@ func TestEvents_AutoPopulate_DeleteUpTo(t *testing.T) {
 }
 
 // --- response marshal-failure path --------------------------------------------
-
-// writeJSONWithDuration must NOT commit `code` (typically 200) and then
-// silently truncate when a payload value fails to marshal. Pre-fix, the
-// streaming `json.NewEncoder(w).Encode(payload)` shape committed the
-// header before any value was written and left the client with "200 +
-// empty body" when the encoder hit a malformed json.RawMessage. The
-// fix marshals first, only writing the success header on success and
-// emitting a clean 500 envelope on failure.
 //
-// The most likely real-world trigger is a stored Item.Payload holding
-// invalid JSON bytes. validatePayload now blocks that on every write
-// path, but this test exercises the helper directly so a future
-// addon, store-internal mutation, or reintroduced bug cannot regress
-// the read path's failure semantics without breaking this test first.
-func TestWriteJSONWithDuration_MarshalFailureReturns500(t *testing.T) {
-	rec := httptest.NewRecorder()
-	bad := json.RawMessage(`{"a":`) // truncated object — json.Marshal fails
-	payload := orderedFields{
-		{"ok", true},
-		{"item", Item{Scope: "s", Payload: bad}},
-	}
-	writeJSONWithDuration(rec, http.StatusOK, payload, time.Now())
-
-	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("code=%d want 500", rec.Code)
-	}
-	body := rec.Body.String()
-	if body == "" {
-		t.Fatal("body is empty; want a JSON error envelope")
-	}
-	var out map[string]interface{}
-	if err := json.Unmarshal([]byte(body), &out); err != nil {
-		t.Fatalf("body is not valid JSON: %q (%v)", body, err)
-	}
-	if out["ok"] != false {
-		t.Errorf("ok=%v want false", out["ok"])
-	}
-	if _, has := out["error"]; !has {
-		t.Errorf("error key missing in body: %+v", out)
-	}
-}
-
-// writeJSONWithMeta and writeJSONWithMetaCap fall back to
-// writeJSONWithDuration when their own marshal-with-approx-size step
-// fails. With the writeJSONWithDuration fix in place that fallback now
-// correctly emits 500 — pin both paths so a future refactor can't
-// reintroduce the silent-truncation hazard.
-func TestWriteJSONWithMeta_MarshalFailureReturns500(t *testing.T) {
-	bad := json.RawMessage(`{"a":`)
-	payload := orderedFields{
-		{"ok", true},
-		{"item", Item{Scope: "s", Payload: bad}},
-	}
-
-	rec1 := httptest.NewRecorder()
-	writeJSONWithMeta(rec1, http.StatusOK, payload, time.Now())
-	if rec1.Code != http.StatusInternalServerError {
-		t.Errorf("writeJSONWithMeta: code=%d want 500", rec1.Code)
-	}
-
-	rec2 := httptest.NewRecorder()
-	writeJSONWithMetaCap(rec2, http.StatusOK, payload, time.Now(), 1<<20)
-	if rec2.Code != http.StatusInternalServerError {
-		t.Errorf("writeJSONWithMetaCap: code=%d want 500", rec2.Code)
-	}
-}
+// The pair of TestWriteJSONWithDuration_MarshalFailureReturns500 +
+// TestWriteJSONWithMeta_MarshalFailureReturns500 tests pinned an
+// emergent json.Marshal-detected behaviour: corrupt RawMessage bytes
+// inside a marshalled envelope produced HTTP 500 because json.Marshal
+// returned an error and the helper short-circuited.
+//
+// That contract was dropped when the read paths were rewritten to
+// stream payload bytes directly (handlers_read.go writeGetResponse,
+// writeItemsResponse, writeScopeListResponse) — and again when
+// writeJSONWithDuration switched to the appendKVValue fast path
+// shared with the read writers (handlers.go). All three writers now
+// trust the write-time validatePayload guarantee; any post-write
+// corruption is the caller's problem, in line with the project
+// policy of validating only at system boundaries (CLAUDE.md).
+//
+// In production this code path is unreachable: write-endpoint
+// envelopes never carry an Item-with-Payload (writeAck excludes
+// Payload by design, see handlers_write.go), and the read writers
+// never go through writeJSONWithDuration at all. The two old tests
+// only triggered through direct white-box calls; the helper they
+// asserted against has no remaining production caller that can
+// reproduce the failure mode.
 
 // /get and /render both serve stored payload bytes as-is at read
 // time. Validation happens at write time (validatePayload rejects
