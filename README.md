@@ -4,7 +4,7 @@ ScopeCache is an in-memory cache that runs inside Caddy. It lets Caddy serve sel
 
 ScopeCache works standalone over plain HTTP, for example over a Unix socket, from any programming language. But it is designed to shine as a Caddy module: when installed inside Caddy, ScopeCache runs in the same process as the webserver, allowing Caddy to serve ScopeCache data directly from memory.
 
-This avoids the usual request path through separate application and storage processes on requests, such as PHP, Node.js, Redis, or a database. In benchmark tests, this direct in-process path served data about 7× faster than routing the same request through Node.js and Redis, even though all services were installed on the same server.
+This avoids the usual request path through separate application and storage processes on requests, such as PHP, Node.js, Redis, or a database. In benchmark tests, this direct in-process path served data about 9× faster than routing the same request through Node.js and Redis, even though all services were installed on the same server.
 
 Redis - and similar in-memory data stores - are fast by themselve. But a typical cache 'read' is not just a Redis memory lookup. The request first moves from the webserver into an application process, where a Redis client sends a command to the Redis process over TCP or a Unix socket. Redis returns the data to the application, which then builds the HTTP response and passes it back to the webserver. ScopeCache avoids this roundtrip by running inside Caddy itself.
 
@@ -26,10 +26,12 @@ ScopeCache can also act as a write buffer, with built-in support for change noti
 
 ## Why ScopeCache Exists
 
+### lightweight inmem datastore
 ScopeCache targets workloads where an application needs a hot, scope-addressed views in memory rather than a full general-purpose datastore. Examples include latest thread messages, unread counters, inbox views, view counts, rate-limit buckets, pre-rendered HTML fragments for HTMX-driven interfaces, and small materialized views.
 
 Redis is excellent software, but for these narrow patterns it can be more infrastructure than the workload requires. ScopeCache is built for cases where the cache can safely be disposable, rebuilt from the source of truth, and served directly from the webserver process. Because ScopeCache runs inside Caddy, cache reads can be served directly from the webserver process. For suitable hot-read paths, this can remove the need for a separate cache service and reduce pressure on the application runtime, resulting in fewer moving parts, lower resource usage, and higher HTTP throughput. Redis is typically used in order to reduce pressure on the database, but requests still pass through the application layer. ScopeCache can reduce pressure on both the database and the application layer, because suitable cache reads can be served directly by Caddy.
 
+### FrankenPHP 
 The second reason ScopeCache exists is [FrankenPHP](https://frankenphp.dev/).
 
 FrankenPHP shows how powerful a Caddy-based architecture can be when more of the web stack runs together. Its worker mode improves PHP performance by keeping application workers alive in memory, avoiding much of the overhead of traditional per-request PHP execution.
@@ -39,6 +41,19 @@ FrankenPHP also makes distribution simpler: a PHP application can be packaged in
 But when Redis is required for optimal performance, that distribution model breaks down. Redis remains a separate service that must be run, secured, monitored, and maintained. It also cannot be compiled into the same single binary as the PHP application, web server, and Mercure. 
 
 FrankenPHP reduces one service boundary by bringing the PHP runtime closer to Caddy. ScopeCache applies a related idea to data: keep frequently accessed data inside the web server process and avoid an additional cache-service roundtrip on the read path. Also important: because ScopeCache is a Caddy module, it can be compiled into the same custom FrankenPHP/Caddy binary as Caddy, the PHP runtime, and the SSE hub.
+
+**PHP extensions can be written in Go**
+One important advantage of FrankenPHP’s design is that PHP extensions can be written in Go. That process is surprisingly simple: you write a small Go file with //export_php:function directives, run one generator command, and the annotated Go functions become available in PHP as native function calls.
+
+Because FrankenPHP and Caddy are tightly integrated, Caddy, PHP, and ScopeCache can all run inside the same OS process: one PID, one address space. That matters. A PHP extension written in Go can access ScopeCache through cgo without leaving the process.
+
+The call from Caddy routes to the ScopeCache handler is just a Go function call, not a TCP request. There is no socket, no kernel roundtrip, and no serialization step on either side. This is very different from the conventional setup. In a typical PHP + Redis deployment, PHP runtime and Redis run as separate OS processes with separate address spaces. Every cache lookup has to cross a process boundary and go through protocol-level serialization on both ends.
+
+The performance difference is substantial. A scopecache_get() call from PHP, exposed through the Go extension, takes about 0.3 µs on average. A single PHP-to-Redis lookup that opens and closes its connection takes roughly 581 µs. With a persistent Redis connection, that drops to about 126 µs in steady state.
+
+Even in that best-case Redis scenario, the PHP-to-Redis path is still about 452× slower than the equivalent in-process ScopeCache call. 
+
+To fully unlock the potential of FrankenPHP, you need a datastore like ScopeCache: written in Go, integrated into Caddy, and designed to run in the same process.
 
 ## What it is: Core features and Addons
 
@@ -83,7 +98,37 @@ Apart from the two convenience features mentioned above, the core is intentional
 - **Cleanup:** `delete`, `delete_up_to`, `delete_scope`
 - **Observe:** `stats`, `scopelist`
 
-### ScopeCache 'internals'
+## ScopeCache 'internals'
+
+### The data structure
+The underlying data structure of ScopeCache is deliberately simple. Each scope owns one ordered slice, containing the items in append order, plus lightweight indexes for direct lookup:
+
+```go
+type ScopeBuffer struct {
+    items    []Item              // primary storage, in append order
+    idIndex  map[string]int      // id  → position in items
+    seqIndex map[uint64]int      // seq → position in items
+    mu       sync.RWMutex        // one lock per scope
+}
+```
+
+The slice is the primary storage. It defines the physical order of the data in memory. The indexes exist only to avoid scanning: a lookup by `id` or `seq` becomes a hashmap lookup followed by direct slice access.
+
+That makes direct lookups O(1) on average, while preserving the natural append order of the collection.
+
+A classical key-value store, such as Redis, Memcached, or a plain hashmap, is conceptually built around:
+
+```text
+key → value
+```
+
+Ordering is not part of that basic model. If you want operations such as “give me the 10 newest items”, you usually build that on top with lists, streams, sorted sets, timestamps, or secondary indexes. A key-value store can support ordered access, but ordering is not its natural shape.
+
+ScopeCache is different: order is part of the storage model itself.
+
+Each scope is an ordered collection first, with hashmap indexes around it for fast random access.
+
+### Limited but flexible filtering
 
 ScopeCache deliberately limits filtering to three axes: `scope`, `id`, and `seq`. There is no query language, no joins, and no payload inspection (apart from JSON + UTF-8 validity checks at write time). There is no TTL system and when the configured memory limit is reached, ScopeCache fails writes explicitly with HTTP `507 Insufficient Storage` instead of silently deleting data in the background. 
 
@@ -216,36 +261,14 @@ dataset, 10 runs averaged):
 |---|---:|---:|
 | Caddy → Node.js → Redis (Unix socket) | 30,414 | 1.870 ms |
 | Caddy/FrankenPHP worker → Redis | 30,543 | 1.969 ms |
-| Caddy → scopecache (in-process) | **222,554** | **0.187 ms** |
+| Caddy → scopecache (in-process) | **281,511** | **0.138ms ms** |
 
-Scopecache reaches ~7.3× the throughput of either Redis-backed route.
+Scopecache reaches ~9× the throughput of either Redis-backed route.
 The win is **architectural, not a Redis-vs-scopecache speed comparison**:
 running the cache inside the Caddy process removes the application-runtime hop and the Redis roundtrip from the read path entirely. A
 single in-process `getBySeq` lookup itself takes ~43 ns regardless of
 scope size (hash-map, O(1)) — about 23 million lookups per second per
 core.
-
-### Resource utilization
-
-Higher throughput would not matter if it cost proportionally more CPU and RAM — a leaner route can be scaled horizontally to match. So a separate run captured per-process CPU usage (via `/proc` jiffies) and memory (via `/proc/[pid]/status` RSS) alongside throughput; the per-route ratios sit in one combined table.
-
-| Route | Requests/sec | Server CPU (cores avg) | Req/sec per core | Memory (MiB avg) | Req/sec per MiB |
-|---|---:|---:|---:|---:|---:|
-| Caddy → Node → Redis | 31,452 | 10.52 | ~2,989 | ~292 | ~108 |
-| Caddy → FrankenPHP worker → Redis | 31,451 | 6.67 | ~4,716 | ~71 | ~443 |
-| Caddy → ScopeCache | **227,979** | 10.31 | **~22,121** | ~83 | **~2,747** |
-
-Two findings sit underneath the headline 7.25× throughput gap:
-
-- **Per CPU core**, ScopeCache is ~7.4× more efficient than Node and ~4.7× more efficient than FrankenPHP worker mode.
-- **Per MiB of memory**, ScopeCache is ~25× more efficient than Node → Redis and ~6.2× more than FrankenPHP worker → Redis.
-
-Redis itself was never the bottleneck (0.42 core in the Node route, 0.91 in the FrankenPHP route). Most of the CPU went into the path *around* Redis — Caddy, the application runtime, protocol handling, decoding, response construction. Removing that path is what makes ScopeCache competitive: Caddy answers directly from its own process memory, with no application-runtime hop and no external cache roundtrip.
-
-Full methodology, hardware, container/CPU pinning, and per-percentile
-results in [docs/benchmark_roundtrip.md](docs/benchmark_roundtrip.md).
-
-
 
 ## Status
 
