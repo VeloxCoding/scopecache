@@ -1,10 +1,10 @@
 # ScopeCache
 
-ScopeCache is a lightweight in-process datastore/cache and write buffer for Caddy: a simple, scope-partitioned, ordered datastore built for ultra-fast dynamic reads.
+ScopeCache is a lightweight in-memory datastore/cache and write buffer for Caddy: a simple, scope-partitioned, ordered datastore built for ultra-fast dynamic reads. ScopeCache combines key-value style access with ordered per-scope collections. It runs primarily as a Caddy module, but can also run standalone over a Unix socket.
 
 It stores application data in memory and lets Caddy serve selected reads directly from the web server process. This can reduce pressure on both the database and the application layer.
 
-ScopeCache is not a Redis replacement and not an HTTP response cache. It is an application-managed, scope-addressed materialized-view datastore: your application decides what data is stored, under which scope, and when it is updated or removed.
+ScopeCache is not a Redis replacement and not an HTTP response cache. It is an application-managed datastore organized by scope: your application decides what data is stored, under which scope, and when it is updated or removed.
 
 ## How ScopeCache works
 
@@ -48,7 +48,7 @@ Good examples include:
 - small materialized JSON, HTML, XML, or text views
 - high-frequency events that need to be drained later
 
-The cache is intentionally disposable. Your database remains the source of truth. ScopeCache can be wiped, warmed, or rebuilt at any time.
+The cache is intentionally disposable. Your source of truth lives elsewhere — usually a database, but it can be any external store (a JSON file, in-memory state, an external API). ScopeCache can be wiped, warmed, or rebuilt from it at any time.
 
 ## What ScopeCache is not
 
@@ -70,15 +70,11 @@ A scope is a named partition, similar to a namespace or bucket. Each scope conta
 
 - `scope` — required partition key
 - `id` — optional stable application-owned identifier
-- `seq` — cache-owned sequence number, assigned by ScopeCache
+- `seq` — cache-owned sequence number, monotonically increasing per scope, assigned by ScopeCache on every append
 - `ts` — cache-owned microsecond timestamp, set by ScopeCache on every write; observability only, not searchable and not used for ordering
 - `payload` — required JSON value, treated as opaque application data
 
-ScopeCache does not inspect the payload for filtering or querying. Filtering, addressing, and cursoring only operate on official top-level item fields.
-
-Item IDs are optional. If present, they let the application give an item a stable, meaningful name.
-
-ScopeCache does not interpret those IDs. They are plain strings. Their meaning belongs to the application.
+ScopeCache does not inspect the payload for filtering or querying. Filtering, addressing, and cursoring only operate on official top-level item fields. IDs, when present, are plain strings whose meaning is decided by the application.
 
 ## Limited filtering, flexible access
 
@@ -103,14 +99,12 @@ user:42:unread
 
 ScopeCache then serves that scope quickly. It does not search through payloads to discover it.
 
-Although filtering is limited, ScopeCache remains flexible — and usable for most real-world use cases — through scope and ID naming.
+Although filtering is limited, ScopeCache remains flexible — and usable for most real-world use cases — through scope and ID naming. Instead of searching inside payloads, the application encodes access patterns directly into scope names.
 
-Instead of searching inside payloads, the application encodes access patterns into scope names. For example, unread messages for a user can be stored under `user:123:unread`.
-
-Because each scope is ordered by its cache-assigned `seq`, retrieving the latest 100 unread messages is a native operation:
+Because each scope is ordered by its cache-assigned `seq`, retrieving the latest 100 unread messages for that user is a native operation:
 
 ```text
-/tail?scope=user:123:unread&limit=100
+/tail?scope=user:42:unread&limit=100
 ```
 
 **ScopeCache combines key-value style access with ordered per-scope collections.** Direct lookups by `id` or `seq` behave like simple key-value reads, while the built-in sequence order makes operations such as `tail`, `head`, and `since(seq)` natural core primitives.
@@ -134,7 +128,7 @@ Your application prepares the data and writes it into ScopeCache. Caddy then ser
 
 ### 2. Write buffer
 
-ScopeCache can also buffer high-frequency events such as analytics hits, log lines, chat messages, or counters.
+ScopeCache can also buffer high-frequency events such as analytics hits, log lines, or chat messages.
 
 A worker can drain the buffer in batches using endpoints such as `/tail` and `/delete_up_to`, then process, persist, or forward the data elsewhere.
 
@@ -201,7 +195,7 @@ Because FrankenPHP and Caddy are tightly integrated, Caddy, PHP, and ScopeCache 
 
 That matters. A PHP extension written in Go can call ScopeCache without leaving the process. Compared with a typical PHP + Redis setup, this removes the Redis protocol, socket roundtrip, and separate Redis process from the access path.
 
-There is still a PHP-to-Go extension boundary, including type conversion. But the path is much shorter than a traditional PHP-to-Redis call.
+There is still a PHP-to-Go extension boundary, including type conversion. But the path is much shorter than a typical PHP-to-Redis lookup.
 
 In an initial benchmark, a `scopecache_get()` call exposed through a Go extension took about 0.3 µs on average. A single PHP-to-Redis lookup that opened and closed its connection took roughly 581 µs. With a persistent Redis connection, that dropped to about 126 µs in steady state.
 
@@ -209,7 +203,7 @@ Even in that best-case Redis scenario, the measured PHP-to-Redis access path was
 
 These numbers measure the complete access path for this specific workload. They do not mean that ScopeCache’s internal lookup algorithm is hundreds of times faster than Redis internally.
 
-To fully unlock the potential of FrankenPHP, you need more than an embedded PHP runtime. You also need application data that can live close to the application layer and the web server. ScopeCache is built for that role.
+To fully unlock the potential of FrankenPHP, you need more than an embedded PHP runtime. You also need application data that can live inside the same process as the application code. ScopeCache is built for that role.
 
 ## Internals
 
