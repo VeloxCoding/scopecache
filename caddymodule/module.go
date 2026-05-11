@@ -85,6 +85,10 @@ type Handler struct {
 	api             *scopecache.API
 	mux             *http.ServeMux
 	stopSubscribers func()
+	// gateway holds the *Gateway this Provision created, so Cleanup
+	// can pass it to DeregisterGatewayIf and not clobber a newer
+	// instance's registration during Caddy config reload.
+	gateway *scopecache.Gateway
 }
 
 // CaddyModule returns the Caddy module registration. The ID places this under
@@ -142,6 +146,13 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 		h.SubscriberCommand,
 		caddy.Log().Named("scopecache.subscriber").Sugar().Infof,
 	)
+
+	// Publish the gateway under the conventional "default" name so
+	// in-process consumers (PHP extensions, future Go-side addons)
+	// can hit the same cache instance the HTTP routes serve. See
+	// gateway_registry.go in the core for lifecycle rationale.
+	h.gateway = gw
+	scopecache.RegisterGateway("default", gw)
 	return nil
 }
 
@@ -219,6 +230,15 @@ func (h *Handler) Cleanup() error {
 	if h.stopSubscribers != nil {
 		h.stopSubscribers()
 		h.stopSubscribers = nil
+	}
+	// Deregister from the gateway registry. DeregisterGatewayIf is
+	// the safe form: during Caddy config reload the NEW Provision
+	// has already overwritten our entry by the time we run, and we
+	// must not clobber it. The conditional check matches only if our
+	// own gateway pointer is still the active registration.
+	if h.gateway != nil {
+		scopecache.DeregisterGatewayIf("default", h.gateway)
+		h.gateway = nil
 	}
 	return nil
 }

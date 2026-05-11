@@ -98,6 +98,17 @@ MSYS_NO_PATHCONV=1 docker run --rm \
         # the staged scopecache source, not the published v0.8.22 release.
         sed -i "s|^// replace github.com/VeloxCoding/scopecache => ../\\.\\.|replace github.com/VeloxCoding/scopecache => /work/scopecache|" /work/ext/go.mod
 
+        # Restore the tight //export_php: directive form that the
+        # frankenphp-gen parser requires. The source file on disk has
+        # "// export_php:" (with a space) so it stays gofmt-compliant
+        # and the project pre-commit hook accepts it. gofmt does not
+        # recognise //export_php: as a directive (it is not on the Go
+        # hardcoded whitelist alongside //go:, //line, //export, etc.)
+        # and would otherwise normalise away the very form the
+        # generator needs. This sed un-normalises the staged copy
+        # immediately before extension-init runs.
+        sed -i "s|^// export_php:|//export_php:|g" /work/ext/scopecache_ext.go
+
         echo ">>> [3/4] running frankenphp-gen extension-init"
         cd /work/ext
         # gen_stub.php lives under /usr/local/lib/php/build in the
