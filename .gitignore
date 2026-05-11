@@ -7,6 +7,7 @@
 /CLAUDE_TODO.md
 /CLAUDE_COMMENTS.md
 /CLAUDE_ADDON_DRAINER.md
+/CLAUDE_PHPEXTENSION_IN_GO.md
 /_phase4/
 /init.txt
 /caddy-module-plan.md
@@ -19,6 +20,11 @@
 /bench-results/
 /deploy/Caddyfile.caddyscope.bench-backup
 /Caddyfile.caddyscope.bench-backup
+# Roundtrip benchmark docs: pre-v0.8.19 numbers, need full rewrite
+# after the /get, /head, /tail, /scopelist, write-envelope perf work.
+# Kept locally as reference while the rewrite is pending.
+/docs/benchmark_roundtrip.md
+/docs/benchmark_roundtrip_setup.md
 # Scripts are local-only operator/dev tooling; only the explicitly
 # tracked exceptions below ship with the repo:
 #   - drain_events.sh: StartSubscriber bridge reference, cited from
