@@ -3,21 +3,21 @@
 # compiled in. Two-stage flow:
 #
 #   1. Build (or reuse) the cached generator image defined in
-#      tools/frankenphp-ext-builder/Dockerfile.gen — that image carries
-#      frankenphp-gen + xcaddy + gen_stub.php + the PHP-ZTS headers.
-#      ~3 min first time, then docker's layer cache makes subsequent
-#      runs instant. For a clean rebuild: ./build.sh --rebuild-gen-image
+#      ./Dockerfile.gen — that image carries frankenphp-gen + xcaddy +
+#      gen_stub.php + the PHP-ZTS headers. ~3 min first time, then
+#      docker's layer cache makes subsequent runs instant. For a
+#      clean rebuild: ./build.sh --rebuild-gen-image
 #
-#   2. Run that image once with the scopecache source + this extension
-#      source bind-mounted, generate the cgo wrappers, and `xcaddy
-#      build` the final binary into /out → ./dist/frankenphp on the
-#      host. ~1-3 min warm.
+#   2. Run that image once with the scopecache source + the extension
+#      source (in addons/frankenphp-ext/) bind-mounted, generate the
+#      cgo wrappers, and `xcaddy build` the final binary into /out →
+#      ./dist/frankenphp on the host. ~1-3 min warm.
 #
 # Cold-cold (no cached image, no docker layer cache): ~10-15 min.
 # Warm (image cached, code edited):                   ~1-3 min.
 #
 # Build-chain pitfalls (why every sed-patch below exists): see
-# tools/frankenphp-ext-builder/README.md.
+# README.md in this directory.
 #
 # Usage:
 #   ./build.sh
@@ -27,7 +27,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-BUILDER_DIR="$REPO_ROOT/tools/frankenphp-ext-builder"
+EXT_SRC="$REPO_ROOT/addons/frankenphp-ext"
 DIST_DIR="$SCRIPT_DIR/dist"
 GEN_IMAGE="frankenphp-ext-builder:latest"
 
@@ -44,7 +44,7 @@ fi
 echo ">>> [pre] building (or reusing cached) $GEN_IMAGE"
 # cd + "." as context: avoids Git-Bash on Windows rewriting an absolute
 # /e/... path that the Windows docker daemon can't resolve.
-( cd "$BUILDER_DIR" && MSYS_NO_PATHCONV=1 docker build \
+( cd "$SCRIPT_DIR" && MSYS_NO_PATHCONV=1 docker build \
     "${DOCKER_BUILD_ARGS[@]}" \
     -t "$GEN_IMAGE" \
     -f Dockerfile.gen \
@@ -57,7 +57,7 @@ echo ">>> [pre] building (or reusing cached) $GEN_IMAGE"
 # Windows absolute paths before docker sees them.
 MSYS_NO_PATHCONV=1 docker run --rm \
     -v "$REPO_ROOT:/scopecache:ro" \
-    -v "$SCRIPT_DIR:/ext-src:ro" \
+    -v "$EXT_SRC:/ext-src:ro" \
     -v "$DIST_DIR:/out" \
     -w /work \
     "$GEN_IMAGE" \
@@ -80,8 +80,8 @@ MSYS_NO_PATHCONV=1 docker run --rm \
         # extra build-script logic.
         #
         # NB no apostrophes in these comments — they would close the
-        # outer bash -c "..." single-quoted string. See pitfall #8 in
-        # CLAUDE_PHPEXTENSION_IN_GO.md.
+        # outer bash -c "..." single-quoted string. README.md
+        # pitfall #3 has the full description.
         mkdir -p /work/scopecache /work/ext
         cp /scopecache/go.mod /work/scopecache/
         cp /scopecache/*.go /work/scopecache/
@@ -97,8 +97,8 @@ MSYS_NO_PATHCONV=1 docker run --rm \
         # Undo the gofmt-rewritten directive on the staged copy. Source
         # on disk has "// export_php:" (with space) so gofmt and the
         # pre-commit hook leave it alone; the generator only matches
-        # the tight "//export_php:" form. See pitfall #6(b) in
-        # CLAUDE_PHPEXTENSION_IN_GO.md for the full rationale.
+        # the tight "//export_php:" form. README.md pitfall #1 covers
+        # the full rationale.
         sed -i "s|^// export_php:|//export_php:|g" /work/ext/scopecache_ext.go
 
         echo ">>> [2/3] frankenphp-gen extension-init"
@@ -111,7 +111,7 @@ MSYS_NO_PATHCONV=1 docker run --rm \
         # declared the return as `?string` / `?array` (nullable). That
         # collapses PHP NULL into "" / [], breaking the idiomatic
         # `if ($r === null)` miss check. Patch back to RETURN_NULL().
-        # See pitfall #10 in CLAUDE_PHPEXTENSION_IN_GO.md.
+        # README.md pitfall #2 has the rationale.
         echo "  patching generated C wrappers for ?string/?array NULL semantics"
         for f in /work/ext/build/*.c /work/ext/*.c; do
             [ -f "$f" ] || continue
@@ -143,4 +143,4 @@ echo
 echo "Binary: $DIST_DIR/frankenphp"
 echo
 echo "Validate: $SCRIPT_DIR/smoke.sh"
-echo "Bench:    $SCRIPT_DIR/bench.php (runtime: $BUILDER_DIR/Dockerfile.bench)"
+echo "Bench:    $SCRIPT_DIR/bench.php (runtime: $SCRIPT_DIR/Dockerfile.bench)"

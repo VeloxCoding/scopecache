@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# validate-sprint1.sh — runs validate-sprint1.php against the current
-# dist/frankenphp and reports PASS/FAIL aggregate.
+# validate.sh — runs validate.php against the current dist/frankenphp
+# and reports the PASS/FAIL aggregate. Exit 0 = OVERALL: PASS.
 
 set -euo pipefail
 
@@ -8,10 +8,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="$SCRIPT_DIR/dist/frankenphp"
 HOST_PORT="${VALIDATE_PORT:-18083}"
 RUNTIME_IMAGE="${RUNTIME_IMAGE:-dunglas/frankenphp:1.12-php8}"
-CONTAINER_NAME="scopecache-validate-sprint1"
+CONTAINER_NAME="frankenphp-ext-validate"
 
 if [ ! -f "$BIN" ]; then
-    echo "validate-sprint1: $BIN not found — run ./build.sh first" >&2
+    echo "validate: $BIN not found — run ./build.sh first" >&2
     exit 1
 fi
 
@@ -31,7 +31,7 @@ for i in $(seq 1 100); do
     sleep 0.1
 done
 
-OUT="$(curl -sf --max-time 30 "http://127.0.0.1:$HOST_PORT/validate-sprint1.php" || echo 'curl FAIL')"
+OUT="$(curl -sf --max-time 60 "http://127.0.0.1:$HOST_PORT/validate.php" || echo 'curl FAIL')"
 echo "$OUT"
 
 if echo "$OUT" | grep -q "^OVERALL: PASS$"; then

@@ -1,74 +1,57 @@
-# FrankenPHP Go-extension builder
+# FrankenPHP-extension tooling
 
-Reusable build infrastructure for FrankenPHP extensions written in Go
-against the `//export_php:` directive. Currently consumed by
-[`addons/frankenphp-ext/`](../../addons/frankenphp-ext/) (the scopecache
-extension); the contents are deliberately scopecache-agnostic so a
-second extension in this repo — or in a separate project that vendors
-this directory — can reuse the same pipeline.
+All build / validate / bench tooling for the scopecache FrankenPHP
+extension — the extension itself (the Go source) lives in
+[`addons/frankenphp-ext/`](../../addons/frankenphp-ext/).
+
+## Quick reference
+
+```bash
+./build.sh           # compile dist/frankenphp (~1-3 min warm)
+./smoke.sh           # post-build sanity (~5 s, 8 checks)
+./validate.sh        # full correctness suite (~5-10 s, ~170 checks)
+./bench.sh           # per-call latency + throughput (get/tail/append @ 54 B)
+./bench.sh --sweep   # scopecache_get cost across payload sizes
+```
 
 ## What lives here
 
 | file | role |
 |---|---|
-| [`Dockerfile.gen`](Dockerfile.gen) | Cached generator image — bakes in PHP-ZTS headers + `frankenphp-gen` (built from master so `extension-init` is present) + `xcaddy` + the right `GEN_STUB_SCRIPT` env path. ~3 min cold, instant warm. |
-| [`Dockerfile.bench`](Dockerfile.bench) | Runtime image adding the `phpredis` and `memcached` C-extensions to stock FrankenPHP — for benches that compare the new extension against those backends. |
-| [`README.md`](README.md) | This file — recipe + the catalogue of build-chain pitfalls. |
+| [`Dockerfile.gen`](Dockerfile.gen) | Cached generator image — PHP-ZTS headers + `frankenphp-gen` (built from FrankenPHP master so `extension-init` is present) + `xcaddy` + the right `GEN_STUB_SCRIPT` env path. ~3 min cold, instant warm. |
+| [`Dockerfile.bench`](Dockerfile.bench) | Runtime image adding `phpredis` + `memcached` C-extensions to stock FrankenPHP — reserved for future Redis/Memcached comparison runs. |
+| [`build.sh`](build.sh) | Two-stage build orchestrator: builds the cached image (stage 1), runs it with the addon source + scopecache core bind-mounted to produce `dist/frankenphp` (stage 2). |
+| [`smoke.sh`](smoke.sh) + [`test.php`](test.php) | Post-build sanity — boots the binary, exercises a few cgo calls, asserts the shared `*Gateway` is reachable from PHP. |
+| [`validate.sh`](validate.sh) + [`validate.php`](validate.php) | Full correctness suite covering all 19 //export_php functions: envelope-shape checks, payload-decode round-trips, error envelopes, byte-exact warm/rebuild, etc. |
+| [`bench.sh`](bench.sh) + [`bench.php`](bench.php) | Per-call latency + throughput for the cgo hot path (`scopecache_get` / `_tail` / `_append`). `bench.sh --sweep` reuses the same PHP to chart `_get` cost across payload sizes 54 B → 10 KiB. |
+| [`Caddyfile.bench`](Caddyfile.bench) | Runtime config used by every script above. Exposes both paths in one process: scopecache as a Caddy module on `:8080` plus `php_server` for the bench PHP files. |
+| `dist/` (gitignored) | Build output — `dist/frankenphp` is a FrankenPHP binary with the scopecache extension baked in. |
 
-## Build recipe (two-stage)
+## Build-chain pitfalls
 
-```bash
-# 1. (Re)build the generator image once.
-docker build -t frankenphp-ext-builder:latest \
-    -f tools/frankenphp-ext-builder/Dockerfile.gen \
-    tools/frankenphp-ext-builder/
-
-# 2. Run that image with the extension source bind-mounted. The
-#    container does: stage source → `frankenphp-gen extension-init`
-#    → patch the generated C wrappers → `xcaddy build` → emit the
-#    final binary into /out (host: ./dist/).
-docker run --rm \
-    -v "$PWD:/scopecache:ro" \
-    -v "$PWD/addons/your-ext:/ext-src:ro" \
-    -v "$PWD/addons/your-ext/dist:/out" \
-    -w /work \
-    frankenphp-ext-builder:latest \
-    bash -c '...'  # see addons/frankenphp-ext/build.sh for the live script
-```
-
-The live consumer is [`addons/frankenphp-ext/build.sh`](../../addons/frankenphp-ext/build.sh)
-— it has the `xcaddy --with` arguments wired up for scopecache plus
-the staging steps below.
-
-## Build-chain pitfalls (why every sed-patch is there)
-
-The build script does several non-obvious things. Each works around a
-real bug that bit a build session at some point.
+These are the gotchas every sed-patch in `build.sh` is working around.
+Each survived a build session that fell over on it.
 
 ### 1. `// export_php:` (with space) on disk, `//export_php:` (tight) at build time
 
 `frankenphp-gen extension-init` only matches the **tight** form
-`//export_php:` (no space after `//`). But `gofmt` and most editor
+`//export_php:` (no space after `//`). `gofmt` and most editor
 "format-on-save" rules rewrite that into `// export_php:` (with space)
 because it would otherwise look like an unparseable comment.
 
-**Workaround:** keep `// export_php:` on disk (gofmt-clean, pre-commit
-hooks happy); `sed` it back to `//export_php:` inside the build
-container before invoking the generator.
+**Workaround:** keep `// export_php:` on disk (gofmt-clean), `sed` it
+back to `//export_php:` inside the build container before invoking the
+generator.
 
-```bash
-sed -i 's|^// export_php:|//export_php:|g' /work/ext/your-ext.go
-```
-
-### 2. `RETURN_EMPTY_STRING` / `RETURN_EMPTY_ARRAY` instead of `RETURN_NULL` for `?string` / `?array`
+### 2. `RETURN_EMPTY_STRING` / `RETURN_EMPTY_ARRAY` instead of `RETURN_NULL`
 
 The upstream extgen template emits `RETURN_EMPTY_STRING()` /
 `RETURN_EMPTY_ARRAY()` when the Go function returns `nil`, regardless
 of whether the directive declared the return type as nullable
 (`?string` / `?array`). That collapses PHP `null` into `""` / `[]`,
-breaking the idiomatic `if ($r === null)` miss check.
+breaking idiomatic `if ($r === null)` miss checks.
 
-**Workaround:** post-process the generated C with sed:
+**Workaround:** post-process the generated C:
 
 ```bash
 sed -i -e 's|RETURN_EMPTY_STRING();|RETURN_NULL();|g' \
@@ -79,17 +62,16 @@ sed -i -e 's|RETURN_EMPTY_STRING();|RETURN_NULL();|g' \
 ### 3. Apostrophes inside the outer `bash -c '...'`
 
 `docker run ... bash -c '...'` uses single quotes outside. A single
-apostrophe inside any of the heredoc-style comments closes the outer
-string mid-script — error symptoms range from "permission denied" to
-"unexpected token". Keep all `bash -c` body text apostrophe-free, or
-escape rigorously.
+apostrophe in any of the heredoc-style comments closes the outer
+string mid-script — symptoms range from "permission denied" to
+"unexpected token". Keep `bash -c` body text apostrophe-free.
 
 ### 4. Generator wants `int64`, not `C.zend_long`
 
-PHP `int` parameters must surface as Go `int64` in the generated
-function signature. If the source uses `C.zend_long` instead, the
-generator silently skips the function (no error, the symbol just
-never reaches PHP). Always declare PHP-`int` params as Go `int64`.
+PHP `int` parameters must surface as Go `int64` in the function
+signature. `C.zend_long` silently makes the generator skip the
+function (no error; the symbol just never reaches PHP). Always
+declare PHP-`int` params as Go `int64`.
 
 ### 5. cgo macros need static-inline trampolines
 
@@ -105,9 +87,9 @@ static inline zend_array *sc_zend_new_array(uint32_t size) { return zend_new_arr
 ### 6. `MSYS_NO_PATHCONV=1` on Windows / Git-Bash hosts
 
 Git-Bash on Windows rewrites absolute Linux-style paths like
-`/scopecache` into Windows drive paths (`C:\scopecache`) before
-they reach the docker daemon. Prefix every `docker build` and
-`docker run` with `MSYS_NO_PATHCONV=1` to stop that.
+`/scopecache` into Windows drive paths (`C:\scopecache`) before they
+reach the docker daemon. Prefix every `docker build` and `docker run`
+with `MSYS_NO_PATHCONV=1`.
 
 ### 7. xcaddy build flags for cgo
 
@@ -119,11 +101,10 @@ CGO_LDFLAGS="$(php-config --ldflags) $(php-config --libs)" \
     xcaddy build ...
 ```
 
-- `-D_GNU_SOURCE` is needed because PHP-Zend headers reference
-  `memrchr()` (a GNU extension).
-- `-linkmode=external` is needed because Go 1.26's internal linker
-  chokes when stitching multiple cgo packages
-  (FrankenPHP + your extension) into one binary.
+- `-D_GNU_SOURCE` — PHP-Zend headers reference `memrchr()` (a GNU extension).
+- `-linkmode=external` — Go 1.26's internal linker chokes when
+  stitching multiple cgo packages (FrankenPHP + the extension) into
+  one binary.
 
 ### 8. UAF on string map-keys: write paths must copy
 
@@ -142,21 +123,11 @@ func zendStringCopy(s *C.zend_string) string {
 }
 ```
 
-The scopecache extension does exactly this distinction — `scopecache_get`
-uses the alias, `scopecache_append` uses the copy.
+The scopecache extension does this distinction: `scopecache_get` uses
+the alias, `scopecache_append` uses the copy.
 
 ## Versioning
 
 Both Dockerfiles pin `dunglas/frankenphp:1.12-*`. Bump the tag here
 when you want a newer FrankenPHP / PHP / Go combination, then
-`./build.sh --rebuild-gen-image` in the consuming addon.
-
-## Adding a second extension
-
-1. Create `addons/<your-ext>/` with `your-ext.go` (use
-   `//export_php:function` directives) and a `go.mod` that imports the
-   scopecache `*Gateway` (if needed).
-2. Copy [`addons/frankenphp-ext/build.sh`](../../addons/frankenphp-ext/build.sh)
-   and adjust the `xcaddy --with` lines to point at your packages.
-3. Both extensions can register on the same `frankenphp-ext-builder`
-   image — no per-extension image needed.
+`./build.sh --rebuild-gen-image`.

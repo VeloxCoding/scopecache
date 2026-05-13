@@ -10,8 +10,7 @@
 # (curl /get) hit the SAME *Gateway: the Caddy module registers its
 # gateway under "default" during Provision, and the extension's
 # scopecache_get() looks it up by that name on every call. See
-# gateway_registry.go in the scopecache core for the registry,
-# and CLAUDE_PHPEXTENSION_IN_GO.md for the design rationale.
+# gateway_registry.go in the scopecache core for the registry.
 #
 # `order scopecache before php_server` matches the harness — scopecache
 # matches /get, /append etc. and returns next() for anything else,

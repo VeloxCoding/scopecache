@@ -31,7 +31,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="$SCRIPT_DIR/dist/frankenphp"
 HOST_PORT="${SMOKE_PORT:-18080}"
 RUNTIME_IMAGE="${SMOKE_IMAGE:-dunglas/frankenphp:1.12-php8}"
-CONTAINER_NAME="scopecache-ext-smoke"
+CONTAINER_NAME="frankenphp-ext-smoke"
 
 if [ ! -f "$BIN" ]; then
     # Use -f not -x: on Windows NTFS the host can't see the +x bit
@@ -45,8 +45,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Start the binary inside the runtime image; mount the addon dir as
-# /app so Caddyfile.bench's `root * /app` resolves.
+# Start the binary inside the runtime image; mount this scripts dir
+# as /app so Caddyfile.bench's `root * /app` resolves test.php +
+# dist/frankenphp.
 echo ">>> starting $CONTAINER_NAME on host port $HOST_PORT"
 MSYS_NO_PATHCONV=1 docker run -d --rm \
     --name "$CONTAINER_NAME" \
