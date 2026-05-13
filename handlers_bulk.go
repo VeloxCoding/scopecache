@@ -41,11 +41,12 @@ func (api *API) handleWarm(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSONWithDuration(w, http.StatusOK, orderedFields{
-		{"ok", true},
-		{"count", len(req.Items)},
-		{"replaced_scopes", replacedScopes},
-	}, started)
+	writeJSONResponse(w, http.StatusOK, WarmResponse{
+		OK:             true,
+		Count:          len(req.Items),
+		ReplacedScopes: replacedScopes,
+		DurationUs:     time.Since(started).Microseconds(),
+	})
 }
 
 func (api *API) handleRebuild(w http.ResponseWriter, r *http.Request) {
@@ -84,10 +85,11 @@ func (api *API) handleRebuild(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSONWithDuration(w, http.StatusOK, orderedFields{
-		{"ok", true},
-		{"count", len(req.Items)},
-		{"rebuilt_scopes", rebuiltScopes},
-		{"rebuilt_items", rebuiltItems},
-	}, started)
+	writeJSONResponse(w, http.StatusOK, RebuildResponse{
+		OK:            true,
+		Count:         len(req.Items),
+		RebuiltScopes: rebuiltScopes,
+		RebuiltItems:  rebuiltItems,
+		DurationUs:    time.Since(started).Microseconds(),
+	})
 }

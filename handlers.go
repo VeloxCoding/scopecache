@@ -4,9 +4,9 @@
 //     responder family: badRequest, conflict, scopeFull, storeFull,
 //     methodNotAllowed)
 //   - body decoding (decodeBody)
-//   - response shaping (orderedFields type + writeJSONWithDuration,
-//     which builds the envelope manually via appendKVValue from
-//     handlers_read.go)
+//   - response shaping (writeJSONResponse — json.Marshal of the
+//     typed envelope structs in response_types.go; field declaration
+//     order = wire emission order)
 //   - common request parsers (parseLookupTarget, parseScopeLimit)
 //   - mux registration (RegisterRoutes)
 //
@@ -111,66 +111,51 @@ func decodeBody(w http.ResponseWriter, r *http.Request, max int64, out interface
 	return nil
 }
 
-// orderedFields is a JSON object whose keys are emitted in insertion order.
-// encoding/json sorts map keys alphabetically, which scatters ok, errors,
-// counts, and payloads through the output in whichever order the alphabet
-// dictates. orderedFields lets every response put ok first, config/caps
-// before aggregates, heavy or variable-size fields last, and duration_us
-// at the very end — a shape a human eye (and a log scanner) can read at
-// a glance.
-type orderedFields []kv
-
-type kv struct {
-	K string
-	V interface{}
-}
-
-func writeJSONWithDuration(w http.ResponseWriter, code int, payload orderedFields, started time.Time) {
-	// Manual envelope build — replaces the json.Marshal + reflect path.
-	// Each kv goes through appendKVValue (handlers_read.go), which has
-	// fast paths for every value type the write-endpoint envelopes
-	// carry (bool/int/int64/uint64/string/MB/writeAck/offenders) and
-	// falls through to json.Marshal for unknown types so the wire
-	// format stays byte-for-byte identical to the previous behaviour.
-	//
-	// duration_us is appended last and inline rather than via the
-	// orderedFields-append-then-marshal pattern so the int conversion
-	// doesn't need to flow through interface{} boxing.
-	body := make([]byte, 0, 192)
-	body = append(body, '{')
-	for i, kv := range payload {
-		if i > 0 {
-			body = append(body, ',')
-		}
-		body = append(body, '"')
-		body = append(body, kv.K...)
-		body = append(body, '"', ':')
-		body = appendKVValue(body, kv.V)
+// writeJSONResponse is the canonical envelope-writer for every typed
+// response struct in [response_types.go]. The struct's declared field
+// order — preserved by encoding/json — produces wire output that
+// matches the historical orderedFields path byte-for-byte. Inner
+// types (Item, MB, writeAck, ScopeCapacityOffender) carry their own
+// MarshalJSON or json tags so json.Marshal reproduces their shapes
+// too.
+//
+// Per-endpoint cap-protected reads (/get, /tail, /head, /scopelist)
+// do NOT go through here: they need to append approx_response_mb
+// after the marshalled body and they enforce a per-response byte cap;
+// both live in their own writeXxxResponse builders that consume the
+// typed struct directly.
+//
+// On a marshal error (should be impossible for the typed structs we
+// own, but harmless to defend against) we emit a minimal valid
+// JSON 500 so the connection still returns parseable bytes.
+func writeJSONResponse(w http.ResponseWriter, code int, resp any) {
+	body, err := json.Marshal(resp)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"ok":false,"error":"internal: response marshal failed"}` + "\n"))
+		return
 	}
-	if len(payload) > 0 {
-		body = append(body, ',')
-	}
-	body = append(body, `"duration_us":`...)
-	body = strconv.AppendInt(body, time.Since(started).Microseconds(), 10)
-	body = append(body, '}', '\n')
-
+	body = append(body, '\n')
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(code)
 	_, _ = w.Write(body)
 }
 
 func badRequest(w http.ResponseWriter, started time.Time, message string) {
-	writeJSONWithDuration(w, http.StatusBadRequest, orderedFields{
-		{"ok", false},
-		{"error", message},
-	}, started)
+	writeJSONResponse(w, http.StatusBadRequest, ErrorResponse{
+		OK:         false,
+		Error:      message,
+		DurationUs: time.Since(started).Microseconds(),
+	})
 }
 
 func conflict(w http.ResponseWriter, started time.Time, message string) {
-	writeJSONWithDuration(w, http.StatusConflict, orderedFields{
-		{"ok", false},
-		{"error", message},
-	}, started)
+	writeJSONResponse(w, http.StatusConflict, ErrorResponse{
+		OK:         false,
+		Error:      message,
+		DurationUs: time.Since(started).Microseconds(),
+	})
 }
 
 // scopeFull responds with 507 Insufficient Storage and the full offender list.
@@ -182,11 +167,12 @@ func scopeFull(w http.ResponseWriter, started time.Time, offenders []ScopeCapaci
 	if len(offenders) > 1 {
 		msg = "multiple scopes are at capacity"
 	}
-	writeJSONWithDuration(w, http.StatusInsufficientStorage, orderedFields{
-		{"ok", false},
-		{"error", msg},
-		{"scopes", offenders},
-	}, started)
+	writeJSONResponse(w, http.StatusInsufficientStorage, ScopeCapacityErrorResponse{
+		OK:         false,
+		Error:      msg,
+		Scopes:     offenders,
+		DurationUs: time.Since(started).Microseconds(),
+	})
 }
 
 // storeFull responds with 507 when the aggregate byte cap would be exceeded.
@@ -194,13 +180,14 @@ func scopeFull(w http.ResponseWriter, started time.Time, offenders []ScopeCapaci
 // client can judge how much headroom remains and whether draining one scope
 // will fix the next retry.
 func storeFull(w http.ResponseWriter, started time.Time, e *StoreFullError) {
-	writeJSONWithDuration(w, http.StatusInsufficientStorage, orderedFields{
-		{"ok", false},
-		{"error", "store is at byte capacity"},
-		{"approx_store_mb", MB(e.StoreBytes)},
-		{"added_mb", MB(e.AddedBytes)},
-		{"max_store_mb", MB(e.Cap)},
-	}, started)
+	writeJSONResponse(w, http.StatusInsufficientStorage, StoreCapacityErrorResponse{
+		OK:            false,
+		Error:         "store is at byte capacity",
+		ApproxStoreMB: MB(e.StoreBytes),
+		AddedMB:       MB(e.AddedBytes),
+		MaxStoreMB:    MB(e.Cap),
+		DurationUs:    time.Since(started).Microseconds(),
+	})
 }
 
 // responseTooLarge writes the 507 envelope used by the cap-protected
@@ -214,12 +201,13 @@ func storeFull(w http.ResponseWriter, started time.Time, e *StoreFullError) {
 // and 507 does not roll back. In practice the cap-protected
 // endpoints are read-only, so there is nothing to roll back.
 func responseTooLarge(w http.ResponseWriter, started time.Time, written, cap int64) {
-	writeJSONWithDuration(w, http.StatusInsufficientStorage, orderedFields{
-		{"ok", false},
-		{"error", "the response would exceed the maximum allowed size"},
-		{"approx_response_mb", MB(written)},
-		{"max_response_mb", MB(cap)},
-	}, started)
+	writeJSONResponse(w, http.StatusInsufficientStorage, ResponseTooLargeErrorResponse{
+		OK:               false,
+		Error:            "the response would exceed the maximum allowed size",
+		ApproxResponseMB: MB(written),
+		MaxResponseMB:    MB(cap),
+		DurationUs:       time.Since(started).Microseconds(),
+	})
 }
 
 // methodNotAllowed responds 405 with an Allow header naming the
@@ -229,10 +217,11 @@ func responseTooLarge(w http.ResponseWriter, started time.Time, written, cap int
 // comma-separated list if a future endpoint accepts multiple.
 func methodNotAllowed(w http.ResponseWriter, started time.Time, allowed string) {
 	w.Header().Set("Allow", allowed)
-	writeJSONWithDuration(w, http.StatusMethodNotAllowed, orderedFields{
-		{"ok", false},
-		{"error", "the HTTP method is not allowed for this endpoint"},
-	}, started)
+	writeJSONResponse(w, http.StatusMethodNotAllowed, ErrorResponse{
+		OK:         false,
+		Error:      "the HTTP method is not allowed for this endpoint",
+		DurationUs: time.Since(started).Microseconds(),
+	})
 }
 
 // lookupTarget is the parsed form of /get's and /render's URL query:

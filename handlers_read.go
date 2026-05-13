@@ -22,45 +22,29 @@ import (
 	"time"
 )
 
-// writeItemsHit assembles and writes the success response for a
-// list-returning read endpoint (/head, /tail). HTTP shape + per-
-// response byte cap only — read-heat stamping lives in store.head /
-// store.tail.
-//
-// extra slots between count and truncated so /tail can carry its
-// offset field at the right wire position; /head passes nil. The
-// fixed ok / hit / count / [extra] / truncated / items order is
-// what clients and log scanners see — keep new fields in their
-// correct slot rather than appending.
-func (api *API) writeItemsHit(
-	w http.ResponseWriter,
-	started time.Time,
-	items []Item,
-	truncated bool,
-	extra orderedFields,
-) {
-	if len(items) > 0 {
-		if estimated := estimateMultiItemResponseBytes(items); estimated > api.maxResponseBytes {
+// writeHeadResponse / writeTailResponse are the typed-struct entry
+// points for the list-returning read endpoints. They call the shared
+// writeItemsResponse builder with the right offset slot wired up
+// (/tail carries it, /head does not). Pre-flight cap check applies
+// only on the hit path where items are present.
+func (api *API) writeHeadResponse(w http.ResponseWriter, resp HeadResponse, started time.Time) {
+	if len(resp.Items) > 0 {
+		if estimated := estimateMultiItemResponseBytes(resp.Items); estimated > api.maxResponseBytes {
 			responseTooLarge(w, started, estimated, api.maxResponseBytes)
 			return
 		}
 	}
-	api.writeItemsResponse(w, started, items, truncated, extra)
+	api.writeItemsResponse(w, started, resp.Items, resp.Truncated, nil)
 }
 
-// writeItemsMiss writes the canonical "scope does not exist" response
-// for a list-returning read endpoint. Same field order as
-// writeItemsHit's success path; truncated is always false; items is
-// the sentinel empty slice (not nil — `[]Item{}` marshals as `[]`,
-// nil would marshal as `null` and break clients that iterate). Goes
-// through the same single-buffer writer as the hit path so cap
-// behaviour stays symmetric across hit and miss responses.
-func (api *API) writeItemsMiss(
-	w http.ResponseWriter,
-	started time.Time,
-	extra orderedFields,
-) {
-	api.writeItemsResponse(w, started, nil, false, extra)
+func (api *API) writeTailResponse(w http.ResponseWriter, resp TailResponse, started time.Time) {
+	if len(resp.Items) > 0 {
+		if estimated := estimateMultiItemResponseBytes(resp.Items); estimated > api.maxResponseBytes {
+			responseTooLarge(w, started, estimated, api.maxResponseBytes)
+			return
+		}
+	}
+	api.writeItemsResponse(w, started, resp.Items, resp.Truncated, &resp.Offset)
 }
 
 // writeItemsResponse builds the /head / /tail / /scopelist (when
@@ -91,7 +75,7 @@ func (api *API) writeItemsResponse(
 	started time.Time,
 	items []Item,
 	truncated bool,
-	extra orderedFields,
+	offset *int,
 ) {
 	// Pre-grow buf so the per-item appends don't trigger slice
 	// re-grows on the hot path. The 32-byte per-item slack covers
@@ -112,12 +96,11 @@ func (api *API) writeItemsResponse(
 	buf = append(buf, `,"count":`...)
 	buf = strconv.AppendInt(buf, int64(len(items)), 10)
 
-	// Extras (currently only /tail's "offset" int).
-	for _, kv := range extra {
-		buf = append(buf, ',', '"')
-		buf = append(buf, kv.K...)
-		buf = append(buf, '"', ':')
-		buf = appendKVValue(buf, kv.V)
+	// /tail carries offset between count and truncated; /head does not
+	// (offset == nil).
+	if offset != nil {
+		buf = append(buf, `,"offset":`...)
+		buf = strconv.AppendInt(buf, int64(*offset), 10)
 	}
 
 	// truncated, items
@@ -208,99 +191,6 @@ func appendItemJSON(buf []byte, item Item) []byte {
 	return append(buf, '}')
 }
 
-// appendKVValue encodes a value as JSON into buf, fast-path for the
-// scalar types orderedFields carries across read + write envelopes.
-// Coverage: nil/bool/int/int64/uint64/string/MB plus the two
-// in-package structs that appear nested inside response envelopes
-// (writeAck for /append + /upsert, []ScopeCapacityOffender for the
-// 507 capacity errors). Any other type falls through to json.Marshal
-// so the wire format stays byte-for-byte identical to the previous
-// path even if a future caller passes something exotic.
-func appendKVValue(buf []byte, v interface{}) []byte {
-	switch t := v.(type) {
-	case nil:
-		return append(buf, `null`...)
-	case bool:
-		if t {
-			return append(buf, `true`...)
-		}
-		return append(buf, `false`...)
-	case int:
-		return strconv.AppendInt(buf, int64(t), 10)
-	case int64:
-		return strconv.AppendInt(buf, t, 10)
-	case uint64:
-		return strconv.AppendUint(buf, t, 10)
-	case string:
-		return appendJSONString(buf, t)
-	case MB:
-		// Matches MB.MarshalJSON's fmt.Sprintf("%.4f", v/1048576) byte-for-byte.
-		return strconv.AppendFloat(buf, float64(t)/1048576.0, 'f', 4, 64)
-	case writeAck:
-		return appendWriteAckJSON(buf, t)
-	case []ScopeCapacityOffender:
-		return appendOffendersJSON(buf, t)
-	default:
-		b, _ := json.Marshal(v)
-		return append(buf, b...)
-	}
-}
-
-// appendWriteAckJSON matches writeAck's struct-tag-derived JSON
-// shape: Scope/ID/Seq are dropped when zero-valued, Ts is always
-// emitted. Mirrors what json.Marshal(writeAck{...}) produces.
-func appendWriteAckJSON(buf []byte, a writeAck) []byte {
-	buf = append(buf, '{')
-	first := true
-	if a.Scope != "" {
-		buf = append(buf, `"scope":`...)
-		buf = appendJSONString(buf, a.Scope)
-		first = false
-	}
-	if a.ID != "" {
-		if !first {
-			buf = append(buf, ',')
-		}
-		buf = append(buf, `"id":`...)
-		buf = appendJSONString(buf, a.ID)
-		first = false
-	}
-	if a.Seq != 0 {
-		if !first {
-			buf = append(buf, ',')
-		}
-		buf = append(buf, `"seq":`...)
-		buf = strconv.AppendUint(buf, a.Seq, 10)
-		first = false
-	}
-	if !first {
-		buf = append(buf, ',')
-	}
-	buf = append(buf, `"ts":`...)
-	buf = strconv.AppendInt(buf, a.Ts, 10)
-	return append(buf, '}')
-}
-
-// appendOffendersJSON serialises the scope-capacity 507 body. Each
-// offender has all three fields (no omitempty), matching what
-// json.Marshal would produce.
-func appendOffendersJSON(buf []byte, offenders []ScopeCapacityOffender) []byte {
-	buf = append(buf, '[')
-	for i, o := range offenders {
-		if i > 0 {
-			buf = append(buf, ',')
-		}
-		buf = append(buf, `{"scope":`...)
-		buf = appendJSONString(buf, o.Scope)
-		buf = append(buf, `,"count":`...)
-		buf = strconv.AppendInt(buf, int64(o.Count), 10)
-		buf = append(buf, `,"cap":`...)
-		buf = strconv.AppendInt(buf, int64(o.Cap), 10)
-		buf = append(buf, '}')
-	}
-	return append(buf, ']')
-}
-
 func (api *API) handleHead(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
 
@@ -337,10 +227,16 @@ func (api *API) handleHead(w http.ResponseWriter, r *http.Request) {
 
 	items, truncated, found := api.store.head(q.Scope, afterSeq, q.Limit)
 	if !found {
-		api.writeItemsMiss(w, started, nil)
+		api.writeHeadResponse(w, HeadResponse{OK: true, Hit: false, Count: 0, Truncated: false, Items: nil}, started)
 		return
 	}
-	api.writeItemsHit(w, started, items, truncated, nil)
+	api.writeHeadResponse(w, HeadResponse{
+		OK:        true,
+		Hit:       len(items) > 0,
+		Count:     len(items),
+		Truncated: truncated,
+		Items:     items,
+	}, started)
 }
 
 func (api *API) handleTail(w http.ResponseWriter, r *http.Request) {
@@ -362,16 +258,19 @@ func (api *API) handleTail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// /tail's wire shape carries `offset` between `count` and `truncated`
-	// — the helpers slot `extra` at exactly that position.
-	offsetField := orderedFields{kv{"offset", offset}}
-
 	items, truncated, found := api.store.tail(q.Scope, q.Limit, offset)
 	if !found {
-		api.writeItemsMiss(w, started, offsetField)
+		api.writeTailResponse(w, TailResponse{OK: true, Hit: false, Count: 0, Offset: offset, Truncated: false, Items: nil}, started)
 		return
 	}
-	api.writeItemsHit(w, started, items, truncated, offsetField)
+	api.writeTailResponse(w, TailResponse{
+		OK:        true,
+		Hit:       len(items) > 0,
+		Count:     len(items),
+		Offset:    offset,
+		Truncated: truncated,
+		Items:     items,
+	}, started)
 }
 
 func (api *API) handleGet(w http.ResponseWriter, r *http.Request) {
@@ -398,7 +297,11 @@ func (api *API) handleGet(w http.ResponseWriter, r *http.Request) {
 		item, found = api.store.get(target.Scope, "", target.Seq)
 	}
 
-	writeGetResponse(w, started, item, found)
+	if !found {
+		writeGetResponse(w, GetResponse{OK: true, Hit: false, Count: 0, Item: nil}, started)
+		return
+	}
+	writeGetResponse(w, GetResponse{OK: true, Hit: true, Count: 1, Item: &item}, started)
 }
 
 // writeGetResponse assembles the /get JSON envelope manually and
@@ -427,11 +330,18 @@ func (api *API) handleGet(w http.ResponseWriter, r *http.Request) {
 // bytes — well under the 4-decimal MiB precision (~104 bytes per
 // 0.0001) — and the user has signed off on that tolerance for the
 // throughput win.
-func writeGetResponse(w http.ResponseWriter, started time.Time, item Item, hit bool) {
+func writeGetResponse(w http.ResponseWriter, resp GetResponse, started time.Time) {
+	// payload is hoisted to function scope so the post-prefix size
+	// estimate and the final write-payload-bytes step can both see it.
+	// Nil on miss; len(nil) == 0 keeps the estTotal math correct.
+	var payload []byte
+
 	prefix := make([]byte, 0, 128)
-	if !hit {
+	if !resp.Hit {
 		prefix = append(prefix, `{"ok":true,"hit":false,"count":0,"item":null`...)
 	} else {
+		item := *resp.Item
+		payload = item.Payload
 		payloadKey := "payload"
 		if item.Scope == EventsScopeName {
 			payloadKey = "event"
@@ -471,7 +381,7 @@ func writeGetResponse(w http.ResponseWriter, started time.Time, item Item, hit b
 	}
 
 	suffix := make([]byte, 0, 96)
-	if hit {
+	if resp.Hit {
 		suffix = append(suffix, '}') // close item
 	}
 	suffix = append(suffix, `,"duration_us":`...)
@@ -480,10 +390,7 @@ func writeGetResponse(w http.ResponseWriter, started time.Time, item Item, hit b
 	// Single-pass approx_response_mb estimate. Tracks the actual
 	// body size to within the width of the MB value itself (~8
 	// bytes), which rounds away inside the 4-decimal precision.
-	// strconv.AppendFloat with prec=4 matches MB.MarshalJSON's
-	// fmt.Sprintf("%.4f", v) output exactly while skipping the
-	// json.Marshal wrap and one allocation.
-	estTotal := len(prefix) + len(item.Payload) + len(suffix) + 30
+	estTotal := len(prefix) + len(payload) + len(suffix) + 30
 	mbVal := float64(estTotal) / 1048576.0
 	suffix = append(suffix, `,"approx_response_mb":`...)
 	suffix = strconv.AppendFloat(suffix, mbVal, 'f', 4, 64)
@@ -492,17 +399,15 @@ func writeGetResponse(w http.ResponseWriter, started time.Time, item Item, hit b
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(prefix)
-	if hit {
+	if resp.Hit {
 		// validatePayload rejects empty/null at write time so a stored
 		// Item should never reach this branch with len(Payload) == 0.
 		// Defensive: emit literal "null" instead of writing zero bytes
-		// (which would produce malformed JSON: "...,"payload":}..."),
-		// matching json.Marshal(RawMessage(nil))'s behaviour. ~1 ns
-		// branch on the hot path.
-		if len(item.Payload) == 0 {
+		// (which would produce malformed JSON: "...,"payload":}...").
+		if len(payload) == 0 {
 			_, _ = w.Write([]byte("null"))
 		} else {
-			_, _ = w.Write(item.Payload)
+			_, _ = w.Write(payload)
 		}
 	}
 	_, _ = w.Write(suffix)

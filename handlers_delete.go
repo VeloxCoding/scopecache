@@ -48,11 +48,12 @@ func (api *API) handleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSONWithDuration(w, http.StatusOK, orderedFields{
-		{"ok", true},
-		{"hit", deleted > 0},
-		{"deleted_count", deleted},
-	}, started)
+	writeJSONResponse(w, http.StatusOK, DeleteResponse{
+		OK:           true,
+		Hit:          deleted > 0,
+		DeletedCount: deleted,
+		DurationUs:   time.Since(started).Microseconds(),
+	})
 }
 
 func (api *API) handleDeleteUpTo(w http.ResponseWriter, r *http.Request) {
@@ -80,11 +81,12 @@ func (api *API) handleDeleteUpTo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSONWithDuration(w, http.StatusOK, orderedFields{
-		{"ok", true},
-		{"hit", deleted > 0},
-		{"deleted_count", deleted},
-	}, started)
+	writeJSONResponse(w, http.StatusOK, DeleteResponse{
+		OK:           true,
+		Hit:          deleted > 0,
+		DeletedCount: deleted,
+		DurationUs:   time.Since(started).Microseconds(),
+	})
 }
 
 func (api *API) handleDeleteScope(w http.ResponseWriter, r *http.Request) {
@@ -111,12 +113,13 @@ func (api *API) handleDeleteScope(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSONWithDuration(w, http.StatusOK, orderedFields{
-		{"ok", true},
-		{"hit", deleted},
-		{"deleted_scope", deleted},
-		{"deleted_items", deletedItems},
-	}, started)
+	writeJSONResponse(w, http.StatusOK, DeleteScopeResponse{
+		OK:           true,
+		Hit:          deleted,
+		DeletedScope: deleted,
+		DeletedItems: deletedItems,
+		DurationUs:   time.Since(started).Microseconds(),
+	})
 }
 
 // handleWipe clears the entire store: every scope, every item, every byte
@@ -143,10 +146,11 @@ func (api *API) handleWipe(w http.ResponseWriter, r *http.Request) {
 
 	deletedScopes, deletedItems, freedBytes := api.store.wipe()
 
-	writeJSONWithDuration(w, http.StatusOK, orderedFields{
-		{"ok", true},
-		{"deleted_scopes", deletedScopes},
-		{"deleted_items", deletedItems},
-		{"freed_mb", MB(freedBytes)},
-	}, started)
+	writeJSONResponse(w, http.StatusOK, WipeResponse{
+		OK:            true,
+		DeletedScopes: deletedScopes,
+		DeletedItems:  deletedItems,
+		FreedMB:       MB(freedBytes),
+		DurationUs:    time.Since(started).Microseconds(),
+	})
 }

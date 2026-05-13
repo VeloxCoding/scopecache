@@ -56,10 +56,11 @@ func (api *API) handleAppend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSONWithDuration(w, http.StatusOK, orderedFields{
-		{"ok", true},
-		{"item", writeAck{Scope: item.Scope, ID: item.ID, Seq: item.Seq, Ts: item.Ts}},
-	}, started)
+	writeJSONResponse(w, http.StatusOK, AppendResponse{
+		OK:         true,
+		Item:       writeAck{Scope: item.Scope, ID: item.ID, Seq: item.Seq, Ts: item.Ts},
+		DurationUs: time.Since(started).Microseconds(),
+	})
 }
 
 // handleUpsert creates a new item or replaces an existing one by scope + id.
@@ -90,11 +91,12 @@ func (api *API) handleUpsert(w http.ResponseWriter, r *http.Request) {
 	// Same item-with-no-payload shape as /append; see comment there. Seq
 	// is the pre-existing seq on a replace and the freshly-assigned seq
 	// on a create.
-	writeJSONWithDuration(w, http.StatusOK, orderedFields{
-		{"ok", true},
-		{"created", created},
-		{"item", writeAck{Scope: result.Scope, ID: result.ID, Seq: result.Seq, Ts: result.Ts}},
-	}, started)
+	writeJSONResponse(w, http.StatusOK, UpsertResponse{
+		OK:         true,
+		Created:    created,
+		Item:       writeAck{Scope: result.Scope, ID: result.ID, Seq: result.Seq, Ts: result.Ts},
+		DurationUs: time.Since(started).Microseconds(),
+	})
 }
 
 // handleCounterAdd atomically increments (or creates) a numeric
@@ -154,11 +156,12 @@ func (api *API) handleCounterAdd(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSONWithDuration(w, http.StatusOK, orderedFields{
-		{"ok", true},
-		{"created", created},
-		{"value", value},
-	}, started)
+	writeJSONResponse(w, http.StatusOK, CounterAddResponse{
+		OK:         true,
+		Created:    created,
+		Value:      value,
+		DurationUs: time.Since(started).Microseconds(),
+	})
 }
 
 func (api *API) handleUpdate(w http.ResponseWriter, r *http.Request) {
@@ -184,9 +187,10 @@ func (api *API) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSONWithDuration(w, http.StatusOK, orderedFields{
-		{"ok", true},
-		{"hit", updated > 0},
-		{"updated_count", updated},
-	}, started)
+	writeJSONResponse(w, http.StatusOK, UpdateResponse{
+		OK:           true,
+		Hit:          updated > 0,
+		UpdatedCount: updated,
+		DurationUs:   time.Since(started).Microseconds(),
+	})
 }

@@ -46,16 +46,16 @@ func (api *API) handleStats(w http.ResponseWriter, r *http.Request) {
 	// and are not useful on every poll. last_write_ts lets a polling
 	// client decide "anything changed since I last looked?" with a
 	// single integer comparison instead of refetching state.
-	// duration_us is appended by the helper.
-	writeJSONWithDuration(w, http.StatusOK, orderedFields{
-		{"ok", true},
-		{"scope_count", st.ScopeCount},
-		{"total_items", st.TotalItems},
-		{"approx_store_mb", st.ApproxStoreMB},
-		{"last_write_ts", st.LastWriteTS},
-		{"events_drops_total", st.EventsDropsTotal},
-		{"reserved_scopes", st.ReservedScopes},
-	}, started)
+	writeJSONResponse(w, http.StatusOK, StatsResponse{
+		OK:               true,
+		ScopeCount:       st.ScopeCount,
+		TotalItems:       st.TotalItems,
+		ApproxStoreMB:    st.ApproxStoreMB,
+		LastWriteTS:      st.LastWriteTS,
+		EventsDropsTotal: st.EventsDropsTotal,
+		ReservedScopes:   st.ReservedScopes,
+		DurationUs:       time.Since(started).Microseconds(),
+	})
 }
 
 // handleScopeList serves /scopelist — the per-scope counterpart of
@@ -114,7 +114,13 @@ func (api *API) handleScopeList(w http.ResponseWriter, r *http.Request) {
 	}
 
 	entries, truncated := api.store.scopeList(prefix, after, limit)
-	api.writeScopeListResponse(w, started, entries, truncated)
+	api.writeScopeListResponse(w, ScopeListResponse{
+		OK:        true,
+		Hit:       len(entries) > 0,
+		Count:     len(entries),
+		Truncated: truncated,
+		Scopes:    entries,
+	}, started)
 }
 
 // writeScopeListResponse mirrors writeItemsResponse for /scopelist:
@@ -128,38 +134,33 @@ func (api *API) handleScopeList(w http.ResponseWriter, r *http.Request) {
 // previous orderedFields path produced; `hit` is `count > 0`, the
 // same semantic /head and /tail derive from `len(items) > 0`, so
 // the list-return read family stays uniform on the wire.
-func (api *API) writeScopeListResponse(
-	w http.ResponseWriter,
-	started time.Time,
-	entries []scopeListEntry,
-	truncated bool,
-) {
-	estCapacity := int64(192) + int64(len(entries))*150
-	for i := range entries {
-		estCapacity += int64(len(entries[i].Scope))
+func (api *API) writeScopeListResponse(w http.ResponseWriter, resp ScopeListResponse, started time.Time) {
+	estCapacity := int64(192) + int64(len(resp.Scopes))*150
+	for i := range resp.Scopes {
+		estCapacity += int64(len(resp.Scopes[i].Scope))
 	}
 	buf := make([]byte, 0, estCapacity)
 
 	buf = append(buf, `{"ok":true,"hit":`...)
-	if len(entries) > 0 {
+	if resp.Hit {
 		buf = append(buf, `true`...)
 	} else {
 		buf = append(buf, `false`...)
 	}
 	buf = append(buf, `,"count":`...)
-	buf = strconv.AppendInt(buf, int64(len(entries)), 10)
+	buf = strconv.AppendInt(buf, int64(resp.Count), 10)
 	buf = append(buf, `,"truncated":`...)
-	if truncated {
+	if resp.Truncated {
 		buf = append(buf, `true`...)
 	} else {
 		buf = append(buf, `false`...)
 	}
 	buf = append(buf, `,"scopes":[`...)
-	for i := range entries {
+	for i := range resp.Scopes {
 		if i > 0 {
 			buf = append(buf, ',')
 		}
-		buf = appendScopeListEntryJSON(buf, entries[i])
+		buf = appendScopeListEntryJSON(buf, resp.Scopes[i])
 	}
 	buf = append(buf, ']')
 
