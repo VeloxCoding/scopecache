@@ -90,69 +90,73 @@ fail=0
 
 # --- scopecache_get -----------------------------------------------------------
 
-if echo "$OUT" | grep -qE "scopecache_get\('demo', 'hello'\) -> string\("; then
-    echo "  PASS  get hit: scopecache_get('demo', 'hello') returned a string"
+if echo "$OUT" | grep -A 3 "scopecache_get('demo', 'hello') ->" | grep -qE '\["hit"\]=>'$'\n''[[:space:]]*bool\(true\)'; then
+    echo "  PASS  get hit: envelope shows hit=true"
 else
-    echo "  FAIL  get hit: scopecache_get('demo', 'hello') did NOT return a string" >&2
+    echo "  FAIL  get hit: envelope did NOT show hit=true" >&2
     fail=1
 fi
 
-if echo "$OUT" | grep -qE "scopecache_get\('demo', 'no-such-item'\) -> NULL"; then
-    echo "  PASS  get miss (unknown id): returned NULL"
+if echo "$OUT" | grep -A 3 "scopecache_get('demo', 'no-such-item') ->" | grep -qE '\["hit"\]=>'$'\n''[[:space:]]*bool\(false\)'; then
+    echo "  PASS  get miss (unknown id): envelope shows hit=false"
 else
-    echo "  FAIL  get miss (unknown id): expected NULL" >&2
+    echo "  FAIL  get miss (unknown id): expected hit=false" >&2
     fail=1
 fi
 
-if echo "$OUT" | grep -qE "scopecache_get\('no-such-scope', 'hello'\) -> NULL"; then
-    echo "  PASS  get miss (unknown scope): returned NULL"
+if echo "$OUT" | grep -A 3 "scopecache_get('no-such-scope', 'hello') ->" | grep -qE '\["hit"\]=>'$'\n''[[:space:]]*bool\(false\)'; then
+    echo "  PASS  get miss (unknown scope): envelope shows hit=false"
 else
-    echo "  FAIL  get miss (unknown scope): expected NULL" >&2
+    echo "  FAIL  get miss (unknown scope): expected hit=false" >&2
     fail=1
 fi
 
 # --- scopecache_append --------------------------------------------------------
+#
+# /append envelope: ok=true, created=true, item.seq>=1. We assert
+# created=true on the line beneath the call header (3-line lookahead).
 
-# Append into demo: seq must be a positive integer (>= 1; 0 is the
-# error sentinel). Match `seq=<positive int>`.
-if echo "$OUT" | grep -qE "scopecache_append\('demo', 'php-write-[0-9a-f]+', \.\.\.\) -> seq=[1-9][0-9]*"; then
-    echo "  PASS  append into existing scope: seq>=1"
+if echo "$OUT" | grep -A 4 "scopecache_append('demo'," | grep -qE '\["created"\]=>'$'\n''[[:space:]]*bool\(true\)'; then
+    echo "  PASS  append into existing scope: created=true"
 else
-    echo "  FAIL  append into 'demo': expected seq>=1" >&2
+    echo "  FAIL  append into 'demo': expected created=true" >&2
     fail=1
 fi
 
-# The just-appended item must be readable back via scopecache_get
-# (proves shared *Gateway between write and read paths).
-if echo "$OUT" | grep -qE "scopecache_get\('demo', 'php-write-[0-9a-f]+'\) -> string\("; then
-    echo "  PASS  append read-back: scopecache_get sees the just-written item"
+# The just-appended item must be readable back: the second
+# scopecache_get-by-php-write-* call header (the read-back) must
+# carry an envelope with hit=true.
+if echo "$OUT" | grep -A 4 "scopecache_get('demo', 'php-write-" | grep -qE '\["hit"\]=>'$'\n''[[:space:]]*bool\(true\)'; then
+    echo "  PASS  append read-back: get envelope hit=true on just-written item"
 else
-    echo "  FAIL  append read-back: scopecache_get did NOT see the just-written item" >&2
+    echo "  FAIL  append read-back: get did NOT see just-written item" >&2
     fail=1
 fi
 
-# Bootstrap: appending to a never-seen scope creates it. seq must be >= 1.
-if echo "$OUT" | grep -qE "scopecache_append\('php-side-scope', 'bootstrap-[0-9a-f]+', '\"hi\"'\) -> seq=[1-9][0-9]*"; then
-    echo "  PASS  append into fresh scope: created + seq>=1"
+# Bootstrap: appending to a never-seen scope creates it.
+if echo "$OUT" | grep -A 4 "scopecache_append('php-side-scope'," | grep -qE '\["created"\]=>'$'\n''[[:space:]]*bool\(true\)'; then
+    echo "  PASS  append into fresh scope: created=true"
 else
-    echo "  FAIL  append into 'php-side-scope': expected seq>=1" >&2
+    echo "  FAIL  append into 'php-side-scope': expected created=true" >&2
     fail=1
 fi
 
 # --- scopecache_tail ----------------------------------------------------------
+#
+# /tail envelope on hit: hit=true + items[] non-empty. On miss:
+# hit=false + items=[] (no longer PHP null — matches HTTP /tail).
 
-# var_dump on a non-empty array prints `array(N) {` then per-element body.
-if echo "$OUT" | grep -qE "scopecache_tail\('demo', 5\) -> array\([1-9]"; then
-    echo "  PASS  tail hit: scopecache_tail('demo', 5) returned a non-empty array"
+if echo "$OUT" | grep -A 3 "scopecache_tail('demo', 5) ->" | grep -qE '\["hit"\]=>'$'\n''[[:space:]]*bool\(true\)'; then
+    echo "  PASS  tail hit: envelope shows hit=true"
 else
-    echo "  FAIL  tail hit: scopecache_tail('demo', 5) did NOT return an array" >&2
+    echo "  FAIL  tail hit: scopecache_tail('demo', 5) did NOT show hit=true" >&2
     fail=1
 fi
 
-if echo "$OUT" | grep -qE "scopecache_tail\('no-such-scope', 5\) -> NULL"; then
-    echo "  PASS  tail miss (unknown scope): returned NULL"
+if echo "$OUT" | grep -A 3 "scopecache_tail('no-such-scope', 5) ->" | grep -qE '\["hit"\]=>'$'\n''[[:space:]]*bool\(false\)'; then
+    echo "  PASS  tail miss (unknown scope): envelope shows hit=false"
 else
-    echo "  FAIL  tail miss (unknown scope): expected NULL" >&2
+    echo "  FAIL  tail miss (unknown scope): expected hit=false" >&2
     fail=1
 fi
 

@@ -1,19 +1,21 @@
 <?php
 // test.php — minimal demo of the in-process PHP→scopecache call,
-// now registry-aware.
+// now returning HTTP-wire-shaped PHP arrays everywhere.
 //
 // What this proves:
 //   - PHP can write to the cache via HTTP /append (goes through the
 //     scopecache caddymodule's *Gateway).
 //   - PHP can read the same item back via scopecache_get() (which
 //     LookupGateway("default")s the SAME *Gateway — no second cache).
-//   - A miss on a known scope returns NULL.
-//   - A miss on an unknown scope returns NULL.
+//   - A miss returns the same envelope shape as HTTP — hit=false,
+//     item=null — not a PHP null.
+//   - Writes return the HTTP /append envelope with created=true plus
+//     the assigned seq under 'item.seq'.
 //
 // Must run inside a binary that has the scopecache caddymodule
 // configured in the Caddyfile (so Provision() ran and registered
-// the gateway). Plain `frankenphp php-cli test.php` will show three
-// NULLs because no caddymodule is active — the extension's
+// the gateway). Plain `frankenphp php-cli test.php` will show "no
+// gateway" results because no caddymodule is active — the extension's
 // LookupGateway returns nil. To exercise the actual round-trip:
 //
 //   ./dist/frankenphp run --config Caddyfile.bench
@@ -44,72 +46,67 @@ unset($ch);
 $seed_note = ($seed_status == 409) ? " (already existed, OK)" : "";
 echo "Seed POST /append          -> HTTP $seed_status$seed_note\n\n";
 
-// Step 2: hit — pre-seeded item, should return the JSON payload.
-$payload = scopecache_get('demo', 'hello');
+// Step 2: hit — pre-seeded item, returns the /get envelope.
+$got = scopecache_get('demo', 'hello');
 echo "scopecache_get('demo', 'hello') -> ";
-var_dump($payload);
+var_dump($got);
 
-// Step 3: miss — unknown id within a known scope.
+// Step 3: miss — unknown id within a known scope. hit=false envelope.
 $miss = scopecache_get('demo', 'no-such-item');
 echo "scopecache_get('demo', 'no-such-item') -> ";
 var_dump($miss);
 
-// Step 4: miss — unknown scope entirely.
+// Step 4: miss — unknown scope entirely. Same shape; cache treats
+// unknown scope identically to unknown id.
 $miss_scope = scopecache_get('no-such-scope', 'hello');
 echo "scopecache_get('no-such-scope', 'hello') -> ";
 var_dump($miss_scope);
 
-echo "\n=== scopecache_append (Sprint 1) ===\n\n";
+echo "\n=== scopecache_append envelope ===\n\n";
 
-// Append from PHP side. seq is cache-assigned; should be >= 1.
-// We use a fresh id each run so we don't collide with prior /append seeds.
+// Append from PHP side: returns /append envelope with created=true
+// and item.seq cache-assigned (>= 1). We use a fresh id each run so
+// we don't collide with prior seeds.
 $append_id = 'php-write-' . bin2hex(random_bytes(4));
 $append_payload = json_encode(['written' => 'from PHP via scopecache_append']);
-$seq = scopecache_append('demo', $append_id, $append_payload);
-echo "scopecache_append('demo', '$append_id', ...) -> seq=$seq\n";
+$append_env = scopecache_append('demo', $append_id, $append_payload);
+echo "scopecache_append('demo', '$append_id', ...) -> ";
+var_dump($append_env);
 
-// Read back what we just wrote — proves the write went through and
-// is visible via the same shared *Gateway.
+// Read back what we just wrote.
 $readback = scopecache_get('demo', $append_id);
 echo "scopecache_get('demo', '$append_id') -> ";
 var_dump($readback);
 
-// Error path: append to a non-existent scope. scopecache pre-creates
-// nothing for user scopes, so appending creates the scope. This should
-// succeed too — there is no "scope doesn't exist" error path for
-// /append (it just creates). Verify it returns a positive seq.
+// Append into a never-seen scope creates it implicitly (scopecache
+// has no separate scope-create primitive).
 $bootstrap_id = 'bootstrap-' . bin2hex(random_bytes(4));
-$bootstrap_seq = scopecache_append('php-side-scope', $bootstrap_id, '"hi"');
-echo "scopecache_append('php-side-scope', '$bootstrap_id', '\"hi\"') -> seq=$bootstrap_seq (created scope)\n";
+$bootstrap_env = scopecache_append('php-side-scope', $bootstrap_id, '"hi"');
+echo "scopecache_append('php-side-scope', '$bootstrap_id', '\"hi\"') -> ";
+var_dump($bootstrap_env);
 
-echo "\n=== scopecache_tail (Sprint 1) ===\n\n";
+echo "\n=== scopecache_tail envelope ===\n\n";
 
-// Hit: tail an existing scope. Expect array (possibly with the items
-// we just appended above).
+// Hit: tail returns /tail envelope with items[]. The seeded 'demo'
+// scope should have at least the seed plus the two appends above.
 $tail_hit = scopecache_tail('demo', 5);
 echo "scopecache_tail('demo', 5) -> ";
 var_dump($tail_hit);
 
-// Miss: tail an unknown scope. Expect NULL (not [] — we distinguish
-// "no scope" from "empty scope").
+// Miss: tail on unknown scope returns the same shape with hit=false,
+// items=[]. (Diverges from the pre-rewrite contract that returned
+// PHP null on miss; matches HTTP /tail exactly.)
 $tail_miss = scopecache_tail('no-such-scope', 5);
 echo "scopecache_tail('no-such-scope', 5) -> ";
 var_dump($tail_miss);
 
 echo "\n";
-echo "If the get block shows one JSON-shaped string and two NULLs, the\n";
-echo "extension is correctly sharing state with HTTP clients through the\n";
-echo "gateway registry.\n";
+echo "Every line above shows an associative array with an 'ok' key.\n";
+echo "'hit'/'created' tell you the call outcome; 'item' or 'items'\n";
+echo "carries the data. Payloads are already decoded — no json_decode\n";
+echo "needed on the PHP side.\n";
 echo "\n";
-echo "If scopecache_append returned seq>=1 and the immediate scopecache_get\n";
-echo "shows the same payload, PHP-side writes are visible via the same\n";
-echo "*Gateway as HTTP-side reads.\n";
-echo "\n";
-echo "If scopecache_tail('demo', 5) returned an array and\n";
-echo "scopecache_tail('no-such-scope', 5) returned NULL, the array-return\n";
-echo "wire-shape works and the NULL-vs-empty-array distinction holds.\n";
-echo "\n";
-echo "If ALL calls returned NULL / 0: no caddymodule was loaded. Check that\n";
+echo "If all lines show NULL: no caddymodule was loaded. Check that\n";
 echo "your Caddyfile has a `scopecache { ... }` block and that the\n";
 echo "binary is running via `frankenphp run --config <file>` (not\n";
 echo "`frankenphp php-cli`, which skips Provision entirely).\n";

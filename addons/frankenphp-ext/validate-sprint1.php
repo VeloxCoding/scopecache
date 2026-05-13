@@ -1,8 +1,9 @@
 <?php
 // validate-sprint1.php — beyond-smoke correctness checks for the
-// Sprint 1 functions (scopecache_tail + scopecache_append). Exercises
-// multi-element returns, ordering, edge inputs, error sentinels, and
-// the cross-call state-sharing contract.
+// scopecache_tail + scopecache_append surface. Adapted to the
+// envelope-returning shape: each function returns a PHP array
+// mirroring the HTTP JSON response, never PHP null/0 except when
+// the extension cannot reach a *Gateway.
 //
 // Output is PASS/FAIL per check; validate-sprint1.sh greps it.
 
@@ -23,6 +24,13 @@ function check(string $label, bool $ok, string $detail = ''): void {
     }
 }
 
+// Helpers — same as validate-sprint2.php so the two harnesses stay
+// in lockstep.
+function seq(array $env): int          { return $env['item']['seq'] ?? -1; }
+function payloadOf(array $env): mixed  { return $env['item']['payload'] ?? null; }
+function itemsOf(array $env): array    { return $env['items'] ?? []; }
+function isErr(array $env): bool       { return ($env['ok'] ?? null) === false; }
+
 echo "=== validate-sprint1.php ===\n\n";
 
 // --- 0. Sanity: functions are loaded -----------------------------------------
@@ -31,122 +39,120 @@ check("function_exists scopecache_tail",   function_exists('scopecache_tail'));
 check("function_exists scopecache_append", function_exists('scopecache_append'));
 
 // --- 1. Fresh scope: append N items, tail them back --------------------------
-// Use a randomised scope so we are not perturbed by other tests' leftovers.
 $rand     = bin2hex(random_bytes(4));
 $scope    = "validate-$rand";
 $N        = 7;
-$expected = [];
+$expected = []; // decoded payload PHP-values, in insertion order
 
 $seqs = [];
 for ($i = 0; $i < $N; $i++) {
-    $payload = json_encode(['idx' => $i, 'tag' => "item-$i"]);
-    $expected[] = $payload;
-    $seq = scopecache_append($scope, "id-$i", $payload);
-    $seqs[] = $seq;
+    $payloadJson  = json_encode(['idx' => $i, 'tag' => "item-$i"]);
+    $expected[]   = ['idx' => $i, 'tag' => "item-$i"];
+    $env          = scopecache_append($scope, "id-$i", $payloadJson);
+    check("append #$i ok=true",      ($env['ok'] ?? null) === true);
+    check("append #$i created=true", ($env['created'] ?? null) === true);
+    $seqs[]       = seq($env);
 }
 
 check("N appends to fresh scope returned positive seqs",
     count(array_filter($seqs, fn($s) => $s >= 1)) === $N,
     "seqs=" . json_encode($seqs));
 
+$seqsSorted = $seqs; sort($seqsSorted);
 check("appended seqs are strictly increasing",
-    $seqs === array_values(array_unique($seqs)) && $seqs === call_user_func(function($s) {
-        $sorted = $s; sort($sorted); return $sorted;
-    }, $seqs),
+    $seqs === $seqsSorted && count(array_unique($seqs)) === $N,
     "seqs=" . json_encode($seqs));
 
-// --- 2. Tail returns all N items, in seq-ascending order ---------------------
+// --- 2. Tail returns all N items, oldest-first within the window -------------
 $tail = scopecache_tail($scope, 100);
-check("tail($scope, 100) returns an array", is_array($tail), "got " . gettype($tail));
-check("tail returns exactly N items (=$N)", is_array($tail) && count($tail) === $N,
-    "got count=" . (is_array($tail) ? count($tail) : 'n/a'));
+check("tail(scope, 100) returns envelope array", is_array($tail));
+check("tail hit=true on populated scope", ($tail['hit'] ?? null) === true);
+check("tail.count == N (=$N)", ($tail['count'] ?? -1) === $N);
 
-if (is_array($tail) && count($tail) === $N) {
-    $contents_match = true;
-    foreach ($tail as $idx => $payload) {
-        if ($payload !== $expected[$idx]) {
-            $contents_match = false;
-            break;
-        }
-    }
-    check("tail contents match the appended payloads in order", $contents_match);
-}
+$payloads = array_map(fn($it) => $it['payload'] ?? null, itemsOf($tail));
+check("tail item payloads match the appended payloads in order",
+    $payloads === $expected,
+    "got " . json_encode($payloads));
 
 // --- 3. Tail limit smaller than N: returns last `limit` items ----------------
-// Gateway.Tail: "newest `limit` items, oldest-first within the window".
-// So tail($scope, 3) on 7 items should give items[4..6].
 $tail3 = scopecache_tail($scope, 3);
-check("tail(scope, 3) returns 3 items", is_array($tail3) && count($tail3) === 3,
-    "got count=" . (is_array($tail3) ? count($tail3) : 'n/a'));
-if (is_array($tail3) && count($tail3) === 3) {
-    $expected_window = array_slice($expected, $N - 3);
-    check("tail(scope, 3) returns the newest 3 (oldest-first)", $tail3 === $expected_window);
-}
+check("tail(scope, 3) count==3", ($tail3['count'] ?? -1) === 3);
+$tail3Payloads = array_map(fn($it) => $it['payload'] ?? null, itemsOf($tail3));
+check("tail(scope, 3) returns the newest 3 (oldest-first)",
+    $tail3Payloads === array_slice($expected, $N - 3));
 
-// --- 4. Tail with limit > N: returns all N items, not limit empty slots ------
+// --- 4. Tail with limit > N: returns all N items -----------------------------
 $tail99 = scopecache_tail($scope, 99);
-check("tail(scope, 99) returns N items (not 99 padded)",
-    is_array($tail99) && count($tail99) === $N);
+check("tail(scope, 99) count==N (not 99-padded)",
+    ($tail99['count'] ?? -1) === $N);
 
-// --- 5. Tail with limit=0: empty array (scope exists, asked nothing) ---------
+// --- 5. Tail with limit=0: server clamps to default, items present -----------
+// scopecache.normalizeLimit returns DefaultLimit when ?limit==0 over HTTP;
+// the Gateway path treats limit=0 the same way (clamps to default). We
+// just assert the call succeeds.
 $tail0 = scopecache_tail($scope, 0);
-check("tail(scope, 0) returns an array", is_array($tail0));
-check("tail(scope, 0) is empty []", is_array($tail0) && count($tail0) === 0);
+check("tail(scope, 0) returns envelope", is_array($tail0));
 
-// --- 6. Tail on a completely unknown scope: NULL -----------------------------
+// --- 6. Tail on a completely unknown scope: hit=false, items=[] --------------
 $tail_miss = scopecache_tail("definitely-not-a-scope-$rand", 5);
-check("tail(unknown-scope, 5) returns NULL", $tail_miss === null,
-    "got " . var_export($tail_miss, true));
+check("tail(unknown-scope) hit=false",
+    ($tail_miss['hit'] ?? null) === false);
+check("tail(unknown-scope) items=[]", itemsOf($tail_miss) === []);
 
 // --- 7. Read-back via scopecache_get: items written via append are visible ---
 $probe = scopecache_get($scope, "id-3");
 check("scopecache_get sees item-3 written via append",
-    $probe === $expected[3],
-    "got " . var_export($probe, true));
+    ($probe['hit'] ?? null) === true && payloadOf($probe) === $expected[3]);
 
-// --- 8. Duplicate id: second append returns 0 (error sentinel) ---------------
-$dup_seq = scopecache_append($scope, "id-3", json_encode(['dup' => true]));
-check("append of duplicate id returns 0 (error sentinel)", $dup_seq === 0,
-    "got seq=$dup_seq");
+// --- 8. Duplicate id: append returns error envelope --------------------------
+$dup_env = scopecache_append($scope, "id-3", json_encode(['dup' => true]));
+check("append of duplicate id returns error envelope (ok=false)",
+    is_array($dup_env) && isErr($dup_env),
+    "got " . var_export($dup_env, true));
 
 // --- 9. Original item NOT clobbered by the failed duplicate append -----------
 $probe_after_dup = scopecache_get($scope, "id-3");
 check("original item-3 survived the duplicate-append rejection",
-    $probe_after_dup === $expected[3],
-    "got " . var_export($probe_after_dup, true));
+    payloadOf($probe_after_dup) === $expected[3]);
 
-// --- 10. Invalid JSON payload: returns 0 -------------------------------------
-$invalid_seq = scopecache_append($scope, "invalid-json-id", "this is not JSON");
-check("append with non-JSON payload returns 0", $invalid_seq === 0,
-    "got seq=$invalid_seq");
+// --- 10. Invalid JSON payload: error envelope --------------------------------
+$invalid_env = scopecache_append($scope, "invalid-json-id", "this is not JSON");
+check("append with non-JSON payload returns error envelope",
+    is_array($invalid_env) && isErr($invalid_env));
 
-// --- 11. Empty payload: returns 0 (validator requires non-empty JSON) --------
-$empty_seq = scopecache_append($scope, "empty-id", "");
-check("append with empty payload returns 0", $empty_seq === 0,
-    "got seq=$empty_seq");
+// --- 11. Empty payload: error envelope ---------------------------------------
+$empty_env = scopecache_append($scope, "empty-id", "");
+check("append with empty payload returns error envelope",
+    is_array($empty_env) && isErr($empty_env));
 
 // --- 12. Seq-only append (empty id): assigned seq >= 1, no id collision ------
-$seq_only_a = scopecache_append($scope, "", json_encode(['seq_only' => 'a']));
-$seq_only_b = scopecache_append($scope, "", json_encode(['seq_only' => 'b']));
-check("two seq-only appends both got seq >= 1", $seq_only_a >= 1 && $seq_only_b >= 1,
-    "seqs=$seq_only_a,$seq_only_b");
-check("the two seq-only appends got DIFFERENT seqs", $seq_only_a !== $seq_only_b,
-    "both seqs=$seq_only_a");
+$so_a = scopecache_append($scope, "", json_encode(['seq_only' => 'a']));
+$so_b = scopecache_append($scope, "", json_encode(['seq_only' => 'b']));
+check("seq-only append A ok=true + created=true",
+    ($so_a['ok'] ?? null) === true && ($so_a['created'] ?? null) === true);
+check("seq-only append B ok=true + created=true",
+    ($so_b['ok'] ?? null) === true && ($so_b['created'] ?? null) === true);
+$soSeqA = seq($so_a);
+$soSeqB = seq($so_b);
+check("two seq-only appends got seq >= 1", $soSeqA >= 1 && $soSeqB >= 1,
+    "seqs=$soSeqA,$soSeqB");
+check("the two seq-only appends got DIFFERENT seqs", $soSeqA !== $soSeqB);
+check("seq-only append A has item.id=null",
+    array_key_exists('id', $so_a['item']) && $so_a['item']['id'] === null);
 
 // --- 13. After seq-only appends, tail count = N + 2 --------------------------
 $tail_after = scopecache_tail($scope, 100);
 check("tail after 2 seq-only appends: N+2 items present",
-    is_array($tail_after) && count($tail_after) === $N + 2,
-    "got count=" . (is_array($tail_after) ? count($tail_after) : 'n/a'));
+    ($tail_after['count'] ?? -1) === $N + 2);
 
 // --- 14. New scope created lazily by append (no separate create call) --------
 $fresh_scope = "lazily-created-$rand";
-$lazy_seq = scopecache_append($fresh_scope, "first", json_encode(['first' => 'item']));
-check("append into never-before-seen scope created it (seq>=1)", $lazy_seq >= 1,
-    "got seq=$lazy_seq");
+$lazy_env = scopecache_append($fresh_scope, "first", json_encode(['first' => 'item']));
+check("append into never-before-seen scope created it (ok=true)",
+    ($lazy_env['ok'] ?? null) === true && seq($lazy_env) >= 1);
 $lazy_tail = scopecache_tail($fresh_scope, 10);
 check("tail of lazily-created scope returns 1 item",
-    is_array($lazy_tail) && count($lazy_tail) === 1);
+    ($lazy_tail['count'] ?? -1) === 1);
 
 echo "\n=== SUMMARY: $pass pass, $fail fail ===\n";
 if ($fail > 0) {

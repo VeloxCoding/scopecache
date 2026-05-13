@@ -73,17 +73,42 @@ static inline void sc_zval_str(zval *zv, zend_string *s) {
 static inline void sc_zval_empty_string(zval *zv) {
     ZVAL_EMPTY_STRING(zv);
 }
+static inline void sc_zval_bool(zval *zv, int b) {
+    ZVAL_BOOL(zv, b);
+}
+static inline void sc_zval_long(zval *zv, zend_long n) {
+    ZVAL_LONG(zv, n);
+}
+static inline void sc_zval_double(zval *zv, double d) {
+    ZVAL_DOUBLE(zv, d);
+}
+static inline void sc_zval_null(zval *zv) {
+    ZVAL_NULL(zv);
+}
+static inline void sc_zval_arr(zval *zv, zend_array *a) {
+    ZVAL_ARR(zv, a);
+}
 // zend_new_array itself is a macro expanding to _zend_new_array(size);
 // cgo cannot call macros, so trampoline it.
 static inline zend_array *sc_zend_new_array(uint32_t size) {
     return zend_new_array(size);
 }
+// String-keyed insert — used by phpAssocAdd*. zend_hash_str_add_new is
+// the no-collision variant (faster; we always build with unique keys).
+// On collision it returns NULL; we ignore the return because our
+// envelope shapes are constructed key-by-key and never re-insert.
+static inline zval *sc_hash_str_add(zend_array *ht, const char *key, size_t key_len, zval *zv) {
+    return zend_hash_str_add_new(ht, key, key_len, zv);
+}
 */
 import "C"
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"unsafe"
 
@@ -144,53 +169,6 @@ func zendStringCopy(s *C.zend_string) string {
 	return C.GoStringN((*C.char)(unsafe.Pointer(&s.val)), C.int(s.len))
 }
 
-// phpPackedArrayFromItems builds a packed PHP zend_array where each
-// element is a zend_string constructed directly from the corresponding
-// scopecache.Item.Payload bytes. Bypasses frankenphp.PHPPackedArray
-// to drop per-element overhead:
-//
-//   - no []any boxing of each element (1 interface-alloc avoided)
-//   - no string(payload) conversion (1 byte-copy avoided)
-//   - no per-element zval emalloc + efree (2 cgo calls + alloc avoided)
-//   - no type-switch dispatch in phpValue
-//
-// One stack-allocated zval is reused across iterations — zend_hash
-// copies the zval contents on insert, so reuse is safe. The
-// zend_strings carry refcount=1 owned by the array slot; the
-// wrapper's RETURN_ARR transfers ownership to PHP, which drops the
-// reference at request end.
-//
-// Per-element cost target: ~100 ns/elt vs the ~200 ns of the
-// generic frankenphp.PHPPackedArray path. See pitfall #N in the
-// addon notes (CLAUDE_PHPEXTENSION_IN_GO.md) for the design
-// rationale and the projected curve.
-//
-// Returns nil ONLY for a nil input slice — an EMPTY slice still
-// returns a non-nil zend_array so the wrapper emits an empty PHP
-// array (`[]`), distinguishing it from PHP `null` for callers.
-func phpPackedArrayFromItems(items []scopecache.Item) unsafe.Pointer {
-	if items == nil {
-		return nil
-	}
-	arr := C.sc_zend_new_array(C.uint32_t(len(items)))
-	var zv C.zval
-	for i := range items {
-		payload := items[i].Payload
-		if len(payload) == 0 {
-			C.sc_zval_empty_string(&zv)
-		} else {
-			zs := C.zend_string_init(
-				(*C.char)(unsafe.Pointer(&payload[0])),
-				C.size_t(len(payload)),
-				C._Bool(false),
-			)
-			C.sc_zval_str(&zv, zs)
-		}
-		C.zend_hash_next_index_insert(arr, &zv)
-	}
-	return unsafe.Pointer(arr)
-}
-
 // phpStringFromBytes emalloc's a fresh zend_string in the PHP request
 // arena and copies the given bytes in, skipping the []byte→string→
 // zend_string detour frankenphp.PHPString takes. The returned pointer
@@ -214,59 +192,445 @@ func phpStringFromBytes(b []byte) unsafe.Pointer {
 	))
 }
 
-// scopecache_get looks up a single item by scope + id and returns its
-// payload bytes as a PHP string. Misses return null.
+// --- PHP-array builders ----------------------------------------------
 //
-// Wire shape (PHP-visible):
+// Every public PHP function mirrors its HTTP-wire counterpart by
+// returning a PHP associative array with the same key set the HTTP
+// envelope carries (response_types.go in the cache core is the source
+// of truth). To avoid the "marshal-to-JSON in Go, decode in PHP"
+// round-trip, the builders write into PHP HashTables directly via the
+// cgo trampolines above.
 //
-//	scopecache_get(string $scope, string $id): ?string
+// Convention used by phpAssocAdd*:
+//   - `key` is a Go string; sc_hash_str_add copies it into the
+//     HashTable, so the underlying Go memory does not need to live
+//     past the call.
+//   - One stack-allocated zval is reused per insert; zend_hash_*
+//     copies the zval contents on insert.
+//   - The returned *C.zend_array is owned by the PHP request arena
+//     (the wrapper's RETURN_ARR transfers ownership to PHP).
+
+func phpAssocNew(size int) *C.zend_array {
+	return C.sc_zend_new_array(C.uint32_t(size))
+}
+
+func phpHashStrAdd(arr *C.zend_array, key string, zv *C.zval) {
+	if len(key) == 0 {
+		return
+	}
+	C.sc_hash_str_add(
+		arr,
+		(*C.char)(unsafe.Pointer(unsafe.StringData(key))),
+		C.size_t(len(key)),
+		zv,
+	)
+}
+
+func phpAssocAddBool(arr *C.zend_array, key string, val bool) {
+	var zv C.zval
+	var b C.int
+	if val {
+		b = 1
+	}
+	C.sc_zval_bool(&zv, b)
+	phpHashStrAdd(arr, key, &zv)
+}
+
+func phpAssocAddLong(arr *C.zend_array, key string, val int64) {
+	var zv C.zval
+	C.sc_zval_long(&zv, C.zend_long(val))
+	phpHashStrAdd(arr, key, &zv)
+}
+
+func phpAssocAddDouble(arr *C.zend_array, key string, val float64) {
+	var zv C.zval
+	C.sc_zval_double(&zv, C.double(val))
+	phpHashStrAdd(arr, key, &zv)
+}
+
+func phpAssocAddNull(arr *C.zend_array, key string) {
+	var zv C.zval
+	C.sc_zval_null(&zv)
+	phpHashStrAdd(arr, key, &zv)
+}
+
+func phpAssocAddString(arr *C.zend_array, key string, val string) {
+	var zv C.zval
+	if len(val) == 0 {
+		C.sc_zval_empty_string(&zv)
+	} else {
+		zs := C.zend_string_init(
+			(*C.char)(unsafe.Pointer(unsafe.StringData(val))),
+			C.size_t(len(val)),
+			C._Bool(false),
+		)
+		C.sc_zval_str(&zv, zs)
+	}
+	phpHashStrAdd(arr, key, &zv)
+}
+
+func phpAssocAddArray(arr *C.zend_array, key string, val *C.zend_array) {
+	var zv C.zval
+	C.sc_zval_arr(&zv, val)
+	phpHashStrAdd(arr, key, &zv)
+}
+
+func phpAssocAddZval(arr *C.zend_array, key string, zv *C.zval) {
+	phpHashStrAdd(arr, key, zv)
+}
+
+// payloadToZval decodes a stored item's JSON payload bytes and writes
+// the resulting PHP value into zv. Mirrors what `json_decode($body, true)`
+// would produce in PHP on the same bytes — object → assoc array, array →
+// packed array, number → int when no decimal/exponent in source else
+// float, string/bool/null map directly.
 //
-// Returned bytes are the verbatim JSON payload — the same bytes
-// served by GET /get?scope=X&id=Y under the "item.payload" key in
-// the HTTP envelope, just without the envelope.
+// Token-walked (not json.Unmarshal-into-any) so JSON-object key order
+// is preserved on the way into the PHP array. PHP's strict-equality
+// operator on assoc arrays compares insertion order; a decoder that
+// went through map[string]any would lose source order to Go's map-
+// iteration randomisation, breaking the `===` parity we promise.
 //
-// Empty/whitespace inputs and over-cap scope/id strings are not
-// validated here; the *Gateway layer enforces shape rules and a
-// future revision will surface validation errors as PHP exceptions.
-// For the prototype, invalid input simply returns null.
+// json.Decoder.UseNumber() preserves the int-vs-float distinction the
+// JSON source had; the default float64 decode would silently widen
+// every integer payload (`42` → float 42.0 → PHP float when emitted),
+// breaking the json_decode parity too.
 //
-// Also returns null when no scopecache caddymodule is loaded in this
-// binary (defaultSlot.Load() returns nil because no Provision ever
-// stored a Gateway into it). An operator seeing only nulls should
-// check that the Caddyfile has a `scopecache {}` block — without it,
-// no Provision() ever ran, so no *Gateway is registered.
+// Empty input (defensive — validatePayload rejects this upstream)
+// writes PHP null.
+func payloadToZval(payload json.RawMessage, zv *C.zval) {
+	if len(payload) == 0 {
+		C.sc_zval_null(zv)
+		return
+	}
+	dec := json.NewDecoder(bytes.NewReader(payload))
+	dec.UseNumber()
+	if err := decodeNextToZval(dec, zv); err != nil {
+		C.sc_zval_null(zv)
+	}
+}
+
+// decodeNextToZval pulls one JSON value (scalar, object, or array)
+// from dec and writes it into zv. Recurses into nested structures
+// via the same function, consuming the matching closing delimiter
+// before returning.
+func decodeNextToZval(dec *json.Decoder, zv *C.zval) error {
+	tok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	return tokenToZval(dec, tok, zv)
+}
+
+func tokenToZval(dec *json.Decoder, tok json.Token, zv *C.zval) error {
+	switch t := tok.(type) {
+	case json.Delim:
+		switch t {
+		case '{':
+			arr := C.sc_zend_new_array(C.uint32_t(8))
+			for dec.More() {
+				keyTok, err := dec.Token()
+				if err != nil {
+					return err
+				}
+				key, ok := keyTok.(string)
+				if !ok {
+					return fmt.Errorf("payload decode: object key is not a string (got %T)", keyTok)
+				}
+				var valZv C.zval
+				if err := decodeNextToZval(dec, &valZv); err != nil {
+					return err
+				}
+				phpHashStrAdd(arr, key, &valZv)
+			}
+			if _, err := dec.Token(); err != nil { // consume '}'
+				return err
+			}
+			C.sc_zval_arr(zv, arr)
+			return nil
+		case '[':
+			arr := C.sc_zend_new_array(C.uint32_t(8))
+			for dec.More() {
+				var elemZv C.zval
+				if err := decodeNextToZval(dec, &elemZv); err != nil {
+					return err
+				}
+				C.zend_hash_next_index_insert(arr, &elemZv)
+			}
+			if _, err := dec.Token(); err != nil { // consume ']'
+				return err
+			}
+			C.sc_zval_arr(zv, arr)
+			return nil
+		default:
+			return fmt.Errorf("payload decode: unexpected delimiter %v", t)
+		}
+	case nil:
+		C.sc_zval_null(zv)
+		return nil
+	case bool:
+		var b C.int
+		if t {
+			b = 1
+		}
+		C.sc_zval_bool(zv, b)
+		return nil
+	case json.Number:
+		s := string(t)
+		if strings.ContainsAny(s, ".eE") {
+			if f, err := strconv.ParseFloat(s, 64); err == nil {
+				C.sc_zval_double(zv, C.double(f))
+				return nil
+			}
+		}
+		if i, err := strconv.ParseInt(s, 10, 64); err == nil {
+			C.sc_zval_long(zv, C.zend_long(i))
+			return nil
+		}
+		if f, err := strconv.ParseFloat(s, 64); err == nil {
+			C.sc_zval_double(zv, C.double(f))
+			return nil
+		}
+		C.sc_zval_null(zv)
+		return nil
+	case string:
+		if len(t) == 0 {
+			C.sc_zval_empty_string(zv)
+		} else {
+			zs := C.zend_string_init(
+				(*C.char)(unsafe.Pointer(unsafe.StringData(t))),
+				C.size_t(len(t)),
+				C._Bool(false),
+			)
+			C.sc_zval_str(zv, zs)
+		}
+		return nil
+	default:
+		C.sc_zval_null(zv)
+		return nil
+	}
+}
+
+// buildItemAssoc constructs the per-item PHP-array used inside the
+// `item` key on /get and as each element of `items` on /head and
+// /tail. Includes the (decoded) payload. Mirrors Item.MarshalJSON's
+// wire shape (scope/id/seq/ts + payload-or-event) from §4.2 of the
+// RFC.
+func buildItemAssoc(item scopecache.Item) *C.zend_array {
+	arr := phpAssocNew(5)
+	phpAssocAddString(arr, "scope", item.Scope)
+	if item.ID == "" {
+		phpAssocAddNull(arr, "id")
+	} else {
+		phpAssocAddString(arr, "id", item.ID)
+	}
+	phpAssocAddLong(arr, "seq", int64(item.Seq))
+	phpAssocAddLong(arr, "ts", item.Ts)
+
+	// payload renames to "event" for items in the reserved _events
+	// scope — see types.go Item.MarshalJSON for the rationale.
+	payloadKey := "payload"
+	if item.Scope == scopecache.EventsScopeName {
+		payloadKey = "event"
+	}
+	var zv C.zval
+	payloadToZval(item.Payload, &zv)
+	phpAssocAddZval(arr, payloadKey, &zv)
+	return arr
+}
+
+// buildWriteAckAssoc constructs the `item` sub-array for /append and
+// /upsert responses. Same shape as buildItemAssoc minus the payload —
+// the client just supplied it on the way in, so echoing it would
+// double the wire cost. Matches writeAck in handlers_write.go.
+func buildWriteAckAssoc(item scopecache.Item) *C.zend_array {
+	arr := phpAssocNew(4)
+	phpAssocAddString(arr, "scope", item.Scope)
+	if item.ID == "" {
+		phpAssocAddNull(arr, "id")
+	} else {
+		phpAssocAddString(arr, "id", item.ID)
+	}
+	phpAssocAddLong(arr, "seq", int64(item.Seq))
+	phpAssocAddLong(arr, "ts", item.Ts)
+	return arr
+}
+
+// buildItemsPackedArray constructs the inner `items` packed-array of
+// /head and /tail responses — every element is the full item shape
+// from buildItemAssoc (scope/id/seq/ts/payload). Returns an empty
+// packed array when `items` is empty.
+func buildItemsPackedArray(items []scopecache.Item) *C.zend_array {
+	arr := C.sc_zend_new_array(C.uint32_t(len(items)))
+	var zv C.zval
+	for i := range items {
+		C.sc_zval_arr(&zv, buildItemAssoc(items[i]))
+		C.zend_hash_next_index_insert(arr, &zv)
+	}
+	return arr
+}
+
+// buildItemsEnvelope assembles the /head + /tail success envelope.
+// withOffset toggles the /tail-only `offset` field; offsetVal is
+// the value to emit when withOffset is true (always 0 today, since
+// scopecache_tail does not expose the offset parameter).
+func buildItemsEnvelope(hit bool, items []scopecache.Item, truncated bool, withOffset bool, offsetVal int64) *C.zend_array {
+	size := 5
+	if withOffset {
+		size++
+	}
+	arr := phpAssocNew(size)
+	phpAssocAddBool(arr, "ok", true)
+	phpAssocAddBool(arr, "hit", hit)
+	phpAssocAddLong(arr, "count", int64(len(items)))
+	if withOffset {
+		phpAssocAddLong(arr, "offset", offsetVal)
+	}
+	phpAssocAddBool(arr, "truncated", truncated)
+	phpAssocAddArray(arr, "items", buildItemsPackedArray(items))
+	return arr
+}
+
+// buildReservedScopesArray builds the inner packed array of
+// /stats's `reserved_scopes` block — one row per reserved scope
+// with the six-field slim shape (no last_access_ts / read_count_total
+// since reserved scopes are infrastructure, not user-facing reads).
+func buildReservedScopesArray(rows []scopecache.ReservedScopeEntry) *C.zend_array {
+	arr := C.sc_zend_new_array(C.uint32_t(len(rows)))
+	var zv C.zval
+	for i := range rows {
+		row := phpAssocNew(6)
+		phpAssocAddString(row, "scope", rows[i].Scope)
+		phpAssocAddLong(row, "item_count", int64(rows[i].ItemCount))
+		phpAssocAddLong(row, "last_seq", int64(rows[i].LastSeq))
+		phpAssocAddDouble(row, "approx_scope_mb", float64(rows[i].ApproxScopeMB)/1048576.0)
+		phpAssocAddLong(row, "created_ts", rows[i].CreatedTS)
+		phpAssocAddLong(row, "last_write_ts", rows[i].LastWriteTS)
+		C.sc_zval_arr(&zv, row)
+		C.zend_hash_next_index_insert(arr, &zv)
+	}
+	return arr
+}
+
+// buildScopeListPackedArray builds the inner packed array of
+// /scopelist's `scopes` field — full eight-field row per scope
+// including the read-bookkeeping signals (last_access_ts,
+// read_count_total) that /stats's reserved_scopes block omits.
+func buildScopeListPackedArray(rows []scopecache.ScopeListEntry) *C.zend_array {
+	arr := C.sc_zend_new_array(C.uint32_t(len(rows)))
+	var zv C.zval
+	for i := range rows {
+		row := phpAssocNew(8)
+		phpAssocAddString(row, "scope", rows[i].Scope)
+		phpAssocAddLong(row, "item_count", int64(rows[i].ItemCount))
+		phpAssocAddLong(row, "last_seq", int64(rows[i].LastSeq))
+		phpAssocAddDouble(row, "approx_scope_mb", float64(rows[i].ApproxScopeMB)/1048576.0)
+		phpAssocAddLong(row, "created_ts", rows[i].CreatedTS)
+		phpAssocAddLong(row, "last_write_ts", rows[i].LastWriteTS)
+		phpAssocAddLong(row, "last_access_ts", rows[i].LastAccessTS)
+		phpAssocAddLong(row, "read_count_total", int64(rows[i].ReadCountTotal))
+		C.sc_zval_arr(&zv, row)
+		C.zend_hash_next_index_insert(arr, &zv)
+	}
+	return arr
+}
+
+// buildHitCountEnvelope returns the {ok, hit, count} shape shared by
+// /delete and /delete_up_to. `hit` is derived as `count > 0`.
+func buildHitCountEnvelope(count int) *C.zend_array {
+	arr := phpAssocNew(3)
+	phpAssocAddBool(arr, "ok", true)
+	phpAssocAddBool(arr, "hit", count > 0)
+	phpAssocAddLong(arr, "count", int64(count))
+	return arr
+}
+
+// buildErrorEnvelope returns the PHP-array form of the HTTP error
+// envelope `{ok: false, error: msg}`. Used when scopecache returns an
+// error the extension cannot otherwise represent in a typed-success
+// envelope (validation failure on input, capacity exceeded, etc.).
+func buildErrorEnvelope(msg string) *C.zend_array {
+	arr := phpAssocNew(2)
+	phpAssocAddBool(arr, "ok", false)
+	phpAssocAddString(arr, "error", msg)
+	return arr
+}
+
+// errorEnvelopePtr is the unsafe.Pointer form of buildErrorEnvelope,
+// shaped for direct return from the //export_php functions.
+func errorEnvelopePtr(msg string) unsafe.Pointer {
+	return unsafe.Pointer(buildErrorEnvelope(msg))
+}
+
+// errorMsg extracts a stable error string from a scopecache Gateway
+// error. ErrInvalidInput's wrapped message goes through verbatim;
+// other errors (capacity, conflict) emit their .Error() string.
+// Mirrors what the HTTP error responses surface.
+func errorMsg(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+// scopecache_get returns the same JSON envelope GET /get serves over
+// HTTP, but as a native PHP associative array — no json_decode needed.
 //
-// export_php:function scopecache_get(string $scope, string $id): ?string
+// Hit:
+//
+//	['ok' => true, 'hit' => true, 'count' => 1,
+//	 'item' => ['scope' => '...', 'id' => '...' | null, 'seq' => N,
+//	            'ts' => N, 'payload' => mixed]]
+//
+// Miss:
+//
+//	['ok' => true, 'hit' => false, 'count' => 0, 'item' => null]
+//
+// `payload` is decoded the same way `json_decode($body, true)` would
+// decode it from the HTTP response: object → assoc array, array →
+// packed array, number → int or float, etc.
+//
+// Returns null only when no scopecache caddymodule is loaded in this
+// binary (Provision never registered a *Gateway). An operator seeing
+// null from this function should check that the Caddyfile has a
+// `scopecache {}` block.
+//
+// export_php:function scopecache_get(string $scope, string $id): ?array
 func scopecache_get(scope *C.zend_string, id *C.zend_string) unsafe.Pointer {
 	gw := defaultSlot.Load()
 	if gw == nil {
 		return nil
 	}
 	item, found := gw.GetByID(zendStringView(scope), zendStringView(id))
-	if !found {
-		return nil
+	arr := phpAssocNew(4)
+	phpAssocAddBool(arr, "ok", true)
+	phpAssocAddBool(arr, "hit", found)
+	if found {
+		phpAssocAddLong(arr, "count", 1)
+		phpAssocAddArray(arr, "item", buildItemAssoc(item))
+	} else {
+		phpAssocAddLong(arr, "count", 0)
+		phpAssocAddNull(arr, "item")
 	}
-	return phpStringFromBytes(item.Payload)
+	return unsafe.Pointer(arr)
 }
 
-// scopecache_tail returns the newest `limit` items in scope, oldest-
-// first within the window. Each array element is the verbatim JSON
-// payload bytes of one item (same shape as scopecache_get returns).
+// scopecache_tail returns the GET /tail envelope as a PHP array.
+// `offset` is always 0 (single-shot tail; pagination by offset is not
+// exposed in the PHP signature).
 //
-// Wire shape (PHP-visible):
+// Hit:
 //
-//	scopecache_tail(string $scope, int $limit): ?array
+//	['ok' => true, 'hit' => true, 'count' => N, 'offset' => 0,
+//	 'truncated' => bool,
+//	 'items' => [ ['scope' => ..., 'id' => ... | null, 'seq' => ..., 'ts' => ..., 'payload' => mixed], ... ]]
 //
-// Distinguishes "no scope" from "empty scope":
-//   - no Caddy module loaded → null
-//   - scope does not exist → null
-//   - scope exists, zero items → []     (empty array, not null)
-//   - scope exists, N items → [payload1, payload2, ...]
+// Miss (scope does not exist):
 //
-// The null-vs-empty-array distinction relies on the build-time
-// wrapper patch (RETURN_EMPTY_ARRAY → RETURN_NULL): when Go returns
-// a nil unsafe.Pointer, PHP sees null; when Go returns a non-nil
-// PHPPackedArray (even of zero elements), PHP sees an array.
+//	['ok' => true, 'hit' => false, 'count' => 0, 'offset' => 0,
+//	 'truncated' => false, 'items' => []]
+//
+// Returns null only when no caddymodule is loaded.
 //
 // export_php:function scopecache_tail(string $scope, int $limit): ?array
 func scopecache_tail(scope *C.zend_string, limit int64) unsafe.Pointer {
@@ -274,20 +638,26 @@ func scopecache_tail(scope *C.zend_string, limit int64) unsafe.Pointer {
 	if gw == nil {
 		return nil
 	}
-	items, _, found := gw.Tail(zendStringView(scope), int(limit), 0)
-	if !found {
-		return nil
-	}
-	return phpPackedArrayFromItems(items)
+	items, truncated, found := gw.Tail(zendStringView(scope), int(limit), 0)
+	return unsafe.Pointer(buildItemsEnvelope(found, items, truncated, true, 0))
 }
 
-// scopecache_head returns the oldest items in scope with seq > afterSeq,
-// up to `limit`. Companion to scopecache_tail — same null-vs-empty-array
-// rules and same per-element array-construction shape.
+// scopecache_head returns the GET /head envelope as a PHP array.
+// Companion to scopecache_tail for forward cursor-based reads.
 //
-// Use afterSeq=0 to start from the beginning of the scope. Returned items
-// are seq-ascending (oldest first); the next call passes the last returned
-// seq as afterSeq to paginate forward.
+// Hit:
+//
+//	['ok' => true, 'hit' => true, 'count' => N,
+//	 'truncated' => bool, 'items' => [ ... ]]
+//
+// Miss:
+//
+//	['ok' => true, 'hit' => false, 'count' => 0,
+//	 'truncated' => false, 'items' => []]
+//
+// `after_seq` filter: 0 starts from the beginning; otherwise returns
+// items with seq strictly greater than `after_seq`. Each item carries
+// its decoded payload as in scopecache_get / scopecache_tail.
 //
 // export_php:function scopecache_head(string $scope, int $after_seq, int $limit): ?array
 func scopecache_head(scope *C.zend_string, afterSeq int64, limit int64) unsafe.Pointer {
@@ -295,28 +665,32 @@ func scopecache_head(scope *C.zend_string, afterSeq int64, limit int64) unsafe.P
 	if gw == nil {
 		return nil
 	}
-	items, _, found := gw.Head(zendStringView(scope), uint64(afterSeq), int(limit))
-	if !found {
-		return nil
-	}
-	return phpPackedArrayFromItems(items)
+	items, truncated, found := gw.Head(zendStringView(scope), uint64(afterSeq), int(limit))
+	return unsafe.Pointer(buildItemsEnvelope(found, items, truncated, false, 0))
 }
 
 // scopecache_get_by_seq looks up a single item by scope + seq. Same
-// shape as scopecache_get, just addressed by the cache-assigned seq
-// instead of the client-supplied id.
+// envelope shape as scopecache_get, just addressed by the cache-
+// assigned seq instead of the client-supplied id.
 //
-// export_php:function scopecache_get_by_seq(string $scope, int $seq): ?string
+// export_php:function scopecache_get_by_seq(string $scope, int $seq): ?array
 func scopecache_get_by_seq(scope *C.zend_string, seq int64) unsafe.Pointer {
 	gw := defaultSlot.Load()
 	if gw == nil {
 		return nil
 	}
 	item, found := gw.GetBySeq(zendStringView(scope), uint64(seq))
-	if !found {
-		return nil
+	arr := phpAssocNew(4)
+	phpAssocAddBool(arr, "ok", true)
+	phpAssocAddBool(arr, "hit", found)
+	if found {
+		phpAssocAddLong(arr, "count", 1)
+		phpAssocAddArray(arr, "item", buildItemAssoc(item))
+	} else {
+		phpAssocAddLong(arr, "count", 0)
+		phpAssocAddNull(arr, "item")
 	}
-	return phpStringFromBytes(item.Payload)
+	return unsafe.Pointer(arr)
 }
 
 // scopecache_render_by_id returns the rendered (HTTP-wire-shape)
@@ -354,38 +728,32 @@ func scopecache_render_by_seq(scope *C.zend_string, seq int64) unsafe.Pointer {
 	return phpStringFromBytes(bytes)
 }
 
-// scopecache_append inserts a new item with cache-assigned seq and
-// returns the assigned seq. The payload bytes must be valid JSON
-// (any JSON value — object, array, string, number, etc.); shape
-// validation lives at the *Gateway boundary.
+// scopecache_append returns the POST /append envelope as a PHP array.
 //
-// Wire shape (PHP-visible):
+// Success:
 //
-//	scopecache_append(string $scope, string $id, string $payload): int
+//	['ok' => true, 'created' => true,
+//	 'item' => ['scope' => ..., 'id' => ... | null, 'seq' => N, 'ts' => N]]
 //
-// Returns:
-//   - seq (>= 1) on success
-//   - 0 on any error: no Caddy module loaded, shape validation
-//     failure, capacity exceeded, duplicate id within scope. seq=0
-//     is never a real assigned seq (the counter starts at 1), so
-//     this sentinel is unambiguous.
+// Error (capacity, duplicate id, validation failure):
 //
-// Sprint-3 plan: replace the 0-sentinel with PHP exceptions so
-// callers can distinguish error categories. For Sprint 1 the
-// sentinel keeps the cgo signature simple.
+//	['ok' => false, 'error' => '<message>']
 //
-// export_php:function scopecache_append(string $scope, string $id, string $payload): int
-func scopecache_append(scope *C.zend_string, id *C.zend_string, payload *C.zend_string) int64 {
+// `created` is always true on /append (the endpoint never replaces)
+// — emitted for uniformity with /upsert and /counter_add. The `item`
+// sub-array deliberately omits `payload` (the client just supplied
+// it, doubling the wire cost would echo it back).
+//
+// Scope and id are deep-copied at the cgo boundary because they
+// become permanent map keys inside scopecache; a zero-copy alias
+// would point to PHP-arena memory freed at request end.
+//
+// export_php:function scopecache_append(string $scope, string $id, string $payload): ?array
+func scopecache_append(scope *C.zend_string, id *C.zend_string, payload *C.zend_string) unsafe.Pointer {
 	gw := defaultSlot.Load()
 	if gw == nil {
-		return 0
+		return nil
 	}
-	// Scope and id MUST be copied — they become permanent map keys
-	// inside scopecache (b.byID[id], s.shards[X].scopes[scope]). A
-	// zero-copy unsafe.String alias would point to PHP-arena memory
-	// that PHP frees at request end, leaving the map indexed by
-	// garbage. Payload is fine to alias here because Gateway.Append's
-	// cloneItemPayload copies it synchronously.
 	item := scopecache.Item{
 		Scope:   zendStringCopy(scope),
 		ID:      zendStringCopy(id),
@@ -393,47 +761,64 @@ func scopecache_append(scope *C.zend_string, id *C.zend_string, payload *C.zend_
 	}
 	result, err := gw.Append(item)
 	if err != nil {
-		return 0
+		return errorEnvelopePtr(errorMsg(err))
 	}
-	return int64(result.Seq)
+	arr := phpAssocNew(3)
+	phpAssocAddBool(arr, "ok", true)
+	phpAssocAddBool(arr, "created", true)
+	phpAssocAddArray(arr, "item", buildWriteAckAssoc(result))
+	return unsafe.Pointer(arr)
 }
 
-// scopecache_upsert creates an item or replaces the payload of an
-// existing one at (scope, id). Returns the assigned seq on create,
-// the preserved seq on replace — same int either way. Returns 0 on
-// validation failure, capacity error, or missing gateway.
+// scopecache_upsert returns the POST /upsert envelope as a PHP array.
 //
-// Same map-key copy discipline as scopecache_append.
+// Success:
 //
-// export_php:function scopecache_upsert(string $scope, string $id, string $payload): int
-func scopecache_upsert(scope *C.zend_string, id *C.zend_string, payload *C.zend_string) int64 {
+//	['ok' => true, 'created' => bool,
+//	 'item' => ['scope' => ..., 'id' => ..., 'seq' => N, 'ts' => N]]
+//
+// `created` is true on first-write of (scope, id), false when an
+// existing item was replaced. On replace, `seq` keeps its original
+// value; on create, `seq` is freshly assigned. `ts` is always
+// refreshed.
+//
+// export_php:function scopecache_upsert(string $scope, string $id, string $payload): ?array
+func scopecache_upsert(scope *C.zend_string, id *C.zend_string, payload *C.zend_string) unsafe.Pointer {
 	gw := defaultSlot.Load()
 	if gw == nil {
-		return 0
+		return nil
 	}
 	item := scopecache.Item{
 		Scope:   zendStringCopy(scope),
 		ID:      zendStringCopy(id),
 		Payload: zendStringBytes(payload),
 	}
-	result, _, err := gw.Upsert(item)
+	result, created, err := gw.Upsert(item)
 	if err != nil {
-		return 0
+		return errorEnvelopePtr(errorMsg(err))
 	}
-	return int64(result.Seq)
+	arr := phpAssocNew(3)
+	phpAssocAddBool(arr, "ok", true)
+	phpAssocAddBool(arr, "created", created)
+	phpAssocAddArray(arr, "item", buildWriteAckAssoc(result))
+	return unsafe.Pointer(arr)
 }
 
-// scopecache_update replaces the payload of an existing item at
-// (scope, id). Returns 1 if an item was updated, 0 if not found OR
-// on validation/error. Sprint 3 will disambiguate via exceptions;
-// callers that need to distinguish "no such item" from "validation
-// failure" must scopecache_get first.
+// scopecache_update returns the POST /update envelope as a PHP array.
 //
-// export_php:function scopecache_update(string $scope, string $id, string $payload): int
-func scopecache_update(scope *C.zend_string, id *C.zend_string, payload *C.zend_string) int64 {
+// Success:
+//
+//	['ok' => true, 'created' => false, 'count' => 0 | 1]
+//
+// `created` is always false on /update (the endpoint never spawns
+// new items) — carried for write-envelope uniformity. `count` is
+// the number of items modified: 0 on miss, 1 on hit.
+//
+// export_php:function scopecache_update(string $scope, string $id, string $payload): ?array
+func scopecache_update(scope *C.zend_string, id *C.zend_string, payload *C.zend_string) unsafe.Pointer {
 	gw := defaultSlot.Load()
 	if gw == nil {
-		return 0
+		return nil
 	}
 	item := scopecache.Item{
 		Scope:   zendStringCopy(scope),
@@ -442,181 +827,214 @@ func scopecache_update(scope *C.zend_string, id *C.zend_string, payload *C.zend_
 	}
 	n, err := gw.Update(item)
 	if err != nil {
-		return 0
+		return errorEnvelopePtr(errorMsg(err))
 	}
-	return int64(n)
+	arr := phpAssocNew(3)
+	phpAssocAddBool(arr, "ok", true)
+	phpAssocAddBool(arr, "created", false)
+	phpAssocAddLong(arr, "count", int64(n))
+	return unsafe.Pointer(arr)
 }
 
-// scopecache_counter_add atomically adds `by` to the counter at
-// (scope, id) and returns the post-add value. Creates the counter
-// if missing (starts at 0 before the add, so first call with by=1
-// returns 1). Returns 0 on error — note that 0 is ALSO a valid
-// counter value, so this sentinel is ambiguous; Sprint 3 will fix
-// with exceptions.
+// scopecache_counter_add returns the POST /counter_add envelope as
+// a PHP array.
 //
-// export_php:function scopecache_counter_add(string $scope, string $id, int $by): int
-func scopecache_counter_add(scope *C.zend_string, id *C.zend_string, by int64) int64 {
+// Success:
+//
+//	['ok' => true, 'created' => bool, 'value' => N]
+//
+// `created` is true on first-touch (the counter was just spawned
+// with value `by`); false when an existing counter was incremented
+// in place. `value` is the post-add counter value.
+//
+// export_php:function scopecache_counter_add(string $scope, string $id, int $by): ?array
+func scopecache_counter_add(scope *C.zend_string, id *C.zend_string, by int64) unsafe.Pointer {
 	gw := defaultSlot.Load()
 	if gw == nil {
-		return 0
+		return nil
 	}
-	value, _, err := gw.CounterAdd(zendStringCopy(scope), zendStringCopy(id), by)
+	value, created, err := gw.CounterAdd(zendStringCopy(scope), zendStringCopy(id), by)
 	if err != nil {
-		return 0
+		return errorEnvelopePtr(errorMsg(err))
 	}
-	return value
+	arr := phpAssocNew(3)
+	phpAssocAddBool(arr, "ok", true)
+	phpAssocAddBool(arr, "created", created)
+	phpAssocAddLong(arr, "value", value)
+	return unsafe.Pointer(arr)
 }
 
-// scopecache_delete removes the item at (scope, id). Returns 1 if
-// an item was deleted, 0 if not found or on error.
+// scopecache_delete returns the POST /delete envelope as a PHP array.
 //
-// Scope/id are NOT retained by scopecache on this path — the delete
-// only takes the shard write-lock briefly and removes by-id from
-// the index maps. Aliases are safe.
+// Success:
 //
-// export_php:function scopecache_delete(string $scope, string $id): int
-func scopecache_delete(scope *C.zend_string, id *C.zend_string) int64 {
+//	['ok' => true, 'hit' => bool, 'count' => 0 | 1]
+//
+// `hit` is `count > 0`. `count` is always 0 or 1 since id is
+// unique-in-scope. A 409 (scope detached) returns the error envelope.
+//
+// export_php:function scopecache_delete(string $scope, string $id): ?array
+func scopecache_delete(scope *C.zend_string, id *C.zend_string) unsafe.Pointer {
 	gw := defaultSlot.Load()
 	if gw == nil {
-		return 0
+		return nil
 	}
 	n, err := gw.Delete(zendStringView(scope), zendStringView(id), 0)
 	if err != nil {
-		return 0
+		return errorEnvelopePtr(errorMsg(err))
 	}
-	return int64(n)
+	return unsafe.Pointer(buildHitCountEnvelope(n))
 }
 
-// scopecache_delete_by_seq removes the item at (scope, seq). Returns
-// 1 if deleted, 0 if not found or on error. Companion to
-// scopecache_delete for the seq-addressed path.
+// scopecache_delete_by_seq returns the POST /delete envelope (seq
+// addressing variant) as a PHP array. Same shape as
+// scopecache_delete.
 //
-// export_php:function scopecache_delete_by_seq(string $scope, int $seq): int
-func scopecache_delete_by_seq(scope *C.zend_string, seq int64) int64 {
+// export_php:function scopecache_delete_by_seq(string $scope, int $seq): ?array
+func scopecache_delete_by_seq(scope *C.zend_string, seq int64) unsafe.Pointer {
 	gw := defaultSlot.Load()
 	if gw == nil {
-		return 0
+		return nil
 	}
 	n, err := gw.Delete(zendStringView(scope), "", uint64(seq))
 	if err != nil {
-		return 0
+		return errorEnvelopePtr(errorMsg(err))
 	}
-	return int64(n)
+	return unsafe.Pointer(buildHitCountEnvelope(n))
 }
 
-// scopecache_delete_up_to removes every item in scope with seq <=
-// maxSeq. The drain-stream primitive: subscribers tail items, then
-// delete_up_to the last seq they processed to free capacity. Returns
-// the deleted count, 0 on error.
+// scopecache_delete_up_to returns the POST /delete_up_to envelope as
+// a PHP array. Same shape as scopecache_delete — `hit` reflects
+// `count > 0`, `count` is the number of items actually removed.
 //
-// export_php:function scopecache_delete_up_to(string $scope, int $max_seq): int
-func scopecache_delete_up_to(scope *C.zend_string, maxSeq int64) int64 {
+// export_php:function scopecache_delete_up_to(string $scope, int $max_seq): ?array
+func scopecache_delete_up_to(scope *C.zend_string, maxSeq int64) unsafe.Pointer {
 	gw := defaultSlot.Load()
 	if gw == nil {
-		return 0
+		return nil
 	}
 	n, err := gw.DeleteUpTo(zendStringView(scope), uint64(maxSeq))
 	if err != nil {
-		return 0
+		return errorEnvelopePtr(errorMsg(err))
 	}
-	return int64(n)
+	return unsafe.Pointer(buildHitCountEnvelope(n))
 }
 
-// scopecache_delete_scope removes the entire scope and every item
-// in it. Returns the count of items deleted (which is also a rough
-// indicator of whether the scope existed: 0 = not found OR empty
-// scope). Reserved scopes (_events, _inbox) are rejected by
-// Gateway.DeleteScope and return 0 here.
+// scopecache_delete_scope returns the POST /delete_scope envelope
+// as a PHP array.
 //
-// export_php:function scopecache_delete_scope(string $scope): int
-func scopecache_delete_scope(scope *C.zend_string) int64 {
+// Success:
+//
+//	['ok' => true, 'hit' => bool, 'count' => N]
+//
+// `hit` is true when the scope existed pre-call (an
+// existing-but-empty scope still hits). `count` is the number of
+// items the scope held at deletion time. Reserved scopes
+// (`_events`, `_inbox`) return the error envelope.
+//
+// export_php:function scopecache_delete_scope(string $scope): ?array
+func scopecache_delete_scope(scope *C.zend_string) unsafe.Pointer {
 	gw := defaultSlot.Load()
 	if gw == nil {
-		return 0
+		return nil
 	}
-	n, _, err := gw.DeleteScope(zendStringView(scope))
+	n, hit, err := gw.DeleteScope(zendStringView(scope))
 	if err != nil {
-		return 0
+		return errorEnvelopePtr(errorMsg(err))
 	}
-	return int64(n)
+	arr := phpAssocNew(3)
+	phpAssocAddBool(arr, "ok", true)
+	phpAssocAddBool(arr, "hit", hit)
+	phpAssocAddLong(arr, "count", int64(n))
+	return unsafe.Pointer(arr)
 }
 
-// scopecache_wipe drops every scope (user-managed AND reserved),
-// resets the byte counter, then re-creates the reserved scopes
-// (_events, _inbox) under the same all-shard write lock so
-// subscribers do not observe a gap. Returns the pre-wipe
-// scope_count (including the reserved scopes that were dropped
-// and immediately re-created — a freshly-booted store wiped
-// immediately returns 2, not 0).
+// scopecache_wipe returns the POST /wipe envelope as a PHP array.
 //
-// Use with care: this is the equivalent of /wipe in the HTTP API,
-// not a per-scope clear.
+// Success:
 //
-// export_php:function scopecache_wipe(): int
-func scopecache_wipe() int64 {
+//	['ok' => true, 'scopes' => N, 'items' => M, 'freed_mb' => F]
+//
+// `scopes` and `items` count what was dropped — including the two
+// reserved scopes that the cache immediately re-creates under the
+// same all-shard write lock (so a freshly-booted store wiped
+// immediately reports `scopes => 2`, not 0). `freed_mb` is the
+// bytes returned to the store-wide budget, in MiB.
+//
+// Use with care: equivalent to POST /wipe in the HTTP API.
+//
+// export_php:function scopecache_wipe(): ?array
+func scopecache_wipe() unsafe.Pointer {
 	gw := defaultSlot.Load()
 	if gw == nil {
-		return 0
+		return nil
 	}
-	scopeCount, _, _ := gw.Wipe()
-	return int64(scopeCount)
+	scopeCount, itemCount, freedBytes := gw.Wipe()
+	arr := phpAssocNew(4)
+	phpAssocAddBool(arr, "ok", true)
+	phpAssocAddLong(arr, "scopes", int64(scopeCount))
+	phpAssocAddLong(arr, "items", int64(itemCount))
+	phpAssocAddDouble(arr, "freed_mb", float64(freedBytes)/1048576.0)
+	return unsafe.Pointer(arr)
 }
 
-// scopecache_stats returns the store-wide snapshot as a JSON-encoded
-// string — identical shape to what GET /stats returns over HTTP, just
-// without the outer envelope. Callers typically `json_decode(..., true)`
-// to get a PHP associative array.
+// scopecache_stats returns the GET /stats envelope as a PHP array —
+// identical shape to what HTTP serves, native PHP types throughout.
 //
-// JSON return (rather than a native PHP assoc-array) chosen for
-// Sprint 2 to avoid building a from-scratch assoc-array cgo helper
-// just for two functions (this one + scopecache_scopelist). The
-// PHP-side json_decode cost is ~1-3 µs for a typical stats payload —
-// fine for an observability call that fires once per request at most.
+//	['ok' => true,
+//	 'scopes' => N, 'items' => M, 'approx_store_mb' => F,
+//	 'last_write_ts' => N, 'events_drops_total' => N,
+//	 'reserved_scopes' => [
+//	    ['scope' => '_events', 'item_count' => N, 'last_seq' => N,
+//	     'approx_scope_mb' => F, 'created_ts' => N, 'last_write_ts' => N],
+//	    ['scope' => '_inbox',  ...]
+//	 ]]
 //
-// Returns "" (empty string, which PHP sees as null via the wrapper-
-// patch on RETURN_EMPTY_STRING) when no Caddy module is loaded or
-// JSON marshalling fails (latter should be impossible given the
-// known struct shape).
-//
-// export_php:function scopecache_stats(): ?string
+// export_php:function scopecache_stats(): ?array
 func scopecache_stats() unsafe.Pointer {
 	gw := defaultSlot.Load()
 	if gw == nil {
 		return nil
 	}
-	stats := gw.Stats()
-	bytes, err := json.Marshal(stats)
-	if err != nil {
-		return nil
-	}
-	return phpStringFromBytes(bytes)
+	st := gw.Stats()
+	arr := phpAssocNew(7)
+	phpAssocAddBool(arr, "ok", true)
+	phpAssocAddLong(arr, "scopes", int64(st.Scopes))
+	phpAssocAddLong(arr, "items", int64(st.Items))
+	phpAssocAddDouble(arr, "approx_store_mb", float64(st.ApproxStoreMB)/1048576.0)
+	phpAssocAddLong(arr, "last_write_ts", st.LastWriteTS)
+	phpAssocAddLong(arr, "events_drops_total", st.EventsDropsTotal)
+	phpAssocAddArray(arr, "reserved_scopes", buildReservedScopesArray(st.ReservedScopes))
+	return unsafe.Pointer(arr)
 }
 
-// scopecache_scopelist returns the per-scope detail rows as a
-// JSON-encoded array string. Same JSON-vs-native-array trade-off
-// as scopecache_stats — caller does json_decode to consume.
+// scopecache_scopelist returns the GET /scopelist envelope as a PHP
+// array — paginated per-scope detail rows in alphabetical order.
 //
-// Params:
+//	['ok' => true, 'hit' => bool, 'count' => N, 'truncated' => bool,
+//	 'scopes' => [
+//	    ['scope' => '...', 'item_count' => N, 'last_seq' => N,
+//	     'approx_scope_mb' => F, 'created_ts' => N, 'last_write_ts' => N,
+//	     'last_access_ts' => N, 'read_count_total' => N], ...
+//	 ]]
 //
-//	$prefix — optional filter; pass "" for no filter.
-//	$after  — pagination cursor (scope name); pass "" to start
-//	          from the beginning.
-//	$limit  — page size.
+// Params: `prefix` "" = no filter; `after` "" = start from beginning;
+// `limit` = page size (clamped server-side).
 //
-// Returns "" / null on no Caddy module or JSON marshal failure.
-//
-// export_php:function scopecache_scopelist(string $prefix, string $after, int $limit): ?string
+// export_php:function scopecache_scopelist(string $prefix, string $after, int $limit): ?array
 func scopecache_scopelist(prefix *C.zend_string, after *C.zend_string, limit int64) unsafe.Pointer {
 	gw := defaultSlot.Load()
 	if gw == nil {
 		return nil
 	}
-	entries, _ := gw.ScopeList(zendStringView(prefix), zendStringView(after), int(limit))
-	bytes, err := json.Marshal(entries)
-	if err != nil {
-		return nil
-	}
-	return phpStringFromBytes(bytes)
+	entries, truncated := gw.ScopeList(zendStringView(prefix), zendStringView(after), int(limit))
+	arr := phpAssocNew(5)
+	phpAssocAddBool(arr, "ok", true)
+	phpAssocAddBool(arr, "hit", len(entries) > 0)
+	phpAssocAddLong(arr, "count", int64(len(entries)))
+	phpAssocAddBool(arr, "truncated", truncated)
+	phpAssocAddArray(arr, "scopes", buildScopeListPackedArray(entries))
+	return unsafe.Pointer(arr)
 }
 
 // phpArrayToGroupedItems converts the nested PHP array shape used by
@@ -676,58 +1094,69 @@ func phpArrayToGroupedItems(arr *C.zend_array) (map[string][]scopecache.Item, er
 	return out, nil
 }
 
-// scopecache_warm replaces the contents of every scope present in
-// `grouped`. Scopes NOT in `grouped` are left untouched. Returns the
-// number of scopes affected; 0 on any error (no Caddy module, shape
-// validation failure, capacity exhausted, reserved-scope target).
+// scopecache_warm returns the POST /warm envelope as a PHP array.
+// Replaces the contents of every scope present in `grouped`; scopes
+// NOT in `grouped` are left untouched.
 //
-// Typical use: init-script pattern — a PHP boot-time script reads
-// from the source-of-truth (DB, JSON file) and warms a fixed set of
-// scopes in one call, avoiding the cgo + lock-acquisition cost of
-// many small appends.
+// Success:
 //
-// export_php:function scopecache_warm(array $grouped): int
-func scopecache_warm(grouped *C.zend_array) int64 {
+//	['ok' => true, 'scopes' => N]
+//
+// `scopes` is the number of distinct scopes the call rewrote.
+// Reserved-scope targets, capacity overflow, or input-shape
+// failures return the error envelope.
+//
+// export_php:function scopecache_warm(array $grouped): ?array
+func scopecache_warm(grouped *C.zend_array) unsafe.Pointer {
 	gw := defaultSlot.Load()
 	if gw == nil {
-		return 0
+		return nil
 	}
 	goGrouped, err := phpArrayToGroupedItems(grouped)
 	if err != nil {
-		return 0
+		return errorEnvelopePtr(err.Error())
 	}
 	n, err := gw.Warm(goGrouped)
 	if err != nil {
-		return 0
+		return errorEnvelopePtr(errorMsg(err))
 	}
-	return int64(n)
+	arr := phpAssocNew(2)
+	phpAssocAddBool(arr, "ok", true)
+	phpAssocAddLong(arr, "scopes", int64(n))
+	return unsafe.Pointer(arr)
 }
 
-// scopecache_rebuild atomically replaces the entire user-managed
-// cache state with `grouped`. Reserved scopes (_events, _inbox) are
-// wiped and re-created under the same all-shard write lock.
-// Returns the scope_count after the rebuild; 0 on any error.
+// scopecache_rebuild returns the POST /rebuild envelope as a PHP
+// array. Atomically replaces the entire user-managed cache state
+// with `grouped`; reserved scopes are re-created under the same
+// all-shard write lock.
 //
-// Use case: full reset to a known good state — typically the
-// init-script pattern after a crash, where every relevant scope
-// must come back to its source-of-truth contents and any leftover
-// scopes must disappear. Differs from scopecache_warm in that warm
-// only touches scopes named in the input; rebuild also drops
-// anything not named.
+// Success:
 //
-// export_php:function scopecache_rebuild(array $grouped): int
-func scopecache_rebuild(grouped *C.zend_array) int64 {
+//	['ok' => true, 'scopes' => N, 'items' => M]
+//
+// `scopes` and `items` reflect the post-rebuild totals (including
+// the two reserved scopes the cache re-creates). Differs from
+// scopecache_warm: rebuild drops anything not named in `grouped`,
+// warm leaves untouched scopes alone.
+//
+// export_php:function scopecache_rebuild(array $grouped): ?array
+func scopecache_rebuild(grouped *C.zend_array) unsafe.Pointer {
 	gw := defaultSlot.Load()
 	if gw == nil {
-		return 0
+		return nil
 	}
 	goGrouped, err := phpArrayToGroupedItems(grouped)
 	if err != nil {
-		return 0
+		return errorEnvelopePtr(err.Error())
 	}
-	n, _, err := gw.Rebuild(goGrouped)
+	scopes, items, err := gw.Rebuild(goGrouped)
 	if err != nil {
-		return 0
+		return errorEnvelopePtr(errorMsg(err))
 	}
-	return int64(n)
+	arr := phpAssocNew(3)
+	phpAssocAddBool(arr, "ok", true)
+	phpAssocAddLong(arr, "scopes", int64(scopes))
+	phpAssocAddLong(arr, "items", int64(items))
+	return unsafe.Pointer(arr)
 }

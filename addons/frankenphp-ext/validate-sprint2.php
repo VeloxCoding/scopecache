@@ -1,8 +1,10 @@
 <?php
-// validate-sprint2.php — correctness checks for the Sprint 2 surface:
-// head, get_by_seq, render_by_id, render_by_seq, upsert, update,
-// counter_add, delete, delete_by_seq, delete_up_to, delete_scope,
-// wipe, stats, scopelist.
+// validate-sprint2.php — correctness checks for the array-returning
+// surface of the scopecache FrankenPHP extension. Every function
+// (except scopecache_render_by_id/_by_seq, which mirror /render's
+// raw-bytes shape) now returns a PHP associative array that mirrors
+// the JSON envelope the HTTP API would produce — no json_decode
+// needed.
 //
 // Output is PASS/FAIL per check; validate-sprint2.sh greps for the
 // final OVERALL: PASS/FAIL line.
@@ -24,14 +26,25 @@ function check(string $label, bool $ok, string $detail = ''): void {
     }
 }
 
+// Helpers to keep assertions tight. seq() pulls the assigned seq from
+// an envelope produced by scopecache_append / scopecache_upsert;
+// payloadOf() pulls the decoded payload from a /get envelope; itemsOf()
+// pulls the items[] array from a /head or /tail envelope.
+function seq(array $env): int          { return $env['item']['seq'] ?? -1; }
+function payloadOf(array $env): mixed  { return $env['item']['payload'] ?? null; }
+function itemsOf(array $env): array    { return $env['items'] ?? []; }
+
 echo "=== validate-sprint2.php ===\n\n";
 
-// --- 0. Sanity: all new functions are loaded ---------------------------------
+// --- 0. Sanity: all functions are loaded -------------------------------------
 foreach ([
-    'scopecache_head',
+    'scopecache_get',
     'scopecache_get_by_seq',
+    'scopecache_head',
+    'scopecache_tail',
     'scopecache_render_by_id',
     'scopecache_render_by_seq',
+    'scopecache_append',
     'scopecache_upsert',
     'scopecache_update',
     'scopecache_counter_add',
@@ -53,142 +66,183 @@ foreach ([
 $rand  = bin2hex(random_bytes(4));
 $scope = "v2-$rand";
 
-// --- 1. head: append N items, then head them back ----------------------------
+// --- 1. append envelope shape ------------------------------------------------
 $N = 5;
 $seqs = [];
 for ($i = 0; $i < $N; $i++) {
-    $seqs[$i] = scopecache_append($scope, "id-$i", json_encode(['i' => $i]));
+    $env = scopecache_append($scope, "id-$i", json_encode(['i' => $i]));
+    check("append #$i returns array envelope", is_array($env));
+    check("append #$i envelope ok=true", ($env['ok'] ?? false) === true);
+    check("append #$i envelope created=true", ($env['created'] ?? null) === true);
+    check("append #$i envelope item.scope matches", ($env['item']['scope'] ?? '') === $scope);
+    check("append #$i envelope item.id matches", ($env['item']['id'] ?? null) === "id-$i");
+    check("append #$i envelope item.seq is positive int", is_int($env['item']['seq'] ?? null) && $env['item']['seq'] >= 1);
+    $seqs[$i] = seq($env);
 }
 
+// --- 2. head envelope shape --------------------------------------------------
 $head_all = scopecache_head($scope, 0, 100);
-check("head(after=0, limit=100) returns array of N items",
-    is_array($head_all) && count($head_all) === $N,
-    "got count=" . (is_array($head_all) ? count($head_all) : 'n/a'));
+check("head returns array envelope", is_array($head_all));
+check("head ok=true", ($head_all['ok'] ?? false) === true);
+check("head hit=true (scope exists)", ($head_all['hit'] ?? null) === true);
+check("head count=$N", ($head_all['count'] ?? -1) === $N);
+check("head truncated=false (well under limit)", ($head_all['truncated'] ?? null) === false);
+check("head items is array of $N entries", count(itemsOf($head_all)) === $N);
+
+// Each item carries the uniform 5-key shape; payload is decoded.
+$item0 = itemsOf($head_all)[0];
+check("head item[0] has scope/id/seq/ts/payload keys",
+    isset($item0['scope'], $item0['id'], $item0['seq'], $item0['ts'], $item0['payload']));
+check("head item[0].payload is decoded to PHP array (not raw JSON string)",
+    is_array($item0['payload']) && ($item0['payload']['i'] ?? null) === 0,
+    "got " . var_export($item0['payload'], true));
 
 $head_after = scopecache_head($scope, $seqs[2], 100);
-check("head(after=seq[2], limit=100) returns the last N-3 items",
-    is_array($head_after) && count($head_after) === ($N - 3),
-    "got count=" . (is_array($head_after) ? count($head_after) : 'n/a'));
+check("head(after=seq[2]) returns N-3 items", count(itemsOf($head_after)) === ($N - 3));
 
 $head_miss = scopecache_head("no-such-scope-$rand", 0, 100);
-check("head(unknown scope, ...) returns NULL", $head_miss === null);
+check("head(unknown scope) hit=false, items=[]",
+    is_array($head_miss) && ($head_miss['hit'] ?? null) === false && itemsOf($head_miss) === []);
 
-// --- 2. get_by_seq + render_by_seq + render_by_id ----------------------------
-$item2_payload_expected = json_encode(['i' => 2]);
-$got_by_seq = scopecache_get_by_seq($scope, $seqs[2]);
-check("get_by_seq returns the item at the requested seq",
-    $got_by_seq === $item2_payload_expected,
-    "got " . var_export($got_by_seq, true));
+// --- 3. get / get_by_seq envelope --------------------------------------------
+$got = scopecache_get($scope, "id-2");
+check("get hit=true on existing id", ($got['hit'] ?? null) === true);
+check("get count=1 on hit", ($got['count'] ?? -1) === 1);
+check("get item.payload decoded to ['i' => 2]",
+    payloadOf($got) === ['i' => 2],
+    "got " . var_export(payloadOf($got), true));
 
-$got_by_seq_miss = scopecache_get_by_seq($scope, 9999999);
-check("get_by_seq miss returns NULL", $got_by_seq_miss === null);
+$got_miss = scopecache_get($scope, "no-such-id-$rand");
+check("get miss hit=false, count=0, item=null",
+    ($got_miss['hit'] ?? null) === false
+    && ($got_miss['count'] ?? -1) === 0
+    && array_key_exists('item', $got_miss) && $got_miss['item'] === null);
 
+$got_seq = scopecache_get_by_seq($scope, $seqs[2]);
+check("get_by_seq hit=true on existing seq", ($got_seq['hit'] ?? null) === true);
+check("get_by_seq item.payload matches", payloadOf($got_seq) === ['i' => 2]);
+
+$got_seq_miss = scopecache_get_by_seq($scope, 9999999);
+check("get_by_seq miss hit=false", ($got_seq_miss['hit'] ?? null) === false);
+
+// --- 4. render_by_* (raw-bytes contract, unchanged) --------------------------
 $render_by_id = scopecache_render_by_id($scope, "id-2");
-check("render_by_id returns the same payload bytes for JSON payloads",
-    $render_by_id === $item2_payload_expected,
+check("render_by_id returns raw JSON-bytes string",
+    $render_by_id === json_encode(['i' => 2]),
     "got " . var_export($render_by_id, true));
 
 $render_by_seq = scopecache_render_by_seq($scope, $seqs[2]);
-check("render_by_seq returns the same payload bytes for JSON payloads",
-    $render_by_seq === $item2_payload_expected);
+check("render_by_seq returns raw JSON-bytes string",
+    $render_by_seq === json_encode(['i' => 2]));
 
-// --- 3. upsert: create-or-replace --------------------------------------------
-$upsert_seq = scopecache_upsert($scope, "id-2", json_encode(['i' => 2, 'updated' => true]));
-check("upsert on existing id returns non-zero seq", $upsert_seq !== 0);
-check("upsert preserved the original seq",
-    $upsert_seq === $seqs[2],
-    "upsert returned $upsert_seq, original was {$seqs[2]}");
-$got_after_upsert = scopecache_get($scope, "id-2");
-check("upsert replaced the payload",
-    $got_after_upsert === json_encode(['i' => 2, 'updated' => true]));
+// --- 5. upsert envelope ------------------------------------------------------
+$ups = scopecache_upsert($scope, "id-2", json_encode(['i' => 2, 'updated' => true]));
+check("upsert ok=true", ($ups['ok'] ?? null) === true);
+check("upsert created=false on existing id", ($ups['created'] ?? null) === false);
+check("upsert preserved seq on replace", seq($ups) === $seqs[2]);
+$got_after_ups = scopecache_get($scope, "id-2");
+check("upsert replaced the payload (decoded)",
+    payloadOf($got_after_ups) === ['i' => 2, 'updated' => true]);
 
-$new_upsert_seq = scopecache_upsert($scope, "id-new", json_encode(['i' => 99]));
-check("upsert with new id returns positive seq (creates)",
-    $new_upsert_seq >= 1);
+$ups_new = scopecache_upsert($scope, "id-new", json_encode(['i' => 99]));
+check("upsert with new id created=true", ($ups_new['created'] ?? null) === true);
+check("upsert new id seq >= 1", seq($ups_new) >= 1);
 
-// --- 4. update: only touches existing items ----------------------------------
-$updated = scopecache_update($scope, "id-2", json_encode(['i' => 2, 'rewritten' => true]));
-check("update on existing id returns 1", $updated === 1);
-$got_after_update = scopecache_get($scope, "id-2");
+// --- 6. update envelope ------------------------------------------------------
+$upd = scopecache_update($scope, "id-2", json_encode(['i' => 2, 'rewritten' => true]));
+check("update ok=true", ($upd['ok'] ?? null) === true);
+check("update created=false (always)", ($upd['created'] ?? null) === false);
+check("update count=1 on hit", ($upd['count'] ?? -1) === 1);
+$got_after_upd = scopecache_get($scope, "id-2");
 check("update changed the payload",
-    $got_after_update === json_encode(['i' => 2, 'rewritten' => true]));
+    payloadOf($got_after_upd) === ['i' => 2, 'rewritten' => true]);
 
-$update_missing = scopecache_update($scope, "no-such-id-$rand", '"x"');
-check("update on missing id returns 0", $update_missing === 0);
+$upd_miss = scopecache_update($scope, "no-such-id-$rand", '"x"');
+check("update count=0 on miss", ($upd_miss['count'] ?? -1) === 0);
 
-// --- 5. counter_add ----------------------------------------------------------
+// --- 7. counter_add envelope -------------------------------------------------
 $counter_scope = "v2-counter-$rand";
 $c1 = scopecache_counter_add($counter_scope, "hits", 1);
-check("counter_add first call returns 1", $c1 === 1, "got $c1");
+check("counter_add first call ok=true", ($c1['ok'] ?? null) === true);
+check("counter_add first call created=true", ($c1['created'] ?? null) === true);
+check("counter_add first call value=1", ($c1['value'] ?? -1) === 1);
+
 $c2 = scopecache_counter_add($counter_scope, "hits", 5);
-check("counter_add second call returns 6 (1+5)", $c2 === 6, "got $c2");
+check("counter_add second call created=false", ($c2['created'] ?? null) === false);
+check("counter_add second call value=6", ($c2['value'] ?? -1) === 6);
+
 $c3 = scopecache_counter_add($counter_scope, "hits", -2);
-check("counter_add with negative returns 4 (6-2)", $c3 === 4, "got $c3");
+check("counter_add negative value=4 (6-2)", ($c3['value'] ?? -1) === 4);
 
-// --- 6. delete (by id) -------------------------------------------------------
-$deleted = scopecache_delete($scope, "id-0");
-check("delete on existing id returns 1", $deleted === 1);
-$got_deleted = scopecache_get($scope, "id-0");
-check("delete actually removed the item (get returns NULL)", $got_deleted === null);
+// --- 8. delete envelope ------------------------------------------------------
+$del = scopecache_delete($scope, "id-0");
+check("delete ok=true, hit=true, count=1",
+    ($del['ok'] ?? null) === true && ($del['hit'] ?? null) === true && ($del['count'] ?? -1) === 1);
+$got_after_del = scopecache_get($scope, "id-0");
+check("delete actually removed the item (get hit=false)",
+    ($got_after_del['hit'] ?? null) === false);
 
-$delete_missing = scopecache_delete($scope, "no-such-id-$rand");
-check("delete on missing id returns 0", $delete_missing === 0);
+$del_miss = scopecache_delete($scope, "no-such-id-$rand");
+check("delete on missing id hit=false, count=0",
+    ($del_miss['hit'] ?? null) === false && ($del_miss['count'] ?? -1) === 0);
 
-// --- 7. delete_by_seq --------------------------------------------------------
-$deleted_seq = scopecache_delete_by_seq($scope, $seqs[1]);
-check("delete_by_seq on existing seq returns 1", $deleted_seq === 1);
-$delete_by_seq_missing = scopecache_delete_by_seq($scope, 9999999);
-check("delete_by_seq on unknown seq returns 0", $delete_by_seq_missing === 0);
+// --- 9. delete_by_seq envelope ----------------------------------------------
+$del_seq = scopecache_delete_by_seq($scope, $seqs[1]);
+check("delete_by_seq hit=true, count=1",
+    ($del_seq['hit'] ?? null) === true && ($del_seq['count'] ?? -1) === 1);
+$del_seq_miss = scopecache_delete_by_seq($scope, 9999999);
+check("delete_by_seq miss hit=false", ($del_seq_miss['hit'] ?? null) === false);
 
-// --- 8. delete_up_to ---------------------------------------------------------
+// --- 10. delete_up_to envelope ----------------------------------------------
 $bulk_scope = "v2-bulk-$rand";
 $bulk_seqs = [];
 for ($i = 0; $i < 10; $i++) {
-    $bulk_seqs[$i] = scopecache_append($bulk_scope, "b-$i", '"x"');
+    $bulk_seqs[$i] = seq(scopecache_append($bulk_scope, "b-$i", '"x"'));
 }
 $drained = scopecache_delete_up_to($bulk_scope, $bulk_seqs[4]);
-check("delete_up_to deletes 5 items (b-0..b-4 inclusive)", $drained === 5,
-    "got $drained");
+check("delete_up_to count=5 (b-0..b-4)",
+    ($drained['count'] ?? -1) === 5,
+    "got " . var_export($drained, true));
 $head_after_drain = scopecache_head($bulk_scope, 0, 100);
 check("after drain, head returns 5 remaining items",
-    is_array($head_after_drain) && count($head_after_drain) === 5);
+    count(itemsOf($head_after_drain)) === 5);
 
-// --- 9. delete_scope ---------------------------------------------------------
-$dropped_n = scopecache_delete_scope($bulk_scope);
-check("delete_scope returns count of remaining items (5)", $dropped_n === 5,
-    "got $dropped_n");
+// --- 11. delete_scope envelope ----------------------------------------------
+$ds = scopecache_delete_scope($bulk_scope);
+check("delete_scope ok=true, hit=true, count=5",
+    ($ds['ok'] ?? null) === true && ($ds['hit'] ?? null) === true && ($ds['count'] ?? -1) === 5);
 $tail_after_drop = scopecache_tail($bulk_scope, 1);
-check("after delete_scope, tail returns NULL", $tail_after_drop === null);
+check("after delete_scope, tail hit=false, items=[]",
+    ($tail_after_drop['hit'] ?? null) === false && itemsOf($tail_after_drop) === []);
 
-// --- 10. stats ---------------------------------------------------------------
-$stats_json = scopecache_stats();
-check("stats returns a non-null string", is_string($stats_json) && $stats_json !== '');
-$stats = json_decode($stats_json, true);
-check("stats JSON decodes to an array", is_array($stats));
-check("stats has scopes key", is_array($stats) && array_key_exists('scopes', $stats));
-check("stats scopes is non-negative int",
-    is_array($stats) && is_int($stats['scopes'] ?? null) && $stats['scopes'] >= 0);
+// --- 12. stats envelope (already an array, no decode) -----------------------
+$stats = scopecache_stats();
+check("stats returns array directly", is_array($stats));
+check("stats ok=true", ($stats['ok'] ?? null) === true);
+check("stats has scopes/items/approx_store_mb keys",
+    isset($stats['scopes'], $stats['items'], $stats['approx_store_mb']));
+check("stats.scopes is non-negative int",
+    is_int($stats['scopes'] ?? null) && $stats['scopes'] >= 0);
+check("stats.items is non-negative int",
+    is_int($stats['items'] ?? null) && $stats['items'] >= 0);
+check("stats.reserved_scopes is array of 2", count($stats['reserved_scopes'] ?? []) === 2);
 
-// --- 11. scopelist -----------------------------------------------------------
-$list_json = scopecache_scopelist('', '', 100);
-check("scopelist returns a non-null string", is_string($list_json) && $list_json !== '');
-$list = json_decode($list_json, true);
-check("scopelist JSON decodes to an array", is_array($list));
-// Our $scope should show up.
+// --- 13. scopelist envelope -------------------------------------------------
+$list = scopecache_scopelist('', '', 100);
+check("scopelist returns array directly", is_array($list));
+check("scopelist ok=true", ($list['ok'] ?? null) === true);
+check("scopelist.scopes is array", is_array($list['scopes'] ?? null));
 $found = false;
-if (is_array($list)) {
-    foreach ($list as $row) {
-        if (($row['scope'] ?? null) === $scope) { $found = true; break; }
-    }
+foreach ($list['scopes'] ?? [] as $row) {
+    if (($row['scope'] ?? null) === $scope) { $found = true; break; }
 }
 check("scopelist includes our test scope '$scope'", $found);
 
-$list_filtered_json = scopecache_scopelist("v2-", '', 100);
-$list_filtered = json_decode($list_filtered_json, true);
-check("scopelist with prefix 'v2-' returns non-empty array",
-    is_array($list_filtered) && count($list_filtered) > 0);
+$list_filtered = scopecache_scopelist("v2-", '', 100);
+check("scopelist with prefix 'v2-' non-empty",
+    count($list_filtered['scopes'] ?? []) > 0);
 
-// --- 12. warm: replace contents of selected scopes ---------------------------
+// --- 14. warm envelope ------------------------------------------------------
 $warm_scope_a = "v2-warm-a-$rand";
 $warm_scope_b = "v2-warm-b-$rand";
 
@@ -203,64 +257,65 @@ $warm_input = [
     ],
 ];
 
-$warm_n = scopecache_warm($warm_input);
-check("warm with 2 scopes returns 2", $warm_n === 2, "got $warm_n");
+$warm_env = scopecache_warm($warm_input);
+check("warm ok=true, scopes=2",
+    ($warm_env['ok'] ?? null) === true && ($warm_env['scopes'] ?? -1) === 2);
 
 $warm_tail_a = scopecache_tail($warm_scope_a, 10);
-check("warm-target A has 3 items after the call",
-    is_array($warm_tail_a) && count($warm_tail_a) === 3);
+check("warm A has 3 items", count(itemsOf($warm_tail_a)) === 3);
 
-// Byte-exact round-trip per item in scope A — both id-addressed items
-// (get) and the seq-only one (compare via tail position; tail returns
-// oldest-first within the window, matching insertion order from the
-// warm-input array).
-check("warm A: item-one byte-exact via scopecache_get",
-    scopecache_get($warm_scope_a, 'one') === json_encode(['v' => 1]));
-check("warm A: item-two byte-exact via scopecache_get",
-    scopecache_get($warm_scope_a, 'two') === json_encode(['v' => 2]));
-check("warm A: tail order matches input order",
-    is_array($warm_tail_a)
-    && $warm_tail_a[0] === json_encode(['v' => 1])
-    && $warm_tail_a[1] === json_encode(['v' => 2])
-    && $warm_tail_a[2] === json_encode(['seq_only' => true]));
+// Byte-exact round-trip per item: payload arrives decoded.
+$one = scopecache_get($warm_scope_a, 'one');
+check("warm A: 'one' payload decoded to ['v' => 1]",
+    payloadOf($one) === ['v' => 1]);
+$two = scopecache_get($warm_scope_a, 'two');
+check("warm A: 'two' payload decoded to ['v' => 2]",
+    payloadOf($two) === ['v' => 2]);
+
+// Tail items[] order matches input order; each item carries its
+// decoded payload AND null id for the seq-only entry.
+$tailItemsA = itemsOf($warm_tail_a);
+check("warm A: tail item[0].payload == ['v' => 1]",
+    ($tailItemsA[0]['payload'] ?? null) === ['v' => 1]);
+check("warm A: tail item[1].payload == ['v' => 2]",
+    ($tailItemsA[1]['payload'] ?? null) === ['v' => 2]);
+check("warm A: tail item[2] is the seq-only entry (id=null)",
+    array_key_exists('id', $tailItemsA[2]) && $tailItemsA[2]['id'] === null
+    && ($tailItemsA[2]['payload'] ?? null) === ['seq_only' => true]);
 
 $warm_tail_b = scopecache_tail($warm_scope_b, 10);
-check("warm-target B has 1 item after the call",
-    is_array($warm_tail_b) && count($warm_tail_b) === 1);
-check("warm B: item-alpha byte-exact via scopecache_get",
-    scopecache_get($warm_scope_b, 'alpha') === json_encode(['letter' => 'a']));
-check("warm B: tail content matches input",
-    is_array($warm_tail_b)
-    && $warm_tail_b[0] === json_encode(['letter' => 'a']));
+check("warm B has 1 item", count(itemsOf($warm_tail_b)) === 1);
+$alpha = scopecache_get($warm_scope_b, 'alpha');
+check("warm B: 'alpha' payload decoded to ['letter' => 'a']",
+    payloadOf($alpha) === ['letter' => 'a']);
 
-// Cross-scope leak: scope A must not contain scope B's payload, and vice versa.
+// Cross-scope leak check (compare decoded payloads).
+$tailItemsB = itemsOf($warm_tail_b);
+$payloadsA = array_map(fn($it) => $it['payload'] ?? null, $tailItemsA);
+$payloadsB = array_map(fn($it) => $it['payload'] ?? null, $tailItemsB);
 check("warm: scope A does NOT contain scope B's payload",
-    is_array($warm_tail_a)
-    && !in_array(json_encode(['letter' => 'a']), $warm_tail_a, true));
+    !in_array(['letter' => 'a'], $payloadsA, true));
 check("warm: scope B does NOT contain scope A's payload",
-    is_array($warm_tail_b)
-    && !in_array(json_encode(['v' => 1]), $warm_tail_b, true));
+    !in_array(['v' => 1], $payloadsB, true));
 
-// Get on a definitely-NOT-warmed id in scope A must still return null
-// (proves warm did not over-populate; ids stay strictly as given).
-check("warm A: get of a non-warmed id returns null",
-    scopecache_get($warm_scope_a, 'definitely-not-warmed') === null);
+check("warm A: get of a non-warmed id returns hit=false",
+    (scopecache_get($warm_scope_a, 'definitely-not-warmed')['hit'] ?? null) === false);
 
-// --- 13. warm error path: missing payload -----------------------------------
+// --- 15. warm error path: missing payload -----------------------------------
 $bad_warm = scopecache_warm([
     "v2-bad-$rand" => [['id' => 'a']], // payload key missing
 ]);
-check("warm with missing payload returns 0", $bad_warm === 0,
-    "got $bad_warm");
+check("warm with missing payload returns error envelope",
+    is_array($bad_warm) && ($bad_warm['ok'] ?? null) === false);
 
-// --- 14. warm rejects reserved scopes ---------------------------------------
+// --- 16. warm rejects reserved scopes ---------------------------------------
 $reserved_warm = scopecache_warm([
     '_events' => [['id' => 'oops', 'payload' => '"x"']],
 ]);
-check("warm targeting _events returns 0 (reserved)", $reserved_warm === 0,
-    "got $reserved_warm");
+check("warm targeting _events returns error envelope",
+    is_array($reserved_warm) && ($reserved_warm['ok'] ?? null) === false);
 
-// --- 15. rebuild: atomic full-state replace ---------------------------------
+// --- 17. rebuild envelope ---------------------------------------------------
 $rebuild_scope = "v2-rebuild-$rand";
 $rebuild_input = [
     $rebuild_scope => [
@@ -270,60 +325,59 @@ $rebuild_input = [
     ],
 ];
 
-// Pre-seed an unrelated user scope to verify rebuild WIPES it (rebuild
-// is the "drop everything user-managed + apply input" primitive).
+// Pre-seed an unrelated user scope to verify rebuild WIPES it.
 $soon_to_be_dropped = "v2-pre-rebuild-$rand";
 scopecache_append($soon_to_be_dropped, 'leftover', '"x"');
 $pre_tail = scopecache_tail($soon_to_be_dropped, 1);
-check("pre-rebuild: leftover scope exists", is_array($pre_tail) && count($pre_tail) === 1);
+check("pre-rebuild: leftover scope exists", count(itemsOf($pre_tail)) === 1);
 
-$rebuild_n = scopecache_rebuild($rebuild_input);
-check("rebuild returns positive scope count", $rebuild_n >= 1, "got $rebuild_n");
+$rebuild_env = scopecache_rebuild($rebuild_input);
+check("rebuild ok=true", ($rebuild_env['ok'] ?? null) === true);
+check("rebuild scopes >= 1", ($rebuild_env['scopes'] ?? 0) >= 1);
+check("rebuild items >= 3", ($rebuild_env['items'] ?? 0) >= 3);
 
 $post_rebuild_dropped = scopecache_tail($soon_to_be_dropped, 1);
 check("rebuild dropped the pre-existing user scope",
-    $post_rebuild_dropped === null);
+    ($post_rebuild_dropped['hit'] ?? null) === false);
 
 $post_rebuild_target = scopecache_tail($rebuild_scope, 10);
 check("rebuild target has 3 items",
-    is_array($post_rebuild_target) && count($post_rebuild_target) === 3);
+    count(itemsOf($post_rebuild_target)) === 3);
 
-// Byte-exact round-trip per rebuild item via scopecache_get.
-check("rebuild: r1 byte-exact via scopecache_get",
-    scopecache_get($rebuild_scope, 'r1') === '"first"');
-check("rebuild: r2 byte-exact via scopecache_get",
-    scopecache_get($rebuild_scope, 'r2') === '"second"');
-check("rebuild: r3 byte-exact via scopecache_get",
-    scopecache_get($rebuild_scope, 'r3') === '"third"');
+// Byte-exact round-trip: payloads are JSON strings, decoded to PHP
+// strings ("first" → 'first').
+check("rebuild: r1 payload decoded to 'first'",
+    payloadOf(scopecache_get($rebuild_scope, 'r1')) === 'first');
+check("rebuild: r2 payload decoded to 'second'",
+    payloadOf(scopecache_get($rebuild_scope, 'r2')) === 'second');
+check("rebuild: r3 payload decoded to 'third'",
+    payloadOf(scopecache_get($rebuild_scope, 'r3')) === 'third');
 
-// Tail order matches input order (oldest-first within window).
-check("rebuild: tail order is r1, r2, r3",
-    is_array($post_rebuild_target)
-    && $post_rebuild_target[0] === '"first"'
-    && $post_rebuild_target[1] === '"second"'
-    && $post_rebuild_target[2] === '"third"');
+$tailItemsR = itemsOf($post_rebuild_target);
+check("rebuild: tail order is r1, r2, r3 by payload",
+    ($tailItemsR[0]['payload'] ?? null) === 'first'
+    && ($tailItemsR[1]['payload'] ?? null) === 'second'
+    && ($tailItemsR[2]['payload'] ?? null) === 'third');
 
-// Stats after rebuild: total item count should reflect EXACTLY what
-// we put in (3 items in the user scope, plus the two reserved scopes
-// _events / _inbox which rebuild re-creates).
-$stats_after_rebuild = json_decode(scopecache_stats(), true);
-check("rebuild: stats items >= 3 (input items present)",
-    is_array($stats_after_rebuild)
-    && ($stats_after_rebuild['items'] ?? 0) >= 3,
-    "items=" . ($stats_after_rebuild['items'] ?? 'n/a'));
+$stats_after = scopecache_stats();
+check("rebuild: stats.items >= 3",
+    ($stats_after['items'] ?? 0) >= 3);
 
-// --- 16. wipe ----------------------------------------------------------------
-// Run this LAST because it nukes every scope including the ones we use
-// in earlier sections. Verify the count is plausible (>= the scopes we
-// created).
-$scope_count_pre_wipe = scopecache_wipe();
-check("wipe returns the scope count that was dropped", $scope_count_pre_wipe >= 1);
+// --- 18. wipe envelope ------------------------------------------------------
+// Run LAST because it nukes every scope.
+$wipe = scopecache_wipe();
+check("wipe ok=true", ($wipe['ok'] ?? null) === true);
+check("wipe scopes >= 1 (something was dropped)", ($wipe['scopes'] ?? 0) >= 1);
+check("wipe items >= 0", isset($wipe['items']) && is_int($wipe['items']));
+check("wipe freed_mb >= 0", isset($wipe['freed_mb']) && is_float($wipe['freed_mb']));
 
-// After wipe, our test scopes must be gone.
+// After wipe, test scopes must be gone.
 $post_wipe_tail = scopecache_tail($scope, 1);
-check("after wipe, our scope is gone (tail returns NULL)", $post_wipe_tail === null);
-$post_wipe_counter = scopecache_get($counter_scope, "hits");
-check("after wipe, counter scope is gone (get returns NULL)", $post_wipe_counter === null);
+check("after wipe, user scope is gone (hit=false)",
+    ($post_wipe_tail['hit'] ?? null) === false);
+$post_wipe_counter_get = scopecache_get($counter_scope, "hits");
+check("after wipe, counter scope is gone (get hit=false)",
+    ($post_wipe_counter_get['hit'] ?? null) === false);
 
 echo "\n=== SUMMARY: $pass pass, $fail fail ===\n";
 if ($fail > 0) {
