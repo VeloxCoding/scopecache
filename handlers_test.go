@@ -298,8 +298,8 @@ func TestWarm_LeavesOtherScopesUntouched(t *testing.T) {
 	if code != 200 {
 		t.Fatalf("code=%d want 200", code)
 	}
-	if mustFloat(t, out, "replaced_scopes") != 1 {
-		t.Errorf("replaced_scopes=%v want 1", out["replaced_scopes"])
+	if mustFloat(t, out, "scopes") != 1 {
+		t.Errorf("scopes=%v want 1", out["scopes"])
 	}
 
 	kept, _ := api.store.getScope("keep")
@@ -348,8 +348,8 @@ func TestRebuild_WipesExistingScopes(t *testing.T) {
 	if code != 200 {
 		t.Fatalf("code=%d want 200", code)
 	}
-	if mustFloat(t, out, "rebuilt_scopes") != 1 {
-		t.Errorf("rebuilt_scopes=%v want 1", out["rebuilt_scopes"])
+	if mustFloat(t, out, "scopes") != 1 {
+		t.Errorf("scopes=%v want 1", out["scopes"])
 	}
 
 	if _, ok := api.store.getScope("old"); ok {
@@ -385,11 +385,8 @@ func TestUpdate_Hit(t *testing.T) {
 	if code != 200 {
 		t.Fatalf("code=%d want 200", code)
 	}
-	if !mustBool(t, out, "hit") {
-		t.Error("hit=false")
-	}
-	if mustFloat(t, out, "updated_count") != 1 {
-		t.Errorf("updated_count=%v want 1", out["updated_count"])
+	if mustFloat(t, out, "count") != 1 {
+		t.Errorf("count=%v want 1", out["count"])
 	}
 
 	_, got, _ := doRequest(t, h, "GET", "/get?scope=s&id=a", "")
@@ -405,8 +402,8 @@ func TestUpdate_MissScope(t *testing.T) {
 	if code != 200 {
 		t.Fatalf("code=%d want 200", code)
 	}
-	if mustBool(t, out, "hit") {
-		t.Error("hit=true for missing scope")
+	if mustFloat(t, out, "count") != 0 {
+		t.Errorf("count=%v want 0 for missing scope", out["count"])
 	}
 }
 
@@ -417,8 +414,8 @@ func TestUpdate_MissID(t *testing.T) {
 	if code != 200 {
 		t.Fatalf("code=%d want 200", code)
 	}
-	if mustBool(t, out, "hit") {
-		t.Error("hit=true for missing id")
+	if mustFloat(t, out, "count") != 0 {
+		t.Errorf("count=%v want 0 for missing id", out["count"])
 	}
 }
 
@@ -430,8 +427,8 @@ func TestUpdate_BySeq_Hit(t *testing.T) {
 	if code != 200 {
 		t.Fatalf("code=%d want 200", code)
 	}
-	if !mustBool(t, out, "hit") {
-		t.Error("hit=false")
+	if mustFloat(t, out, "count") != 1 {
+		t.Errorf("count=%v want 1", out["count"])
 	}
 
 	_, got, _ := doRequest(t, h, "GET", "/get?scope=s&seq=1", "")
@@ -447,8 +444,8 @@ func TestUpdate_BySeq_Miss(t *testing.T) {
 	if code != 200 {
 		t.Fatalf("code=%d want 200", code)
 	}
-	if mustBool(t, out, "hit") {
-		t.Error("hit=true for missing seq")
+	if mustFloat(t, out, "count") != 0 {
+		t.Errorf("count=%v want 0 for missing seq", out["count"])
 	}
 }
 
@@ -903,8 +900,8 @@ func TestDeleteScope_Hit(t *testing.T) {
 	if !mustBool(t, out, "hit") {
 		t.Error("hit=false")
 	}
-	if mustFloat(t, out, "deleted_items") != 2 {
-		t.Errorf("deleted_items=%v want 2", out["deleted_items"])
+	if mustFloat(t, out, "count") != 2 {
+		t.Errorf("count=%v want 2", out["count"])
 	}
 }
 
@@ -932,13 +929,13 @@ func TestWipe_EmptyStore(t *testing.T) {
 		t.Error("ok=false")
 	}
 	// "Empty" still has the two reserved scopes (_events, _inbox) pre-created
-	// at boot. /wipe drops them (counted in deleted_scopes) then immediately
+	// at boot. /wipe drops them (counted in scopes) then immediately
 	// re-creates them, so the cache lands back at its boot baseline.
-	if mustFloat(t, out, "deleted_scopes") != float64(len(reservedScopeNames)) {
-		t.Errorf("deleted_scopes=%v want %d (reserved scopes were dropped + re-created)", out["deleted_scopes"], len(reservedScopeNames))
+	if mustFloat(t, out, "scopes") != float64(len(reservedScopeNames)) {
+		t.Errorf("scopes=%v want %d (reserved scopes were dropped + re-created)", out["scopes"], len(reservedScopeNames))
 	}
-	if mustFloat(t, out, "deleted_items") != 0 {
-		t.Errorf("deleted_items=%v want 0", out["deleted_items"])
+	if mustFloat(t, out, "items") != 0 {
+		t.Errorf("items=%v want 0", out["items"])
 	}
 }
 
@@ -954,11 +951,11 @@ func TestWipe_ClearsEveryScope(t *testing.T) {
 	}
 	// 2 user scopes + 2 reserved scopes (_events, _inbox) all dropped by /wipe.
 	wantDeleted := float64(2 + len(reservedScopeNames))
-	if mustFloat(t, out, "deleted_scopes") != wantDeleted {
-		t.Errorf("deleted_scopes=%v want %v", out["deleted_scopes"], wantDeleted)
+	if mustFloat(t, out, "scopes") != wantDeleted {
+		t.Errorf("scopes=%v want %v", out["scopes"], wantDeleted)
 	}
-	if mustFloat(t, out, "deleted_items") != 3 {
-		t.Errorf("deleted_items=%v want 3", out["deleted_items"])
+	if mustFloat(t, out, "items") != 3 {
+		t.Errorf("items=%v want 3", out["items"])
 	}
 	if mustFloat(t, out, "freed_mb") <= 0 {
 		t.Errorf("freed_mb=%v want >0", out["freed_mb"])
@@ -966,8 +963,8 @@ func TestWipe_ClearsEveryScope(t *testing.T) {
 
 	// User scopes must be gone; reserved scopes were re-created by post-wipe init.
 	_, out, _ = doAdminRequest(t, h, "/stats", "")
-	if got := mustFloat(t, out, "scope_count"); got != float64(len(reservedScopeNames)) {
-		t.Errorf("scope_count=%v want %d after /wipe (reserved scopes restored)", got, len(reservedScopeNames))
+	if got := mustFloat(t, out, "scopes"); got != float64(len(reservedScopeNames)) {
+		t.Errorf("scopes=%v want %d after /wipe (reserved scopes restored)", got, len(reservedScopeNames))
 	}
 	for _, scope := range []string{"a", "b"} {
 		if _, ok := api.store.getScope(scope); ok {
@@ -986,13 +983,13 @@ func TestWipe_StatsReportEmptyAfterwards(t *testing.T) {
 
 	_, out, _ := doAdminRequest(t, h, "/stats", "")
 	// Post-wipe baseline: reserved scopes are immediately re-created, so
-	// scope_count = len(reservedScopeNames), approx_store_mb = the
+	// scopes = len(reservedScopeNames), approx_store_mb = the
 	// reserved-scope overhead (still very small but non-zero).
-	if mustFloat(t, out, "scope_count") != float64(len(reservedScopeNames)) {
-		t.Errorf("scope_count=%v want %d", out["scope_count"], len(reservedScopeNames))
+	if mustFloat(t, out, "scopes") != float64(len(reservedScopeNames)) {
+		t.Errorf("scopes=%v want %d", out["scopes"], len(reservedScopeNames))
 	}
-	if mustFloat(t, out, "total_items") != 0 {
-		t.Errorf("total_items=%v want 0", out["total_items"])
+	if mustFloat(t, out, "items") != 0 {
+		t.Errorf("items=%v want 0", out["items"])
 	}
 	// approx_store_mb is the reserved-scope overhead (2 × 1024 bytes = 2048
 	// bytes ≈ 0.0020 MiB). Just assert it's non-negative and small.
@@ -1011,8 +1008,8 @@ func TestWipe_IgnoresBody(t *testing.T) {
 	if code != 200 {
 		t.Fatalf("code=%d want 200", code)
 	}
-	if mustFloat(t, out, "deleted_items") != 1 {
-		t.Errorf("deleted_items=%v want 1", out["deleted_items"])
+	if mustFloat(t, out, "items") != 1 {
+		t.Errorf("items=%v want 1", out["items"])
 	}
 }
 
@@ -1371,11 +1368,11 @@ func TestStats_Structure(t *testing.T) {
 
 	_, out, _ := doAdminRequest(t, h, "/stats", "")
 	// 1 user scope ("s") + reserved scopes (_events, _inbox).
-	if got := mustFloat(t, out, "scope_count"); got != float64(1+len(reservedScopeNames)) {
-		t.Errorf("scope_count=%v want %d (user + reserved)", got, 1+len(reservedScopeNames))
+	if got := mustFloat(t, out, "scopes"); got != float64(1+len(reservedScopeNames)) {
+		t.Errorf("scopes=%v want %d (user + reserved)", got, 1+len(reservedScopeNames))
 	}
-	if mustFloat(t, out, "total_items") != 1 {
-		t.Errorf("total_items=%v want 1", out["total_items"])
+	if mustFloat(t, out, "items") != 1 {
+		t.Errorf("items=%v want 1", out["items"])
 	}
 	if _, present := out["approx_store_mb"]; !present {
 		t.Error("approx_store_mb missing")
@@ -1388,11 +1385,11 @@ func TestStats_Structure(t *testing.T) {
 	}
 	// Regression guard: /stats is intentionally aggregate-only for
 	// user-managed scopes since the 100k-scope DoS observation. The
-	// `scopes` key (full per-scope enumeration) belongs on /scopelist;
-	// the small fixed `reserved_scopes` block on /stats is the bounded
-	// exception for cache infrastructure scopes.
-	if _, present := out["scopes"]; present {
-		t.Errorf("scopes key must NOT appear on /stats response (moved to /scopelist): %v", out["scopes"])
+	// `scopes` key on /stats is the integer scope-count; the full
+	// per-scope enumeration array belongs on /scopelist. Verify
+	// /stats's `scopes` is a scalar number, not an array.
+	if _, isArray := out["scopes"].([]interface{}); isArray {
+		t.Errorf("scopes on /stats must be a scalar count, not an array (per-scope enumeration lives on /scopelist): %v", out["scopes"])
 	}
 }
 
@@ -1964,7 +1961,7 @@ func TestIntegration_MixedWorkload_StatsAndInvariants(t *testing.T) {
 	postGetY := nowUnixMicro()
 
 	// 11. append with an over-cap scope name (MaxScopeBytes+1 bytes). Must
-	//     400 and must NOT register a new scope — verified via scope_count
+	//     400 and must NOT register a new scope — verified via scopes
 	//     below.
 	tooLong := strings.Repeat("a", MaxScopeBytes+1)
 	if code, _, _ := doRequest(t, h, "POST", "/append",
@@ -1977,13 +1974,13 @@ func TestIntegration_MixedWorkload_StatsAndInvariants(t *testing.T) {
 
 	// 2 user scopes (x, y) + reserved scopes (_events, _inbox).
 	wantScopeCount := float64(2 + len(reservedScopeNames))
-	if got := mustFloat(t, stats, "scope_count"); got != wantScopeCount {
-		t.Errorf("scope_count=%v want %v (rejected too-long-scope must not register; reserved baseline)", got, wantScopeCount)
+	if got := mustFloat(t, stats, "scopes"); got != wantScopeCount {
+		t.Errorf("scopes=%v want %v (rejected too-long-scope must not register; reserved baseline)", got, wantScopeCount)
 	}
 	// x: 100 rebuilt − 1 deleted (item_050) − 30 (delete_up_to) = 69
 	// y: 50 warmed + 100 appended − 1 deleted (seq 75)         = 149
-	if got := mustFloat(t, stats, "total_items"); got != 218 {
-		t.Errorf("total_items=%v want 218", got)
+	if got := mustFloat(t, stats, "items"); got != 218 {
+		t.Errorf("items=%v want 218", got)
 	}
 
 	// Per-scope assertions read directly from *scopeBuffer — /stats is
@@ -2094,7 +2091,7 @@ func TestIntegration_MixedWorkload_StatsAndInvariants(t *testing.T) {
 // the end we sum the tallies and require the API's own state to match to the
 // item. Everything we can derive from the workload is checked exactly:
 //
-//   - total_items from /stats == Σ appendsOK − Σ deletedN
+//   - items from /stats == Σ appendsOK − Σ deletedN
 //   - same total matches len(items) walked across every live scope
 //   - per scope: items slice, bySeq map, byID map are mutually consistent
 //   - per scope: items are still sorted ascending by seq (append contract)
@@ -2121,7 +2118,7 @@ func TestRace_ParallelMixedWorkload(t *testing.T) {
 
 	type tally struct {
 		appendsOK int64 // successful /append (200 response)
-		deletedN  int64 // sum of deleted_count from /delete and /delete_up_to
+		deletedN  int64 // sum of count from /delete and /delete_up_to
 		readsHit  int64 // /head and /tail calls that returned hit=true
 	}
 	tallies := make([]tally, workers)
@@ -2149,11 +2146,11 @@ func TestRace_ParallelMixedWorkload(t *testing.T) {
 					}
 				case roll < 65:
 					// Delete by seq. Random seq in [1, 500] — most miss, which
-					// is fine: we only count actual hits via deleted_count.
+					// is fine: we only count actual hits via count.
 					seq := rng.Intn(500) + 1
 					body := fmt.Sprintf(`{"scope":"%s","seq":%d}`, scope, seq)
 					if _, out, _ := doRequest(t, h, "POST", "/delete", body); out != nil {
-						if n, ok := out["deleted_count"].(float64); ok {
+						if n, ok := out["count"].(float64); ok {
 							ts.deletedN += int64(n)
 						}
 					}
@@ -2184,7 +2181,7 @@ func TestRace_ParallelMixedWorkload(t *testing.T) {
 					maxSeq := rng.Intn(50) + 1
 					body := fmt.Sprintf(`{"scope":"%s","max_seq":%d}`, scope, maxSeq)
 					if _, out, _ := doRequest(t, h, "POST", "/delete_up_to", body); out != nil {
-						if n, ok := out["deleted_count"].(float64); ok {
+						if n, ok := out["count"].(float64); ok {
 							ts.deletedN += int64(n)
 						}
 					}
@@ -2209,8 +2206,8 @@ func TestRace_ParallelMixedWorkload(t *testing.T) {
 	}
 
 	_, stats, _ := doAdminRequest(t, h, "/stats", "")
-	if got := int64(mustFloat(t, stats, "total_items")); got != expectedItems {
-		t.Errorf("/stats total_items=%d want %d (appends=%d deletes=%d)",
+	if got := int64(mustFloat(t, stats, "items")); got != expectedItems {
+		t.Errorf("/stats items=%d want %d (appends=%d deletes=%d)",
 			got, expectedItems, appendsOK, deletedN)
 	}
 
@@ -2293,7 +2290,7 @@ func TestRace_ParallelMixedWorkload(t *testing.T) {
 //   - The HTTP layer rejects every operation that the reservation contract
 //     forbids (/upsert, /update, /counter_add, /delete_scope, /warm,
 //     /rebuild) with status 400.
-//   - /wipe restores the reserved-scope baseline (scope_count=2, items=0,
+//   - /wipe restores the reserved-scope baseline (scopes=2, items=0,
 //     small but non-zero approx_store_mb) so subscribers attached to
 //     either reserved scope find their target still present.
 
@@ -2305,7 +2302,7 @@ func TestRace_ParallelMixedWorkload(t *testing.T) {
 // rather than via /stats's `approx_store_mb` because the MB serialiser
 // rounds to 4 decimals (~105-byte resolution); a small payload would
 // not produce a detectable delta. /stats is checked for shape + the
-// values it CAN render exactly (scope_count, total_items).
+// values it CAN render exactly (scopes, items).
 func TestReservedScopes_AppendInboxRoundTrip(t *testing.T) {
 	h, api := newTestHandler(10)
 
@@ -2340,7 +2337,7 @@ func TestReservedScopes_AppendInboxRoundTrip(t *testing.T) {
 		t.Errorf("/append: seq=%v want >0", seq)
 	}
 
-	// Internal counters: scope_count unchanged (append to existing scope),
+	// Internal counters: scopes unchanged (append to existing scope),
 	// totalItems +1, totalBytes strictly greater.
 	if got := api.store.scopeCount.Load(); got != preScopes {
 		t.Errorf("post-append scopeCount=%d want %d (no new scope created)", got, preScopes)
@@ -2373,11 +2370,11 @@ func TestReservedScopes_AppendInboxRoundTrip(t *testing.T) {
 
 	// /stats reports the same counts.
 	_, stats, _ := doAdminRequest(t, h, "/stats", "")
-	if got := mustFloat(t, stats, "scope_count"); got != float64(len(reservedScopeNames)) {
-		t.Errorf("/stats scope_count=%v want %d", got, len(reservedScopeNames))
+	if got := mustFloat(t, stats, "scopes"); got != float64(len(reservedScopeNames)) {
+		t.Errorf("/stats scopes=%v want %d", got, len(reservedScopeNames))
 	}
-	if got := mustFloat(t, stats, "total_items"); got != 1 {
-		t.Errorf("/stats total_items=%v want 1", got)
+	if got := mustFloat(t, stats, "items"); got != 1 {
+		t.Errorf("/stats items=%v want 1", got)
 	}
 
 	// /scopelist must include _inbox with the new item count.
@@ -2446,8 +2443,8 @@ func TestReservedScopes_DrainerPattern(t *testing.T) {
 	if code != 200 {
 		t.Fatalf("/delete_up_to _inbox: code=%d body=%s", code, raw)
 	}
-	if got := mustFloat(t, out, "deleted_count"); got != N {
-		t.Errorf("/delete_up_to _inbox: deleted_count=%v want %d", got, N)
+	if got := mustFloat(t, out, "count"); got != N {
+		t.Errorf("/delete_up_to _inbox: count=%v want %d", got, N)
 	}
 
 	// Scope must still exist, but be empty.
@@ -2576,11 +2573,11 @@ func TestReservedScopes_WipeRestoresBaseline(t *testing.T) {
 	// /stats must show reserved baseline restored: 2 scopes, 0 items,
 	// approx_store_mb is the reserved-scope overhead (small but non-zero).
 	_, stats, _ := doAdminRequest(t, h, "/stats", "")
-	if got := mustFloat(t, stats, "scope_count"); got != float64(len(reservedScopeNames)) {
-		t.Errorf("post-wipe scope_count=%v want %d (reserved restored)", got, len(reservedScopeNames))
+	if got := mustFloat(t, stats, "scopes"); got != float64(len(reservedScopeNames)) {
+		t.Errorf("post-wipe scopes=%v want %d (reserved restored)", got, len(reservedScopeNames))
 	}
-	if got := mustFloat(t, stats, "total_items"); got != 0 {
-		t.Errorf("post-wipe total_items=%v want 0", got)
+	if got := mustFloat(t, stats, "items"); got != 0 {
+		t.Errorf("post-wipe items=%v want 0", got)
 	}
 	if got := mustFloat(t, stats, "approx_store_mb"); got <= 0 {
 		t.Errorf("post-wipe approx_store_mb=%v want >0 (reserved overhead)", got)
@@ -2647,11 +2644,11 @@ func TestReservedScopes_RebuildRestoresBaseline(t *testing.T) {
 
 	// Post-rebuild: 2 user scopes from input + 2 reserved scopes = 4.
 	_, stats, _ := doAdminRequest(t, h, "/stats", "")
-	if got := mustFloat(t, stats, "scope_count"); got != float64(2+len(reservedScopeNames)) {
-		t.Errorf("post-rebuild scope_count=%v want %d", got, 2+len(reservedScopeNames))
+	if got := mustFloat(t, stats, "scopes"); got != float64(2+len(reservedScopeNames)) {
+		t.Errorf("post-rebuild scopes=%v want %d", got, 2+len(reservedScopeNames))
 	}
-	if got := mustFloat(t, stats, "total_items"); got != 2 {
-		t.Errorf("post-rebuild total_items=%v want 2 (only the 2 input items)", got)
+	if got := mustFloat(t, stats, "items"); got != 2 {
+		t.Errorf("post-rebuild items=%v want 2 (only the 2 input items)", got)
 	}
 
 	// Original user scope is gone; reserved scope contents are also gone
@@ -3873,11 +3870,11 @@ func TestEvents_AutoPopulate_WipeNoEmit(t *testing.T) {
 	if code != 200 {
 		t.Fatalf("/stats: code=%d", code)
 	}
-	if scopeCount := mustFloat(t, out, "scope_count"); scopeCount != 2 {
-		t.Errorf("post-wipe scope_count=%v want 2 (only _events + _inbox)", scopeCount)
+	if scopeCount := mustFloat(t, out, "scopes"); scopeCount != 2 {
+		t.Errorf("post-wipe scopes=%v want 2 (only _events + _inbox)", scopeCount)
 	}
-	if totalItems := mustFloat(t, out, "total_items"); totalItems != 0 {
-		t.Errorf("post-wipe total_items=%v want 0", totalItems)
+	if totalItems := mustFloat(t, out, "items"); totalItems != 0 {
+		t.Errorf("post-wipe items=%v want 0", totalItems)
 	}
 }
 

@@ -165,9 +165,9 @@ $stats_json = scopecache_stats();
 check("stats returns a non-null string", is_string($stats_json) && $stats_json !== '');
 $stats = json_decode($stats_json, true);
 check("stats JSON decodes to an array", is_array($stats));
-check("stats has scope_count key", is_array($stats) && array_key_exists('ScopeCount', $stats));
-check("stats scope_count is non-negative int",
-    is_array($stats) && is_int($stats['ScopeCount'] ?? null) && $stats['ScopeCount'] >= 0);
+check("stats has scopes key", is_array($stats) && array_key_exists('scopes', $stats));
+check("stats scopes is non-negative int",
+    is_array($stats) && is_int($stats['scopes'] ?? null) && $stats['scopes'] >= 0);
 
 // --- 11. scopelist -----------------------------------------------------------
 $list_json = scopecache_scopelist('', '', 100);
@@ -307,10 +307,10 @@ check("rebuild: tail order is r1, r2, r3",
 // we put in (3 items in the user scope, plus the two reserved scopes
 // _events / _inbox which rebuild re-creates).
 $stats_after_rebuild = json_decode(scopecache_stats(), true);
-check("rebuild: stats total_items >= 3 (input items present)",
+check("rebuild: stats items >= 3 (input items present)",
     is_array($stats_after_rebuild)
-    && ($stats_after_rebuild['TotalItems'] ?? 0) >= 3,
-    "TotalItems=" . ($stats_after_rebuild['TotalItems'] ?? 'n/a'));
+    && ($stats_after_rebuild['items'] ?? 0) >= 3,
+    "items=" . ($stats_after_rebuild['items'] ?? 'n/a'));
 
 // --- 16. wipe ----------------------------------------------------------------
 // Run this LAST because it nukes every scope including the ones we use

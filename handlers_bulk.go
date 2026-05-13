@@ -39,9 +39,8 @@ func (api *API) handleWarm(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSONResponse(w, http.StatusOK, WarmResponse{
-		OK:             true,
-		Count:          len(req.Items),
-		ReplacedScopes: replacedScopes,
+		OK:     true,
+		Scopes: replacedScopes,
 	})
 }
 
@@ -80,9 +79,8 @@ func (api *API) handleRebuild(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSONResponse(w, http.StatusOK, RebuildResponse{
-		OK:            true,
-		Count:         len(req.Items),
-		RebuiltScopes: rebuiltScopes,
-		RebuiltItems:  rebuiltItems,
+		OK:     true,
+		Scopes: rebuiltScopes,
+		Items:  rebuiltItems,
 	})
 }

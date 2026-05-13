@@ -46,9 +46,9 @@ func (api *API) handleDelete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSONResponse(w, http.StatusOK, DeleteResponse{
-		OK:           true,
-		Hit:          deleted > 0,
-		DeletedCount: deleted,
+		OK:    true,
+		Hit:   deleted > 0,
+		Count: deleted,
 	})
 }
 
@@ -76,9 +76,9 @@ func (api *API) handleDeleteUpTo(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSONResponse(w, http.StatusOK, DeleteResponse{
-		OK:           true,
-		Hit:          deleted > 0,
-		DeletedCount: deleted,
+		OK:    true,
+		Hit:   deleted > 0,
+		Count: deleted,
 	})
 }
 
@@ -105,9 +105,9 @@ func (api *API) handleDeleteScope(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSONResponse(w, http.StatusOK, DeleteScopeResponse{
-		OK:           true,
-		Hit:          deleted,
-		DeletedItems: deletedItems,
+		OK:    true,
+		Hit:   deleted,
+		Count: deletedItems,
 	})
 }
 
@@ -134,9 +134,9 @@ func (api *API) handleWipe(w http.ResponseWriter, r *http.Request) {
 	deletedScopes, deletedItems, freedBytes := api.store.wipe()
 
 	writeJSONResponse(w, http.StatusOK, WipeResponse{
-		OK:            true,
-		DeletedScopes: deletedScopes,
-		DeletedItems:  deletedItems,
-		FreedMB:       MB(freedBytes),
+		OK:      true,
+		Scopes:  deletedScopes,
+		Items:   deletedItems,
+		FreedMB: MB(freedBytes),
 	})
 }

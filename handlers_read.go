@@ -138,45 +138,31 @@ func (api *API) writeItemsResponse(
 }
 
 // appendItemJSON appends item to buf as JSON, mirroring
-// Item.MarshalJSON byte-for-byte: scope/id/seq are dropped when
-// zero-valued, ts and the payload-bearing field are always
-// emitted, and items in the reserved _events scope rename
-// "payload" to "event". Empty Payload (only reachable via
-// white-box mutation; validatePayload blocks it on the write
-// path) emits literal "null" instead of malformed `,"payload":}`.
+// Item.MarshalJSON byte-for-byte: every item carries the full
+// scope/id/seq/ts + payload-bearing key set. An item without a
+// client-supplied id renders as `"id":null` rather than dropping
+// the key — uniform-shape rule lets clients read item.id directly
+// without a presence check. Items in the reserved _events scope
+// rename "payload" to "event". Empty Payload (only reachable via
+// white-box mutation; validatePayload blocks it on the write path)
+// emits literal "null" instead of malformed `,"payload":}`.
 func appendItemJSON(buf []byte, item Item) []byte {
 	payloadKey := "payload"
 	if item.Scope == EventsScopeName {
 		payloadKey = "event"
 	}
 
-	buf = append(buf, '{')
-	first := true
-	if item.Scope != "" {
-		buf = append(buf, `"scope":`...)
-		buf = appendJSONString(buf, item.Scope)
-		first = false
-	}
-	if item.ID != "" {
-		if !first {
-			buf = append(buf, ',')
-		}
-		buf = append(buf, `"id":`...)
+	buf = append(buf, `{"scope":`...)
+	buf = appendJSONString(buf, item.Scope)
+	buf = append(buf, `,"id":`...)
+	if item.ID == "" {
+		buf = append(buf, `null`...)
+	} else {
 		buf = appendJSONString(buf, item.ID)
-		first = false
 	}
-	if item.Seq != 0 {
-		if !first {
-			buf = append(buf, ',')
-		}
-		buf = append(buf, `"seq":`...)
-		buf = strconv.AppendUint(buf, item.Seq, 10)
-		first = false
-	}
-	if !first {
-		buf = append(buf, ',')
-	}
-	buf = append(buf, `"ts":`...)
+	buf = append(buf, `,"seq":`...)
+	buf = strconv.AppendUint(buf, item.Seq, 10)
+	buf = append(buf, `,"ts":`...)
 	buf = strconv.AppendInt(buf, item.Ts, 10)
 	buf = append(buf, ',', '"')
 	buf = append(buf, payloadKey...)
@@ -339,33 +325,17 @@ func writeGetResponse(w http.ResponseWriter, resp GetResponse) {
 			payloadKey = "event"
 		}
 
-		prefix = append(prefix, `{"ok":true,"hit":true,"count":1,"item":{`...)
-		first := true
-		if item.Scope != "" {
-			prefix = append(prefix, `"scope":`...)
-			prefix = appendJSONString(prefix, item.Scope)
-			first = false
-		}
-		if item.ID != "" {
-			if !first {
-				prefix = append(prefix, ',')
-			}
-			prefix = append(prefix, `"id":`...)
+		prefix = append(prefix, `{"ok":true,"hit":true,"count":1,"item":{"scope":`...)
+		prefix = appendJSONString(prefix, item.Scope)
+		prefix = append(prefix, `,"id":`...)
+		if item.ID == "" {
+			prefix = append(prefix, `null`...)
+		} else {
 			prefix = appendJSONString(prefix, item.ID)
-			first = false
 		}
-		if item.Seq != 0 {
-			if !first {
-				prefix = append(prefix, ',')
-			}
-			prefix = append(prefix, `"seq":`...)
-			prefix = strconv.AppendUint(prefix, item.Seq, 10)
-			first = false
-		}
-		if !first {
-			prefix = append(prefix, ',')
-		}
-		prefix = append(prefix, `"ts":`...)
+		prefix = append(prefix, `,"seq":`...)
+		prefix = strconv.AppendUint(prefix, item.Seq, 10)
+		prefix = append(prefix, `,"ts":`...)
 		prefix = strconv.AppendInt(prefix, item.Ts, 10)
 		prefix = append(prefix, ',', '"')
 		prefix = append(prefix, payloadKey...)

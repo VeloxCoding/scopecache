@@ -45,8 +45,8 @@ func (api *API) handleStats(w http.ResponseWriter, r *http.Request) {
 	// single integer comparison instead of refetching state.
 	writeJSONResponse(w, http.StatusOK, StatsResponse{
 		OK:               true,
-		ScopeCount:       st.ScopeCount,
-		TotalItems:       st.TotalItems,
+		Scopes:           st.Scopes,
+		Items:            st.Items,
 		ApproxStoreMB:    st.ApproxStoreMB,
 		LastWriteTS:      st.LastWriteTS,
 		EventsDropsTotal: st.EventsDropsTotal,

@@ -17,10 +17,13 @@ package scopecache
 
 // --- Success: writes -----------------------------------------------
 
-// AppendResponse is the body of a successful POST /append.
+// AppendResponse is the body of a successful POST /append. /append
+// always creates a new item, so `created` is always true — emitted
+// for envelope uniformity with /upsert and /counter_add.
 type AppendResponse struct {
-	OK   bool     `json:"ok"`
-	Item writeAck `json:"item"`
+	OK      bool     `json:"ok"`
+	Created bool     `json:"created"` // always true
+	Item    writeAck `json:"item"`
 }
 
 // UpsertResponse is the body of a successful POST /upsert. `created`
@@ -32,13 +35,14 @@ type UpsertResponse struct {
 	Item    writeAck `json:"item"`
 }
 
-// UpdateResponse is the body of a successful POST /update. `hit` =
-// `updated_count > 0`; both fields are kept for backward-compat with
-// clients that branch on one or the other.
+// UpdateResponse is the body of a successful POST /update. /update
+// only ever modifies an existing item, so `created` is always false
+// — emitted for envelope uniformity. `count` is the number of items
+// the update touched (0 on miss, 1 on hit).
 type UpdateResponse struct {
-	OK           bool `json:"ok"`
-	Hit          bool `json:"hit"`
-	UpdatedCount int  `json:"updated_count"`
+	OK      bool `json:"ok"`
+	Created bool `json:"created"` // always false
+	Count   int  `json:"count"`
 }
 
 // CounterAddResponse is the body of a successful POST /counter_add.
@@ -55,9 +59,9 @@ type CounterAddResponse struct {
 // DeleteResponse is the body of a successful POST /delete and
 // /delete_up_to — both share the same wire shape.
 type DeleteResponse struct {
-	OK           bool `json:"ok"`
-	Hit          bool `json:"hit"`
-	DeletedCount int  `json:"deleted_count"`
+	OK    bool `json:"ok"`
+	Hit   bool `json:"hit"`
+	Count int  `json:"count"`
 }
 
 // DeleteScopeResponse is the body of a successful POST /delete_scope.
@@ -67,37 +71,33 @@ type DeleteResponse struct {
 // deleted". On /delete_scope an existing-but-already-empty scope
 // still counts as a hit (the scope is gone after the call).
 type DeleteScopeResponse struct {
-	OK           bool `json:"ok"`
-	Hit          bool `json:"hit"`
-	DeletedItems int  `json:"deleted_items"`
+	OK    bool `json:"ok"`
+	Hit   bool `json:"hit"`
+	Count int  `json:"count"` // items in the deleted scope
 }
 
 // WipeResponse is the body of a successful POST /wipe.
 type WipeResponse struct {
-	OK            bool `json:"ok"`
-	DeletedScopes int  `json:"deleted_scopes"`
-	DeletedItems  int  `json:"deleted_items"`
-	FreedMB       MB   `json:"freed_mb"`
+	OK      bool `json:"ok"`
+	Scopes  int  `json:"scopes"`
+	Items   int  `json:"items"`
+	FreedMB MB   `json:"freed_mb"`
 }
 
 // --- Success: bulk --------------------------------------------------
 
-// WarmResponse is the body of a successful POST /warm. `count` is the
-// input item count (clients echo it back as a sanity check);
-// `replaced_scopes` is the number of distinct scopes that were
-// rewritten.
+// WarmResponse is the body of a successful POST /warm. `scopes` is
+// the number of distinct scopes that were rewritten.
 type WarmResponse struct {
-	OK             bool `json:"ok"`
-	Count          int  `json:"count"`
-	ReplacedScopes int  `json:"replaced_scopes"`
+	OK     bool `json:"ok"`
+	Scopes int  `json:"scopes"`
 }
 
 // RebuildResponse is the body of a successful POST /rebuild.
 type RebuildResponse struct {
-	OK            bool `json:"ok"`
-	Count         int  `json:"count"`
-	RebuiltScopes int  `json:"rebuilt_scopes"`
-	RebuiltItems  int  `json:"rebuilt_items"`
+	OK     bool `json:"ok"`
+	Scopes int  `json:"scopes"`
+	Items  int  `json:"items"`
 }
 
 // --- Success: observability -----------------------------------------
@@ -106,8 +106,8 @@ type RebuildResponse struct {
 // `ok` are flattened straight from storeStats.
 type StatsResponse struct {
 	OK               bool                 `json:"ok"`
-	ScopeCount       int                  `json:"scope_count"`
-	TotalItems       int                  `json:"total_items"`
+	Scopes           int                  `json:"scopes"`
+	Items            int                  `json:"items"`
 	ApproxStoreMB    MB                   `json:"approx_store_mb"`
 	LastWriteTS      int64                `json:"last_write_ts"`
 	EventsDropsTotal int64                `json:"events_drops_total"`

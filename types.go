@@ -317,28 +317,38 @@ type Item struct {
 // key removes the ambiguity: `payload` always means "the bytes the
 // client originally stored", at every level it appears.
 //
+// `id` is always emitted: items with no client-supplied id render
+// as `"id":null` rather than dropping the key. Uniform-shape rule
+// means every item on the wire has the same key set; clients can
+// read `item.id` directly without a presence check.
+//
 // Implementation note: emitting via two struct literals (one per
 // scope) keeps the generated JSON well-defined. encoding/json's
 // reflection path produces consistent field-order matching the
 // struct declaration, so /tail _events output remains stable across
 // Go versions.
 func (i Item) MarshalJSON() ([]byte, error) {
+	var idPtr *string
+	if i.ID != "" {
+		id := i.ID
+		idPtr = &id
+	}
 	if i.Scope == EventsScopeName {
 		return json.Marshal(struct {
-			Scope string          `json:"scope,omitempty"`
-			ID    string          `json:"id,omitempty"`
-			Seq   uint64          `json:"seq,omitempty"`
+			Scope string          `json:"scope"`
+			ID    *string         `json:"id"`
+			Seq   uint64          `json:"seq"`
 			Ts    int64           `json:"ts"`
 			Event json.RawMessage `json:"event"`
-		}{i.Scope, i.ID, i.Seq, i.Ts, i.Payload})
+		}{i.Scope, idPtr, i.Seq, i.Ts, i.Payload})
 	}
 	return json.Marshal(struct {
-		Scope   string          `json:"scope,omitempty"`
-		ID      string          `json:"id,omitempty"`
-		Seq     uint64          `json:"seq,omitempty"`
+		Scope   string          `json:"scope"`
+		ID      *string         `json:"id"`
+		Seq     uint64          `json:"seq"`
 		Ts      int64           `json:"ts"`
 		Payload json.RawMessage `json:"payload"`
-	}{i.Scope, i.ID, i.Seq, i.Ts, i.Payload})
+	}{i.Scope, idPtr, i.Seq, i.Ts, i.Payload})
 }
 
 // counterCell is the lock-free state for a counter item. value is

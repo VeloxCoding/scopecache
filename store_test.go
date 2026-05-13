@@ -1608,10 +1608,10 @@ func TestNewStore_PreCreatesReservedScopes(t *testing.T) {
 	// total_items == 0, totalBytes == reservedScopesOverhead, and
 	// lastWriteTS == 0 (the "fresh boot" sentinel).
 	if got := s.scopeCount.Load(); got != int64(len(reservedScopeNames)) {
-		t.Errorf("fresh store scope_count=%d want %d", got, len(reservedScopeNames))
+		t.Errorf("fresh store scopes=%d want %d", got, len(reservedScopeNames))
 	}
 	if got := s.totalItems.Load(); got != 0 {
-		t.Errorf("fresh store total_items=%d want 0", got)
+		t.Errorf("fresh store items=%d want 0", got)
 	}
 	if got := s.totalBytes.Load(); got != reservedScopesOverhead {
 		t.Errorf("fresh store totalBytes=%d want %d (reserved-scope overhead only)",

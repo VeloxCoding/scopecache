@@ -25,13 +25,26 @@ import (
 // "item". Mirrors Item's JSON layout for scope/id/seq/ts but
 // deliberately excludes Payload — the client supplied it on the way
 // in, and echoing it would double the wire cost on a 1 MiB write.
-// omitempty rules match Item's so a write without an id produces
-// the same shape as Item-without-Payload.
+// ID is rendered via writeAckIDJSON so seq-only writes emit
+// `"id":null` rather than dropping the key — matches the uniform
+// item-shape rule applied across the read endpoints.
 type writeAck struct {
-	Scope string `json:"scope,omitempty"`
-	ID    string `json:"id,omitempty"`
-	Seq   uint64 `json:"seq,omitempty"`
-	Ts    int64  `json:"ts"`
+	Scope string  `json:"scope"`
+	ID    *string `json:"id"`
+	Seq   uint64  `json:"seq"`
+	Ts    int64   `json:"ts"`
+}
+
+// newWriteAck builds a writeAck from an Item, mapping an empty ID
+// to a nil *string so json.Marshal emits `"id":null` rather than
+// `"id":""`.
+func newWriteAck(item Item) writeAck {
+	var idPtr *string
+	if item.ID != "" {
+		id := item.ID
+		idPtr = &id
+	}
+	return writeAck{Scope: item.Scope, ID: idPtr, Seq: item.Seq, Ts: item.Ts}
 }
 
 func (api *API) handleAppend(w http.ResponseWriter, r *http.Request) {
@@ -54,8 +67,9 @@ func (api *API) handleAppend(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSONResponse(w, http.StatusOK, AppendResponse{
-		OK:   true,
-		Item: writeAck{Scope: item.Scope, ID: item.ID, Seq: item.Seq, Ts: item.Ts},
+		OK:      true,
+		Created: true,
+		Item:    newWriteAck(item),
 	})
 }
 
@@ -88,7 +102,7 @@ func (api *API) handleUpsert(w http.ResponseWriter, r *http.Request) {
 	writeJSONResponse(w, http.StatusOK, UpsertResponse{
 		OK:      true,
 		Created: created,
-		Item:    writeAck{Scope: result.Scope, ID: result.ID, Seq: result.Seq, Ts: result.Ts},
+		Item:    newWriteAck(result),
 	})
 }
 
@@ -176,8 +190,8 @@ func (api *API) handleUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSONResponse(w, http.StatusOK, UpdateResponse{
-		OK:           true,
-		Hit:          updated > 0,
-		UpdatedCount: updated,
+		OK:      true,
+		Created: false,
+		Count:   updated,
 	})
 }

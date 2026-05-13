@@ -167,8 +167,8 @@ func TestGateway_DataplaneRoundtrip(t *testing.T) {
 
 	// Stats reflects the writes.
 	st := g.Stats()
-	if st.TotalItems < 3 {
-		t.Errorf("Stats.TotalItems=%d want >= 3 (3 user + N events)", st.TotalItems)
+	if st.Items < 3 {
+		t.Errorf("Stats.Items=%d want >= 3 (3 user + N events)", st.Items)
 	}
 }
 
@@ -220,8 +220,8 @@ func TestGateway_WipeStats(t *testing.T) {
 		_, _ = g.Append(Item{Scope: "posts", Payload: json.RawMessage(`{}`)})
 	}
 	pre := g.Stats()
-	if pre.ScopeCount < 1 {
-		t.Errorf("pre-wipe ScopeCount=%d want >= 1", pre.ScopeCount)
+	if pre.Scopes < 1 {
+		t.Errorf("pre-wipe Scopes=%d want >= 1", pre.Scopes)
 	}
 
 	scopeCount, totalItems, _ := g.Wipe()
@@ -231,11 +231,11 @@ func TestGateway_WipeStats(t *testing.T) {
 
 	post := g.Stats()
 	// Reserved scopes always re-created post-wipe.
-	if post.ScopeCount != 2 {
-		t.Errorf("post-wipe ScopeCount=%d want 2 (only _events + _inbox)", post.ScopeCount)
+	if post.Scopes != 2 {
+		t.Errorf("post-wipe Scopes=%d want 2 (only _events + _inbox)", post.Scopes)
 	}
-	if post.TotalItems != 0 {
-		t.Errorf("post-wipe TotalItems=%d want 0", post.TotalItems)
+	if post.Items != 0 {
+		t.Errorf("post-wipe Items=%d want 0", post.Items)
 	}
 }
 
