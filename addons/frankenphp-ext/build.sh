@@ -64,10 +64,26 @@ MSYS_NO_PATHCONV=1 docker run --rm \
         set -euo pipefail
 
         echo ">>> [1/3] staging scopecache + extension source under /work"
+        # Stage scopecache root + caddymodule + addons (caddymodule
+        # imports addons/guarded — see caddymodule/module.go:28 — so
+        # the addons tree must be present for the xcaddy build to
+        # resolve that import). cmd/ is skipped because xcaddy does
+        # not --with the standalone-binary package and nothing on
+        # the build path imports it.
+        #
+        # Note: copying all of /scopecache/addons re-stages the
+        # extension source under /work/scopecache/addons/frankenphp-ext.
+        # That copy is shadowed by the xcaddy --with that points the
+        # extension module at /work/ext instead, so the duplicate is
+        # harmless. Could be excluded for tidiness; not worth the
+        # extra build-script logic.
+        #
+        # NB no apostrophes in these comments — they would close the
+        # outer bash -c "..." single-quoted string. See pitfall #8 in
+        # CLAUDE_PHPEXTENSION_IN_GO.md.
         mkdir -p /work/scopecache /work/ext
         cp /scopecache/go.mod /work/scopecache/
         cp /scopecache/*.go /work/scopecache/
-        cp -r /scopecache/cmd /work/scopecache/cmd
         cp -r /scopecache/caddymodule /work/scopecache/caddymodule
         cp -r /scopecache/addons /work/scopecache/addons
         cp /ext-src/go.mod /work/ext/

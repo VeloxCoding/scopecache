@@ -46,7 +46,6 @@
 
 package scopecache_ext
 
-// #include <Zend/zend_types.h>
 // #include <Zend/zend_string.h>
 import "C"
 
@@ -121,9 +120,10 @@ func phpStringFromBytes(b []byte) unsafe.Pointer {
 // For the prototype, invalid input simply returns null.
 //
 // Also returns null when no scopecache caddymodule is loaded in this
-// binary (LookupGateway returns nil). An operator seeing only nulls
-// should check that the Caddyfile has a `scopecache {}` block — without
-// it, no Provision() ever ran, so no *Gateway is registered.
+// binary (defaultSlot.Load() returns nil because no Provision ever
+// stored a Gateway into it). An operator seeing only nulls should
+// check that the Caddyfile has a `scopecache {}` block — without it,
+// no Provision() ever ran, so no *Gateway is registered.
 //
 // export_php:function scopecache_get(string $scope, string $id): ?string
 func scopecache_get(scope *C.zend_string, id *C.zend_string) unsafe.Pointer {
