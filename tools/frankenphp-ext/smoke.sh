@@ -20,7 +20,7 @@
 # a Linux ELF built inside the matching builder image. Windows/macOS
 # users get the same smoke check as Linux users.
 #
-# Port: 18080 on the host (avoiding the 8080 the harness often holds).
+# Port: 18080 on the host (avoiding the common 8080 default).
 #
 # Usage:
 #   ./smoke.sh

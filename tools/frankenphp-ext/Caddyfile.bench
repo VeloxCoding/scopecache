@@ -12,9 +12,9 @@
 # scopecache_get() looks it up by that name on every call. See
 # gateway_registry.go in the scopecache core for the registry.
 #
-# `order scopecache before php_server` matches the harness — scopecache
-# matches /get, /append etc. and returns next() for anything else,
-# so /bench.php falls through cleanly to php_server.
+# `order scopecache before php_server` — scopecache matches /get,
+# /append etc. and returns next() for anything else, so /bench.php
+# falls through cleanly to php_server.
 #
 # `frankenphp` global block must be present even without a `worker`
 # directive; without it php_server has no PHP runtime to dispatch to.
