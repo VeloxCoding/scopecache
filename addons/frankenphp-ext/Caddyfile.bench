@@ -1,0 +1,34 @@
+# Caddyfile.bench — bench-only config that exposes BOTH paths in one
+# frankenphp process:
+#
+#   - scopecache as a Caddy module on :8080 (the HTTP path that
+#     PHP→curl→HTTP→Caddy→scopecache exercises)
+#   - php_server on :8080 for bench.php itself (where the
+#     scopecache_get() cgo call is measured)
+#
+# Both PHP-side calls (scopecache_get via cgo) and HTTP-side calls
+# (curl /get) hit the SAME *Gateway: the Caddy module registers its
+# gateway under "default" during Provision, and the extension's
+# scopecache_get() looks it up by that name on every call. See
+# gateway_registry.go in the scopecache core for the registry,
+# and CLAUDE_PHPEXTENSION_IN_GO.md for the design rationale.
+#
+# `order scopecache before php_server` matches the harness — scopecache
+# matches /get, /append etc. and returns next() for anything else,
+# so /bench.php falls through cleanly to php_server.
+#
+# `frankenphp` global block must be present even without a `worker`
+# directive; without it php_server has no PHP runtime to dispatch to.
+
+{
+    auto_https off
+    admin off
+    frankenphp
+    order scopecache before php_server
+}
+
+:8080 {
+    root * /app
+    scopecache
+    php_server
+}

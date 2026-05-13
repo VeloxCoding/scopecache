@@ -1,0 +1,12 @@
+# Dockerfile.bench — derived FrankenPHP runtime image for the
+# scopecache-vs-redis benchmark. Adds the phpredis C-extension to the
+# stock dunglas/frankenphp:1.12-php8 runtime so bench.php can call
+# Redis the same way real PHP apps do (production standard, not
+# pure-PHP predis).
+#
+# Built only when ./run-bench.sh runs; the original
+# dist/frankenphp binary is mounted from the host at /app/dist.
+
+FROM dunglas/frankenphp:1.12-php8
+
+RUN install-php-extensions redis memcached
