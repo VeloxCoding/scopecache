@@ -294,7 +294,7 @@ func (api *API) handleGet(w http.ResponseWriter, r *http.Request) {
 //
 // Wire-format compatibility:
 //   - The envelope shape is identical to the previous orderedFields
-//     emission: ok, hit, count, item, duration_us, approx_response_mb.
+//     emission: ok, hit, count, item, approx_response_mb.
 //   - For items in the reserved _events scope the payload-bearing
 //     field is named "event" (matching Item.MarshalJSON's special
 //     case); otherwise it is "payload".

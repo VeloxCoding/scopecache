@@ -4,9 +4,8 @@
 // Single source of truth for the HTTP wire format. Each handler builds
 // its response struct and passes it to writeJSONResponse, which calls
 // json.Marshal. The struct's declared field order is preserved by
-// encoding/json, so wire output matches the historical inline-build
-// path on every field except the now-removed duration_us suffix
-// (deliberately dropped in Phase C — see commit log).
+// encoding/json, so wire output matches the response shapes documented
+// in docs/scopecache-core-rfc.md §6.
 //
 // Cap-protected reads (/get, /tail, /head, /scopelist) keep their
 // dedicated byte-builders for payload-copy avoidance; those builders

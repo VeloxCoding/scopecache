@@ -268,16 +268,16 @@ change between calls and re-emitting them on every poll is pure noise.
 
 | field             | purpose                                                                  |
 |-------------------|--------------------------------------------------------------------------|
-| `scope_count`     | live scope count (atomic; updated on scope create / delete / wipe / rebuild) |
-| `total_items`     | Σ `len(scope.items)` across all live scopes (atomic; updated on every write/delete) |
+| `scopes`          | live scope count (atomic; updated on scope create / delete / wipe / rebuild) |
+| `items`           | Σ `len(scope.items)` across all live scopes (atomic; updated on every write/delete) |
 | `approx_store_mb` | running byte-budget reservation in MiB (atomic; updated on every write that reserves or releases bytes) |
 | `last_write_ts`   | microsecond timestamp of the most recent state-changing event anywhere in the cache (atomic, monotonic via CAS-max). 0 means no writes since process start. Bumped by every per-scope `lastWriteTS` update plus the destructive store-level paths (`/delete_scope`, `/wipe`, `/rebuild`) that don't go through a per-scope bump. |
 
-The four atomics (`scope_count`, `total_items`, `approx_store_mb`,
+The four atomics (`scopes`, `items`, `approx_store_mb`,
 `last_write_ts`) are loaded independently. Concurrent writes between
 the loads can produce a snapshot where the fields reflect slightly
 different instants; the `Σ scope.bytes == approx_store_mb`, `Σ
-len(scope.items) == total_items`, and `last_write_ts >= max(scope.lastWriteTS)`
+len(scope.items) == items`, and `last_write_ts >= max(scope.lastWriteTS)`
 invariants hold at quiesce, not at every observation. See §8.3.
 
 **Polling pattern.** Clients that maintain a local view of cache
@@ -423,6 +423,7 @@ For a user `/append` of `{"n":1}` on scope `counter` with
 ```json
 {
   "scope": "_events",
+  "id": null,
   "seq": 2,
   "ts": 1700000000123456,
   "event": {
@@ -435,6 +436,13 @@ For a user `/append` of `{"n":1}` on scope `counter` with
   }
 }
 ```
+
+`_events` entries are seq-only (the cache never assigns a client-
+facing `id` to an auto-populated event), so the outer envelope
+renders `"id": null` per the uniform-shape rule (§4.2). The inner
+`event` envelope is the cache-controlled writeEvent shape — its
+fields mirror the action the user took, not the auto-populated
+event's own seq/ts.
 
 Drainers reading `/tail` or `/head` against `_events` parse
 `items[i].event` to get the writeEvent envelope; they parse
@@ -507,10 +515,10 @@ StartSubscriber(s)        — drain bridges activate against _events / _inbox
 This pre-creates `_events` and `_inbox` via `ensureScope`-equivalent
 logic, charges `len(reservedScopeNames) × scopeBufferOverhead`
 (2 × 1024 = 2048 bytes by default) against the store byte budget,
-and bumps `scope_count` by 2. Pre-creation does NOT bump
-`s.lastWriteTS` — a fresh store still reports `last_write_ts = 0`
-so the "have I seen this cache before" sentinel works for polling
-clients.
+and bumps `scopes` (the `/stats` aggregate) by 2. Pre-creation
+does NOT bump `s.lastWriteTS` — a fresh store still reports
+`last_write_ts = 0` so the "have I seen this cache before"
+sentinel works for polling clients.
 
 The same `s.initReservedScopesLocked()` runs at the tail of
 `/wipe` and `/rebuild`, under the all-shard write lock that the
@@ -518,7 +526,7 @@ destructive op already holds:
 
 - `/wipe` drops every scope (including reserved), then re-creates
   the reserved ones before releasing the lock. Post-wipe baseline:
-  `scope_count = 2`, `total_items = 0`,
+  `scopes = 2`, `items = 0`,
   `approx_store_mb = reservedScopesOverhead`.
 - `/rebuild` validates input first (400 if any input scope is
   reserved), then under all-shard write lock detaches every
@@ -778,7 +786,31 @@ payload bytes — see `approxItemSize` in code) is checked against
 `MaxItemBytes` after field-shape validation. An over-cap item is
 rejected with `400 Bad Request`. See §3.2.
 
-### 4.2 Query parameters
+### 4.2 Wire-shape uniformity
+
+Every `item` value rendered on the wire — single-item responses
+(`/get`, `/append`, `/upsert`) and list-returning responses
+(`/head`, `/tail`) — carries the **same key set** regardless of
+which fields the original write supplied:
+
+```json
+{"scope": "...", "id": "..." | null, "seq": 123, "ts": 1700000000000000, "payload": ...}
+```
+
+- `id` is always emitted. Items written without a client-supplied
+  `id` render as `"id": null` rather than dropping the key.
+  Clients can read `item.id` directly without a presence check.
+- `seq` and `ts` are always emitted (cache-assigned, monotonic
+  per scope and microsecond-stamped respectively).
+- `payload` is always emitted, except on items in the reserved
+  `_events` scope where the field is renamed to `event` (the
+  bytes there are the cache-controlled writeEvent envelope, not a
+  user-supplied payload — see §2.6).
+
+Other response fields (the envelope's `ok`, `hit`, `count`, etc.)
+follow the per-field conventions in §5.1.
+
+### 4.3 Query parameters
 
 Read endpoints accept query parameters with the following rules:
 
@@ -795,7 +827,7 @@ Single-item read endpoints (`/get`, `/render`) require exactly one
 of `id` or `seq`. Supplying both, or neither, is rejected with
 `400 Bad Request`.
 
-### 4.3 Why the cache rejects client-supplied `seq` and `ts`
+### 4.4 Why the cache rejects client-supplied `seq` and `ts`
 
 Both fields are owned by the cache and stamped on every write that
 touches an item. Accepting client-supplied values would silently
@@ -812,16 +844,13 @@ the cache stays opaque.
 ### 5.1 Response envelope
 
 Successful responses use a JSON envelope. The shape of the envelope
-varies per endpoint, but two fields are universal:
+varies per endpoint, but one field is universal:
 
 - `ok` — boolean, always present, `true` on success and `false` on
   error.
-- `duration_us` — integer, always present, the handler's internal
-  duration in microseconds (measured from the start of request
-  processing to the start of response write).
 
 Read endpoints whose response size scales with the request (`/get`,
-`/head`, `/tail`) additionally include:
+`/head`, `/tail`, `/scopelist`) additionally include:
 
 - `approx_response_mb` — number, the approximate marshalled size
   of the response body in MiB (4-decimal precision).
@@ -831,6 +860,32 @@ Two endpoints break the JSON-envelope rule by design:
 - **`/render`** — returns raw payload bytes (or empty body on
   miss); see §6.4.
 - **`/help`** — returns `text/plain`; see §6.5.
+
+#### Per-field conventions
+
+Across every endpoint the cache uses a small uniform vocabulary
+instead of endpoint-specific names. A reader who knows the
+vocabulary can read any response without an endpoint-specific
+schema:
+
+- `count` — the relevant integer for endpoints that return one
+  number (items updated on `/update`, items deleted on the delete
+  family, items in this page on `/head` / `/tail` / `/scopelist`).
+- `scopes` / `items` — the two integers on responses that need a
+  scope-count *and* an item-count side by side (`/wipe`, `/warm`,
+  `/rebuild`, `/stats`).
+- `hit` — present on every endpoint where the call may legitimately
+  not match anything (`/get`, `/head`, `/tail`, `/scopelist`, the
+  three delete endpoints). Not present on unconditional ops
+  (`/append`, `/upsert`, `/counter_add`, `/wipe`, `/warm`,
+  `/rebuild`) where `hit` would always be `true` and convey no
+  information.
+- `created` — present on every write response (`/append`,
+  `/upsert`, `/update`, `/counter_add`). `true` when the call
+  produced a brand-new item, `false` when an existing item was
+  modified in place. `/append` always emits `true` and `/update`
+  always emits `false` (by construction); they carry the field
+  anyway so every write response has the same key set.
 
 ### 5.2 Error envelope
 
@@ -842,8 +897,7 @@ scope or store-wide totals — see §3.
 ```json
 {
   "ok": false,
-  "error": "the 'scope' field is required for the '/append' endpoint",
-  "duration_us": 12
+  "error": "the 'scope' field is required for the '/append' endpoint"
 }
 ```
 
@@ -946,14 +1000,17 @@ Insert a new item into a scope. Rejects on duplicate `id`-in-scope.
 ```json
 {
   "ok": true,
-  "item": {"scope": "events", "id": "e1", "seq": 1, "ts": 1700000000000000},
-  "duration_us": 42
+  "created": true,
+  "item": {"scope": "events", "id": "e1", "seq": 1, "ts": 1700000000000000}
 }
 ```
 
 The `item` object echoes the stored `scope`, `id`, `seq`, and `ts`.
 Payload bytes are not echoed (they doubled the wire cost on the
-write path that just delivered them).
+write path that just delivered them). `created` is always `true` on
+`/append` — kept for uniformity with `/upsert` and `/counter_add`
+(§5.1). When the request omits `id` the response renders
+`"id":null` rather than dropping the key (uniform-shape rule, §4.2).
 
 **Endpoint-specific errors**
 
@@ -967,7 +1024,7 @@ write path that just delivered them).
 curl -s -X POST http://localhost:8080/append \
   -H 'Content-Type: application/json' \
   -d '{"scope":"events","id":"e1","payload":{"v":1}}'
-# → {"ok":true,"item":{"scope":"events","id":"e1","seq":1,"ts":...},"duration_us":42}
+# → {"ok":true,"created":true,"item":{"scope":"events","id":"e1","seq":1,"ts":...}}
 ```
 
 ---
@@ -993,8 +1050,7 @@ distinguishes create from replace via `created`.
 {
   "ok": true,
   "created": false,
-  "item": {"scope": "events", "id": "e1", "seq": 5, "ts": 1700000000000000},
-  "duration_us": 42
+  "item": {"scope": "events", "id": "e1", "seq": 5, "ts": 1700000000000000}
 }
 ```
 
@@ -1015,7 +1071,7 @@ keeps its original value; on create, `seq` is freshly assigned.
 curl -s -X POST http://localhost:8080/upsert \
   -H 'Content-Type: application/json' \
   -d '{"scope":"events","id":"e1","payload":{"v":2}}'
-# → {"ok":true,"created":false,"item":{"scope":"events","id":"e1","seq":5,"ts":...},"duration_us":42}
+# → {"ok":true,"created":false,"item":{"scope":"events","id":"e1","seq":5,"ts":...}}
 ```
 
 ---
@@ -1038,12 +1094,14 @@ with `hit: false`).
 **Response (200)**
 
 ```json
-{"ok": true, "hit": true, "updated_count": 1, "duration_us": 42}
+{"ok": true, "created": false, "count": 1}
 ```
 
-- `hit` — whether an item was found and updated (`updated_count > 0`).
-- `updated_count` — number of items modified (always 0 or 1 since
-  `id`/`seq` is unique-in-scope).
+- `created` — always `false` on `/update` (the endpoint never
+  spawns a new item). Carried for uniformity with the other write
+  responses (§5.1).
+- `count` — number of items modified (always 0 or 1 since `id`/`seq`
+  is unique-in-scope). `count == 0` is the soft-miss signal.
 
 **Side effects**
 
@@ -1064,7 +1122,7 @@ applied.
 curl -s -X POST http://localhost:8080/update \
   -H 'Content-Type: application/json' \
   -d '{"scope":"events","id":"e1","payload":{"v":3}}'
-# → {"ok":true,"hit":true,"updated_count":1,"duration_us":42}
+# → {"ok":true,"created":false,"count":1}
 ```
 
 ---
@@ -1087,7 +1145,7 @@ bytes.
 **Response (200)**
 
 ```json
-{"ok": true, "created": false, "value": 7, "duration_us": 42}
+{"ok": true, "created": false, "value": 7}
 ```
 
 - `created` — `true` when the counter did not exist (item created
@@ -1126,7 +1184,7 @@ NOT — see §2.4 for the rationale.
 curl -s -X POST http://localhost:8080/counter_add \
   -H 'Content-Type: application/json' \
   -d '{"scope":"hits","id":"page-42","by":1}'
-# → {"ok":true,"created":false,"value":7,"duration_us":42}
+# → {"ok":true,"created":false,"value":7}
 ```
 
 ### 6.2 Deletes
@@ -1147,8 +1205,11 @@ on a non-existent item.
 **Response (200)**
 
 ```json
-{"ok": true, "hit": true, "deleted_count": 1, "duration_us": 42}
+{"ok": true, "hit": true, "count": 1}
 ```
+
+- `hit` — whether an item was found and deleted (`count > 0`).
+- `count` — number of items removed (always 0 or 1).
 
 **Example**
 
@@ -1156,7 +1217,7 @@ on a non-existent item.
 curl -s -X POST http://localhost:8080/delete \
   -H 'Content-Type: application/json' \
   -d '{"scope":"events","id":"e1"}'
-# → {"ok":true,"hit":true,"deleted_count":1,"duration_us":42}
+# → {"ok":true,"hit":true,"count":1}
 ```
 
 ---
@@ -1178,11 +1239,12 @@ Drain a `seq`-prefix from a scope: removes every item with
 **Response (200)**
 
 ```json
-{"ok": true, "hit": true, "deleted_count": 100, "duration_us": 42}
+{"ok": true, "hit": true, "count": 100}
 ```
 
-`deleted_count` is the number of items actually removed (may be 0
-if no items had `seq ≤ max_seq`).
+- `hit` — whether anything was removed (`count > 0`).
+- `count` — number of items actually removed (may be 0 if no items
+  had `seq ≤ max_seq`).
 
 **Example**
 
@@ -1190,7 +1252,7 @@ if no items had `seq ≤ max_seq`).
 curl -s -X POST http://localhost:8080/delete_up_to \
   -H 'Content-Type: application/json' \
   -d '{"scope":"events","max_seq":100}'
-# → {"ok":true,"hit":true,"deleted_count":100,"duration_us":42}
+# → {"ok":true,"hit":true,"count":100}
 ```
 
 ---
@@ -1209,13 +1271,14 @@ Soft-misses on a non-existent scope.
 **Response (200)**
 
 ```json
-{"ok": true, "hit": true, "deleted_scope": true, "deleted_items": 42, "duration_us": 42}
+{"ok": true, "hit": true, "count": 42}
 ```
 
-- `hit` / `deleted_scope` — `true` when the scope existed and was
-  removed; `false` when the scope did not exist.
-- `deleted_items` — the number of items the scope held at deletion
-  time.
+- `hit` — `true` when the scope existed and was removed; `false`
+  when the scope did not exist. Unlike `/delete` and
+  `/delete_up_to`, `hit` here reflects "did the scope exist
+  pre-call" — an existing-but-empty scope still hits.
+- `count` — the number of items the scope held at deletion time.
 
 **Side effects**
 
@@ -1235,7 +1298,7 @@ budget.
 curl -s -X POST http://localhost:8080/delete_scope \
   -H 'Content-Type: application/json' \
   -d '{"scope":"events"}'
-# → {"ok":true,"hit":true,"deleted_scope":true,"deleted_items":42,"duration_us":42}
+# → {"ok":true,"hit":true,"count":42}
 ```
 
 ---
@@ -1254,8 +1317,13 @@ at 1 KiB to prevent memory abuse.
 **Response (200)**
 
 ```json
-{"ok": true, "deleted_scopes": 12, "deleted_items": 5400, "freed_mb": 12.3456, "duration_us": 42}
+{"ok": true, "scopes": 12, "items": 5400, "freed_mb": 12.3456}
 ```
+
+- `scopes` — number of scopes that were dropped (including the
+  two reserved scopes that are immediately re-created — see below).
+- `items` — total items released across every scope.
+- `freed_mb` — bytes returned to the store-wide budget, in MiB.
 
 **Side effects**
 
@@ -1263,8 +1331,8 @@ In-flight writes against any scope detach (409). The reserved
 scopes `_events` and `_inbox` (§2.6) are dropped along with everything
 else, then immediately re-created under the same all-shard write
 lock — subscribers attached to either reserved scope do not observe
-a gap. Post-call baseline is `scope_count = 2`,
-`total_items = 0`, `approx_store_mb` ≈ `reservedScopesOverhead /
+a gap. Post-call baseline is `scopes = 2`,
+`items = 0`, `approx_store_mb` ≈ `reservedScopesOverhead /
 1 MiB` (~0.002 MiB by default).
 
 This is **not** an eviction policy: the cache never wipes itself.
@@ -1275,7 +1343,7 @@ than coordinating N delete calls.
 
 ```bash
 curl -s -X POST http://localhost:8080/wipe
-# → {"ok":true,"deleted_scopes":12,"deleted_items":5400,"freed_mb":12.3456,"duration_us":42}
+# → {"ok":true,"scopes":12,"items":5400,"freed_mb":12.3456}
 ```
 
 ### 6.3 Bulk
@@ -1301,12 +1369,14 @@ the batch is replaced as a unit.
 **Response (200)**
 
 ```json
-{"ok": true, "count": 100, "replaced_scopes": 3, "duration_us": 42}
+{"ok": true, "scopes": 3}
 ```
 
-- `count` — total number of items written.
-- `replaced_scopes` — number of distinct scopes touched by the
-  replacement.
+- `scopes` — number of distinct scopes touched by the replacement.
+
+The input item count is intentionally not echoed: the client knows
+how many items it sent. The byte-level cap protection lives in §3
+and surfaces as 507 when exceeded, not as a per-item count here.
 
 **Side effects**
 
@@ -1327,7 +1397,7 @@ replaced scope detach (409).
 curl -s -X POST http://localhost:8080/warm \
   -H 'Content-Type: application/json' \
   -d '{"items":[{"scope":"events","id":"e1","payload":{"v":1}}]}'
-# → {"ok":true,"count":1,"replaced_scopes":1,"duration_us":42}
+# → {"ok":true,"scopes":1}
 ```
 
 ---
@@ -1359,8 +1429,13 @@ want to clear the store should call `/wipe`.
 **Response (200)**
 
 ```json
-{"ok": true, "count": 100, "rebuilt_scopes": 3, "rebuilt_items": 100, "duration_us": 42}
+{"ok": true, "scopes": 3, "items": 100}
 ```
+
+- `scopes` — number of distinct scopes the rebuilt state contains
+  (user scopes plus the two reserved scopes recreated under the
+  same lock; see §2.6).
+- `items` — total items in the rebuilt state.
 
 **Side effects**
 
@@ -1377,7 +1452,7 @@ exactly does not blow past it once init runs.
 curl -s -X POST http://localhost:8080/rebuild \
   -H 'Content-Type: application/json' \
   -d '{"items":[{"scope":"events","id":"e1","payload":{"v":1}}]}'
-# → {"ok":true,"count":1,"rebuilt_scopes":1,"rebuilt_items":1,"duration_us":42}
+# → {"ok":true,"scopes":1,"items":1}
 ```
 
 ### 6.4 Reads
@@ -1404,15 +1479,20 @@ true|false`. See §5.3 for why misses are not 404.
   "hit": true,
   "count": 1,
   "item": {"scope":"events","id":"e1","seq":1,"ts":1700000000000000,"payload":{"v":1}},
-  "duration_us": 42,
   "approx_response_mb": 0.0001
 }
 ```
 
+Every item carries the full `scope` / `id` / `seq` / `ts` /
+`payload` key set on the wire. Items written without a
+client-supplied `id` render as `"id":null` rather than dropping
+the key — uniform shape lets clients read `item.id` directly
+without a presence check (§4.2).
+
 **Response (200, miss)**
 
 ```json
-{"ok": true, "hit": false, "count": 0, "item": null, "duration_us": 42, "approx_response_mb": 0.0001}
+{"ok": true, "hit": false, "count": 0, "item": null, "approx_response_mb": 0.0001}
 ```
 
 **Side effects**
@@ -1423,7 +1503,7 @@ A successful hit bumps the per-scope read-bookkeeping atomics (§9).
 
 ```bash
 curl -s 'http://localhost:8080/get?scope=events&id=e1'
-# → {"ok":true,"hit":true,"count":1,"item":{...},"duration_us":42,"approx_response_mb":0.0001}
+# → {"ok":true,"hit":true,"count":1,"item":{...},"approx_response_mb":0.0001}
 ```
 
 ---
@@ -1497,18 +1577,19 @@ cursor-based forward paging (stable under `/delete_up_to`), or
   "count": 10,
   "truncated": false,
   "items": [{"scope":"events","id":"e1","seq":1,"ts":...,"payload":{"v":1}}, ...],
-  "duration_us": 42,
   "approx_response_mb": 0.0042
 }
 ```
 
 `truncated` is `true` when more items exist beyond the returned
-`limit` window.
+`limit` window. Items follow the same uniform key set as on `/get`
+(§6.4): seq-only items render `"id":null` rather than dropping
+the key.
 
 **Response (200, miss)** — empty scope or unknown scope:
 
 ```json
-{"ok": true, "hit": false, "count": 0, "truncated": false, "items": [], "duration_us": 42, "approx_response_mb": 0.0001}
+{"ok": true, "hit": false, "count": 0, "truncated": false, "items": [], "approx_response_mb": 0.0001}
 ```
 
 **Endpoint-specific errors**
@@ -1525,7 +1606,7 @@ A successful hit bumps the per-scope read-bookkeeping atomics (§9).
 
 ```bash
 curl -s 'http://localhost:8080/head?scope=events&limit=10'
-# → {"ok":true,"hit":true,"count":10,"truncated":false,"items":[...],"duration_us":42,...}
+# → {"ok":true,"hit":true,"count":10,"truncated":false,"items":[...],"approx_response_mb":...}
 ```
 
 ---
@@ -1553,7 +1634,6 @@ tail. Returns 200 in both the hit and miss case.
   "offset": 0,
   "truncated": true,
   "items": [...],
-  "duration_us": 42,
   "approx_response_mb": 0.0042
 }
 ```
@@ -1572,7 +1652,7 @@ A successful hit bumps the per-scope read-bookkeeping atomics (§9).
 
 ```bash
 curl -s 'http://localhost:8080/tail?scope=events&limit=10'
-# → {"ok":true,"hit":true,"count":10,"offset":0,"truncated":true,"items":[...],"duration_us":42,...}
+# → {"ok":true,"hit":true,"count":10,"offset":0,"truncated":true,"items":[...],"approx_response_mb":...}
 ```
 
 ### 6.5 Observability
@@ -1595,8 +1675,8 @@ None.
 ```json
 {
   "ok": true,
-  "scope_count": 14,
-  "total_items": 5400,
+  "scopes": 14,
+  "items": 5400,
   "approx_store_mb": 12.3456,
   "last_write_ts": 1700000000123456,
   "events_drops_total": 0,
@@ -1617,18 +1697,19 @@ None.
       "created_ts": 1700000000000000,
       "last_write_ts": 0
     }
-  ],
-  "duration_us": 0
+  ]
 }
 ```
 
 **Field semantics**
 
-- `scope_count` — total number of scopes in the cache, **including**
-  the two reserved scopes. A freshly-wiped store has `scope_count=2`,
+- `scopes` — total number of scopes in the cache, **including**
+  the two reserved scopes. A freshly-wiped store has `scopes=2`,
   not `0`, because the reservation contract recreates `_events` and
-  `_inbox` immediately on `/wipe` and `/rebuild` (§2.6).
-- `total_items` — sum of items across all scopes, including reserved.
+  `_inbox` immediately on `/wipe` and `/rebuild` (§2.6). The bare
+  integer is the scope-count on `/stats`; the full per-scope
+  enumeration is a separate endpoint, `/scopelist`.
+- `items` — sum of items across all scopes, including reserved.
   When `events_mode=full` this also counts the auto-populated event
   entries.
 - `approx_store_mb` — sum of `approxItemSize(item)` over every item
@@ -1655,7 +1736,7 @@ None.
 
 **Cost**
 
-`/stats` is **O(1)**: five atomic loads (`scope_count`, `total_items`,
+`/stats` is **O(1)**: five atomic loads (`scopes`, `items`,
 `approx_store_mb`, `last_write_ts`, `events_drops_total`) plus two
 `getScope() + buf.stats()` materialisations for the reserved-scope
 rows. Cost is independent of the number of user-managed scopes in the
@@ -1664,15 +1745,16 @@ write/delete/bulk path. See §2.5 for the polling pattern that
 `last_write_ts` enables. Configured caps are NOT echoed here — they
 are static config and live on `/help`.
 
-The previous shape included a per-scope `scopes` map keyed by scope
-name across **all** user scopes. At 100k+ scopes that response
-routinely blew past practical client and proxy response-size limits,
-and the per-scope enumeration (one `buffer.stats()` materialisation
-per scope) dominated `/stats` latency. Per-scope listing of user
-scopes moved to a dedicated paginated endpoint (`/scopelist`); the
-small fixed `reserved_scopes` block is the bounded exception so
-operators can monitor drainer-backlog and fan-in queue depth without
-paging.
+The previous shape included a per-scope array keyed by scope name
+across **all** user scopes (where `scopes` on `/stats` was an array
+of detail rows). At 100k+ scopes that response routinely blew past
+practical client and proxy response-size limits, and the per-scope
+enumeration (one `buffer.stats()` materialisation per scope)
+dominated `/stats` latency. Per-scope listing of user scopes moved
+to a dedicated paginated endpoint (`/scopelist`); `/stats` now
+returns `scopes` as a scalar integer (the count) plus a small fixed
+`reserved_scopes` block, which is the bounded exception so operators
+can monitor drainer-backlog and fan-in queue depth without paging.
 
 **Side effects**
 
@@ -1746,7 +1828,6 @@ read-count) are explicitly out of core; addons that want them poll
       "read_count_total": 0
     }
   ],
-  "duration_us": 42,
   "approx_response_mb": 0.0009
 }
 ```
@@ -1775,7 +1856,7 @@ names where M is the filtered count, and `O(limit)` `buf.stats()`
 materialisations once the locks are released. Filtering happens inside
 the walk so a narrow prefix is much cheaper than a full enumeration.
 
-This is fundamentally an `O(scope_count)` endpoint — unlike `/stats`,
+This is fundamentally an `O(scopes)` endpoint — unlike `/stats`,
 which is `O(1)` — so use it for periodic enumeration and addon polling
 rather than per-request hot paths.
 
@@ -1791,8 +1872,8 @@ counters it is trying to measure.
 Three illustrative calls against a store that holds an `events` scope
 plus a handful of `thread:42:*` scopes. Responses are abbreviated for
 readability: `created_ts`, `last_write_ts`, `last_access_ts`,
-`read_count_total`, `duration_us`, and `approx_response_mb` are present
-on the wire but omitted from the prose below.
+`read_count_total`, and `approx_response_mb` are present on the wire
+but omitted from the prose below.
 
 *First page, every scope:*
 
@@ -2334,13 +2415,13 @@ are internally consistent at the moment of the read.
 `/stats` is an **advisory snapshot**, not a transaction:
 
 - Every field comes from an independent atomic load. The three
-  counters (`scope_count`, `total_items`, `approx_store_mb`) are
+  counters (`scopes`, `items`, `approx_store_mb`) are
   maintained incrementally on every write/delete/bulk path, but
   they are not loaded under a shared lock — concurrent writes
   between the three loads can produce a snapshot where the fields
   reflect three slightly different instants.
 - The `Σ scope.bytes == total_bytes` and `Σ len(scope.items) ==
-  total_items` invariants hold at quiesce, not at every observation.
+  items` invariants hold at quiesce, not at every observation.
 
 Operators using `/stats` to drive decisions (capacity planning,
 admission-control headroom) should treat its output as approximate
