@@ -41,56 +41,56 @@ package scopecache_ext
 // makes the source of each symbol unambiguous at the call site.
 // <php.h> pulls in zend_types.h, zend_string.h, zend_hash.h and
 // everything else the API exposes.
-static inline void sc_zval_str(zval *zv, zend_string *s) {
+static void sc_zval_str(zval *zv, zend_string *s) {
     ZVAL_STR(zv, s);
 }
-static inline void sc_zval_empty_string(zval *zv) {
+static void sc_zval_empty_string(zval *zv) {
     ZVAL_EMPTY_STRING(zv);
 }
-static inline void sc_zval_bool(zval *zv, int b) {
+static void sc_zval_bool(zval *zv, int b) {
     ZVAL_BOOL(zv, b);
 }
-static inline void sc_zval_long(zval *zv, zend_long n) {
+static void sc_zval_long(zval *zv, zend_long n) {
     ZVAL_LONG(zv, n);
 }
-static inline void sc_zval_double(zval *zv, double d) {
+static void sc_zval_double(zval *zv, double d) {
     ZVAL_DOUBLE(zv, d);
 }
-static inline void sc_zval_null(zval *zv) {
+static void sc_zval_null(zval *zv) {
     ZVAL_NULL(zv);
 }
-static inline void sc_zval_arr(zval *zv, zend_array *a) {
+static void sc_zval_arr(zval *zv, zend_array *a) {
     ZVAL_ARR(zv, a);
 }
-static inline zend_array *sc_zend_new_array(uint32_t size) {
+static zend_array *sc_zend_new_array(uint32_t size) {
     return zend_new_array(size);
 }
 // zend_hash_str_add_new — the no-collision variant of the insert
 // macro; faster, and our build* helpers always use unique keys.
-static inline zval *sc_hash_str_add(zend_array *ht, const char *key, size_t key_len, zval *zv) {
+static zval *sc_hash_str_add(zend_array *ht, const char *key, size_t key_len, zval *zv) {
     return zend_hash_str_add_new(ht, key, key_len, zv);
 }
 
 // sc_add_* — fused zval-construct + hash-insert helpers, one cgo
 // crossing per add (vs. the two-step ZVAL_* + hash_str_add the
 // Go-side helpers used to pay).
-static inline void sc_add_bool(zend_array *ht, const char *key, size_t key_len, int b) {
+static void sc_add_bool(zend_array *ht, const char *key, size_t key_len, int b) {
     zval zv; ZVAL_BOOL(&zv, b);
     zend_hash_str_add_new(ht, key, key_len, &zv);
 }
-static inline void sc_add_long(zend_array *ht, const char *key, size_t key_len, zend_long n) {
+static void sc_add_long(zend_array *ht, const char *key, size_t key_len, zend_long n) {
     zval zv; ZVAL_LONG(&zv, n);
     zend_hash_str_add_new(ht, key, key_len, &zv);
 }
-static inline void sc_add_double(zend_array *ht, const char *key, size_t key_len, double d) {
+static void sc_add_double(zend_array *ht, const char *key, size_t key_len, double d) {
     zval zv; ZVAL_DOUBLE(&zv, d);
     zend_hash_str_add_new(ht, key, key_len, &zv);
 }
-static inline void sc_add_null(zend_array *ht, const char *key, size_t key_len) {
+static void sc_add_null(zend_array *ht, const char *key, size_t key_len) {
     zval zv; ZVAL_NULL(&zv);
     zend_hash_str_add_new(ht, key, key_len, &zv);
 }
-static inline void sc_add_string(zend_array *ht, const char *key, size_t key_len,
+static void sc_add_string(zend_array *ht, const char *key, size_t key_len,
                                   const char *str_data, size_t str_len) {
     zval zv;
     if (str_len == 0) {
@@ -101,7 +101,7 @@ static inline void sc_add_string(zend_array *ht, const char *key, size_t key_len
     }
     zend_hash_str_add_new(ht, key, key_len, &zv);
 }
-static inline void sc_add_arr(zend_array *ht, const char *key, size_t key_len, zend_array *a) {
+static void sc_add_arr(zend_array *ht, const char *key, size_t key_len, zend_array *a) {
     zval zv; ZVAL_ARR(&zv, a);
     zend_hash_str_add_new(ht, key, key_len, &zv);
 }
@@ -109,13 +109,13 @@ static inline void sc_add_arr(zend_array *ht, const char *key, size_t key_len, z
 // sc_packed_push_arr — append a zend_array as the next packed-index
 // element of an outer packed array. Collapses the two-cgo pattern
 // (ZVAL_ARR + zend_hash_next_index_insert) into one call.
-static inline void sc_packed_push_arr(zend_array *outer, zend_array *inner) {
+static void sc_packed_push_arr(zend_array *outer, zend_array *inner) {
     zval zv; ZVAL_ARR(&zv, inner);
     zend_hash_next_index_insert(outer, &zv);
 }
 
 // sc_zval_str_from_bytes — zend_string_init + ZVAL_STR in one cgo call.
-static inline void sc_zval_str_from_bytes(zval *zv, const char *data, size_t len) {
+static void sc_zval_str_from_bytes(zval *zv, const char *data, size_t len) {
     if (len == 0) {
         ZVAL_EMPTY_STRING(zv);
     } else {
@@ -126,7 +126,7 @@ static inline void sc_zval_str_from_bytes(zval *zv, const char *data, size_t len
 
 // sc_packed_push_str_from_bytes — fresh zend_string + packed-index
 // insert in one cgo call. Used by the JSON-array fast path.
-static inline void sc_packed_push_str_from_bytes(zend_array *outer, const char *data, size_t len) {
+static void sc_packed_push_str_from_bytes(zend_array *outer, const char *data, size_t len) {
     zval zv;
     if (len == 0) {
         ZVAL_EMPTY_STRING(&zv);
@@ -139,26 +139,26 @@ static inline void sc_packed_push_str_from_bytes(zend_array *outer, const char *
 
 // sc_packed_push_long / _push_double / _push_bool / _push_null —
 // scalar packed-array push in one cgo call.
-static inline void sc_packed_push_long(zend_array *outer, zend_long n) {
+static void sc_packed_push_long(zend_array *outer, zend_long n) {
     zval zv; ZVAL_LONG(&zv, n);
     zend_hash_next_index_insert(outer, &zv);
 }
-static inline void sc_packed_push_double(zend_array *outer, double d) {
+static void sc_packed_push_double(zend_array *outer, double d) {
     zval zv; ZVAL_DOUBLE(&zv, d);
     zend_hash_next_index_insert(outer, &zv);
 }
-static inline void sc_packed_push_bool(zend_array *outer, int b) {
+static void sc_packed_push_bool(zend_array *outer, int b) {
     zval zv; ZVAL_BOOL(&zv, b);
     zend_hash_next_index_insert(outer, &zv);
 }
-static inline void sc_packed_push_null(zend_array *outer) {
+static void sc_packed_push_null(zend_array *outer) {
     zval zv; ZVAL_NULL(&zv);
     zend_hash_next_index_insert(outer, &zv);
 }
 
 // sc_assoc_add_str_from_bytes — string-keyed counterpart of
 // sc_packed_push_str_from_bytes. Used by the JSON-object fast path.
-static inline void sc_assoc_add_str_from_bytes(zend_array *arr,
+static void sc_assoc_add_str_from_bytes(zend_array *arr,
         const char *key, size_t key_len,
         const char *data, size_t data_len) {
     zval zv;
@@ -175,7 +175,7 @@ static inline void sc_assoc_add_str_from_bytes(zend_array *arr,
 // (scope, id|null, seq, ts, payload-or-event) in one cgo call.
 // Caller pre-decodes the payload zval; reserved-scope rename to
 // "event" is handled inline.
-static inline zend_array *sc_build_item_array(
+static zend_array *sc_build_item_array(
     const char *scope_data, size_t scope_len,
     const char *id_data,    size_t id_len,    int id_is_null,
     zend_long seq, zend_long ts,
@@ -219,7 +219,7 @@ static inline zend_array *sc_build_item_array(
 // sc_build_write_ack_array — same one-shot pattern for /append and
 // /upsert response items (no payload, no event renaming). The same
 // id/null switch applies.
-static inline zend_array *sc_build_write_ack_array(
+static zend_array *sc_build_write_ack_array(
     const char *scope_data, size_t scope_len,
     const char *id_data,    size_t id_len,    int id_is_null,
     zend_long seq, zend_long ts
