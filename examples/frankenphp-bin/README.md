@@ -12,23 +12,57 @@ Drop it on a Linux server, make it executable, run it.
 
 ## Quick start
 
+### On Linux (any distro, x86_64)
+
 ```bash
 chmod +x frankenphp-static-linux-x86_64
-./frankenphp-static-linux-x86_64 run
+./frankenphp-static-linux-x86_64 php-server
 ```
 
-Then open `http://localhost:8080/` in a browser. You'll see the
-embedded "hello world" page that round-trips through scopecache:
+The `php-server` subcommand is FrankenPHP's; it boots the **embedded**
+Caddyfile + PHP app baked into the binary. Plain `caddy run` without
+`--config` won't work — there's no Caddyfile on disk to point at.
 
-- First visit → cache **miss**, page writes a greeting + timestamp.
-- Refresh    → cache **hit**, same timestamp keeps showing.
-- Restart the binary → cache cleared, miss again.
+### On Windows / macOS / anywhere with Docker
 
-The page also links to a few cache endpoints you can hit directly:
+The binary is Linux-only, but Docker Desktop runs a Linux VM under the
+hood. Wrap the binary in a minimal Alpine container:
+
+```bash
+docker run -d --name fpbin -p 8080:8080 \
+    -v "$(pwd):/app:ro" \
+    --entrypoint /app/frankenphp-static-linux-x86_64 \
+    alpine:latest php-server
+```
+
+On Git-Bash for Windows prefix with `MSYS_NO_PATHCONV=1` or it will
+rewrite `/app` to a Windows path before Docker sees it. If port 8080
+is already taken (common in dev environments), change `-p 8080:8080`
+to `-p 8090:8080` and open `http://localhost:8090/`.
+
+Stop with `docker rm -f fpbin`.
+
+### What the demo does
+
+Open `http://localhost:8080/` (or whichever port you mapped).
+
+Every refresh:
+
+1. Picks a random Dutch noun.
+2. Calls `scopecache_append('demo', '', json_encode(['word'=>..., 'ts'=>...]))`
+   — **direct cgo into the in-process `*Gateway`**, no HTTP.
+3. Calls `scopecache_tail('demo', 10)` and renders the last 10 items
+   in a table.
+
+So the seq counter grows each refresh, the table fills with new
+words, the timestamps show real wall-clock spacing.
+
+The page links to a few cache endpoints you can also hit directly:
 
 - `/stats` — JSON snapshot of the whole cache
-- `/tail?scope=demo&limit=10` — newest items in scope `demo`
-- `/get?scope=demo&id=greeting` — raw envelope for the greeting
+- `/tail?scope=demo&limit=10` — same items, JSON envelope
+- `/scopelist` — list of every scope (you'll see `_events`, `_inbox`, `demo`)
+- `POST /wipe` — clear the cache without restarting the binary
 
 ## What the binary actually is
 
@@ -54,7 +88,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/opt/scopecache/frankenphp-static-linux-x86_64 run
+ExecStart=/opt/scopecache/frankenphp-static-linux-x86_64 php-server
 Restart=always
 User=www-data
 
