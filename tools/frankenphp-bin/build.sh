@@ -66,6 +66,11 @@ EXT_GEN_DIR="$WORK_DIR/ext-prebuilt"
 mkdir -p "$EXT_GEN_DIR"
 
 echo ">>> Pre-generating PHP-extension C wrappers via $EXT_BUILDER_IMAGE..."
+# NOTE: copy ONLY scopecache_ext.go. scopecache_ext_experimental.go
+# is deliberately omitted so the production binary stays free of
+# bench/A-B variants. The dynamic bench build at tools/frankenphp-ext
+# does include that file; see addons/frankenphp-ext/scopecache_ext_experimental.go
+# for the boundary contract.
 MSYS_NO_PATHCONV=1 docker run --rm \
     -v "$REPO_ROOT/addons/frankenphp-ext:/ext-src:ro" \
     -v "$EXT_GEN_DIR:/out" \

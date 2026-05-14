@@ -90,6 +90,17 @@ MSYS_NO_PATHCONV=1 docker run --rm \
         cp /ext-src/go.mod /work/ext/
         cp /ext-src/scopecache_ext.go /work/ext/
 
+        # Experimental functions for bench-experimental.{sh,php}.
+        # frankenphp-gen extension-init only processes ONE Go file —
+        # so we merge the experimental files content (from the marker
+        # line onwards) into scopecache_ext.go before invoking it.
+        # The marker is "// --- BEGIN MERGE-INTO-MAIN-EXT ---" near
+        # the top of scopecache_ext_experimental.go. Production build
+        # (tools/frankenphp-bin) does NOT do this merge, so its binary
+        # stays free of experimental functions.
+        awk "/^\\/\\/ --- BEGIN MERGE-INTO-MAIN-EXT ---/,EOF" \
+            /ext-src/scopecache_ext_experimental.go >> /work/ext/scopecache_ext.go
+
         # Activate the replace directive so the extension builds against
         # the staged scopecache source, not the published release.
         sed -i "s|^// replace github.com/VeloxCoding/scopecache => ../\\.\\.|replace github.com/VeloxCoding/scopecache => /work/scopecache|" /work/ext/go.mod
