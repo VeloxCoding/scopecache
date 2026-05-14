@@ -42,16 +42,20 @@ $ts   = (new DateTimeImmutable())->format('Y-m-d H:i:s.v');
 // ob_get_clean() below.
 
 // Append a new item. id is empty => seq-only item (cache assigns the seq).
+// Extension returns the /append envelope as a JSON string; json_decode
+// for PHP-side field access. The cgo call + decode are timed together
+// so the displayed cost matches what a real PHP consumer pays.
 $tAppend = hrtime(true);
-$append_env = scopecache_append('demo', '', json_encode([
+$append_env = json_decode(scopecache_append('demo', '', json_encode([
     'word' => $word,
     'ts'   => $ts,
-]));
+])), true);
 $append_us = (hrtime(true) - $tAppend) / 1000;
 
-// Read the last 5 items, newest first.
+// Read the last 5 items, newest first. Same string-return + json_decode
+// pattern as append above.
 $tTail = hrtime(true);
-$tail_env = scopecache_tail('demo', 5);
+$tail_env = json_decode(scopecache_tail('demo', 5), true);
 $tail_us  = (hrtime(true) - $tTail) / 1000;
 $items    = $tail_env['items'] ?? [];
 
