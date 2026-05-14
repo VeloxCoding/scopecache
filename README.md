@@ -32,6 +32,16 @@ GET /tail?scope=thread:123&limit=100
 
 returns the latest 100 items for the scope `thread:123`.
 
+**Direct PHP access through FrankenPHP**
+
+FrankenPHP makes it possible to write PHP extensions in Go, so PHP can access ScopeCache directly inside the same process. 
+
+In a end-to-end benchmark, a PHP `scopecache_get()` call to ScopeCache and back took around **0.5 microseconds**. A regular PHP-to-Redis roundtrip on the same server took around **127 microseconds** with a persistent Redis connection, while opening a new Redis connection for a single request took roughly **600 microseconds**.
+
+The difference is architectural: ScopeCache avoids the extra process and protocol roundtrip that Redis requires.
+
+ScopeCache is not tied to PHP. The same in-process Caddy/cache architecture can be useful in many other use cases and with other platforms as well.
+
 ## What ScopeCache is
 
 ScopeCache is a small in-memory datastore/cache for workloads where the application already knows which views need to be served quickly.
