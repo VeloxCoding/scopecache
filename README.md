@@ -227,9 +227,9 @@ Conceptually, the core shape is:
 
 ```go
 type scopeBuffer struct {
-    items []Item              // primary storage, in append order
-    byID  map[string]Item     // id  -> item
-    bySeq map[uint64]Item     // seq -> item
+    items []*Item             // primary storage, in append order
+    byID  map[string]*Item    // id  -> item
+    bySeq map[uint64]*Item    // seq -> item
     mu    sync.RWMutex        // one lock per scope
 }
 ```
@@ -237,6 +237,8 @@ type scopeBuffer struct {
 The slice is the ordered storage. It defines the physical order of the data in memory and makes operations such as `head`, `tail`, and cursor-based reads natural.
 
 The maps exist to avoid scanning. A lookup by `id` or `seq` is an O(1) hashmap lookup on average, independent of the number of items in the scope.
+
+The slice and both maps hold pointers to the same items, so each item lives in memory once, no matter how many indexes address it.
 
 A classical key-value store is conceptually built around:
 
