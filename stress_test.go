@@ -233,7 +233,7 @@ func verifyInvariants(t *testing.T, s *store) {
 
 			var sum int64
 			for _, it := range buf.items {
-				sum += approxItemSize(it)
+				sum += approxItemSize(*it)
 			}
 			if sum != buf.bytes {
 				t.Errorf("scope %q: sum(approxItemSize)=%d != buf.bytes=%d", name, sum, buf.bytes)

@@ -166,13 +166,15 @@ func (b *scopeBuffer) counterAddSlow(scope, id string, by int64) (int64, bool, e
 			return 0, false, nil
 		}
 
-		// Build the new (counter-shaped) Item view of this slot to
-		// derive the byte delta. Scope/ID/Seq are unchanged on
-		// promote, so size differs only in the payload-related fields:
+		// Build the counter-shaped item in a value copy first, so a
+		// failed reservation below leaves the live item untouched —
+		// aliasing the stored *Item into `promoted` would corrupt it
+		// before the cap check. Scope/ID/Seq are unchanged on promote,
+		// so size differs only in the payload-related fields:
 		// approxItemSize charges counterCellOverhead for counter
 		// items, len(Payload)+len(renderBytes) for regular ones.
-		oldSize := approxItemSize(existing)
-		promoted := existing
+		oldSize := approxItemSize(*existing)
+		promoted := *existing
 		cell := &counterCell{}
 		cell.value.Store(newValue)
 		nowUs := time.Now().UnixMicro()
@@ -193,12 +195,13 @@ func (b *scopeBuffer) counterAddSlow(scope, id string, by int64) (int64, bool, e
 			}
 		}
 
-		// Promote keeps the per-scope / store freshness signals
-		// silent — see file-header rule on counter_add silence. The
-		// cell's ts captures "when did this counter last change".
-		b.items[i] = promoted
-		b.bySeq[promoted.Seq] = promoted
-		b.byID[id] = promoted
+		// Reservation succeeded — write the promoted shape back
+		// through the shared *Item; byID and bySeq alias it, so they
+		// observe it too. Promote keeps the per-scope / store
+		// freshness signals silent — see file-header rule on
+		// counter_add silence. The cell's ts captures "when did this
+		// counter last change".
+		*b.items[i] = promoted
 		b.bytes += delta
 
 		return newValue, false, nil
@@ -234,15 +237,17 @@ func (b *scopeBuffer) counterAddSlow(scope, id string, by int64) (int64, bool, e
 
 	b.lastSeq++
 	item.Seq = b.lastSeq
-	b.items = append(b.items, item)
+	// One heap *Item shared by all three indexes (see insertNewItemLocked).
+	stored := &item
+	b.items = append(b.items, stored)
 	if b.bySeq == nil {
-		b.bySeq = make(map[uint64]Item)
+		b.bySeq = make(map[uint64]*Item)
 	}
-	b.bySeq[item.Seq] = item
+	b.bySeq[item.Seq] = stored
 	if b.byID == nil {
-		b.byID = make(map[string]Item)
+		b.byID = make(map[string]*Item)
 	}
-	b.byID[id] = item
+	b.byID[id] = stored
 	b.idKeyBytes += int64(len(id))
 	b.bytes += size
 	if b.store != nil {

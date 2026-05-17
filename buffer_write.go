@@ -94,17 +94,14 @@ func (b *scopeBuffer) upsertByID(item Item) (Item, bool, error) {
 		// counter cell so it's no longer canonical.
 		b.items[i].counter = nil
 
-		updated := b.items[i]
-		// b.byID hit above proves byID was already allocated; same for
-		// bySeq (every item that lives in byID also lives in bySeq).
-		b.bySeq[updated.Seq] = updated
-		b.byID[item.ID] = updated
+		// items[i], byID and bySeq alias one *Item, so the field
+		// writes above are already visible through every index.
 		b.bytes += delta
 		b.lastWriteTS = nowUs
 		if b.store != nil {
 			b.store.bumpLastWriteTS(nowUs)
 		}
-		return updated, false, nil
+		return *b.items[i], false, nil
 	}
 
 	if b.itemCapExceeded(len(b.items) + 1) {
@@ -284,16 +281,20 @@ func (b *scopeBuffer) insertNewItemLocked(item Item, nowUs int64) (Item, error) 
 	b.lastSeq++
 	item.Seq = b.lastSeq
 
-	b.items = append(b.items, item)
+	// One heap *Item, shared by all three indexes — items, bySeq and
+	// byID hold the same pointer, so later in-place mutations need no
+	// re-sync.
+	stored := &item
+	b.items = append(b.items, stored)
 	if b.bySeq == nil {
-		b.bySeq = make(map[uint64]Item)
+		b.bySeq = make(map[uint64]*Item)
 	}
-	b.bySeq[item.Seq] = item
+	b.bySeq[item.Seq] = stored
 	if item.ID != "" {
 		if b.byID == nil {
-			b.byID = make(map[string]Item)
+			b.byID = make(map[string]*Item)
 		}
-		b.byID[item.ID] = item
+		b.byID[item.ID] = stored
 		b.idKeyBytes += int64(len(item.ID))
 	}
 	b.bytes += size

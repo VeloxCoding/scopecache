@@ -14,29 +14,30 @@ package scopecache
 
 import "sort"
 
-// deleteIndexLocked removes items[i] in O(n) tail-shift, GC-zeroes
-// the now-duplicate last slot, syncs bySeq + byID, and releases the
-// item's bytes from b.bytes and (when store-attached) s.totalBytes.
+// deleteIndexLocked removes items[i] in O(n) tail-shift, nils the
+// now-duplicate last slot, removes the bySeq + byID entries, and
+// releases the item's bytes from b.bytes and (when store-attached)
+// s.totalBytes.
 //
 // PRECONDITION: caller holds b.mu and i is valid.
 //
 // Three invariants the body upholds — drift here leaks state silently:
 //
-//  1. Zero the duplicate last slot before reslicing, otherwise the
-//     backing array keeps a reference to the removed payload bytes.
+//  1. Nil the duplicate last slot before reslicing, otherwise the
+//     backing array keeps a pointer to the removed *Item (and its
+//     payload bytes) and prevents GC.
 //  2. b.bytes and s.totalBytes update lockstep.
 //  3. byID delete is conditional on removed.ID != "" — empty-id
 //     items have no byID entry to remove.
 func (b *scopeBuffer) deleteIndexLocked(i int) {
 	removed := b.items[i]
-	removedSize := approxItemSize(removed)
+	removedSize := approxItemSize(*removed)
 
-	// Tail-shift then zero the now-duplicate last slot before
-	// shrinking. Without the zero the backing array keeps a
-	// reference to the removed Item (and its payload bytes) and
-	// prevents GC.
+	// Tail-shift then nil the now-duplicate last slot before
+	// shrinking. Without the nil the backing array keeps a pointer to
+	// the removed *Item (and its payload bytes) and prevents GC.
 	copy(b.items[i:], b.items[i+1:])
-	b.items[len(b.items)-1] = Item{}
+	b.items[len(b.items)-1] = nil
 	b.items = b.items[:len(b.items)-1]
 
 	delete(b.bySeq, removed.Seq)
@@ -85,19 +86,20 @@ func (b *scopeBuffer) shrinkIfSparseLocked() {
 	}
 	// Rebuild items slice with cap = len so the high-water backing
 	// array becomes GC-eligible.
-	newItems := make([]Item, len(b.items))
+	newItems := make([]*Item, len(b.items))
 	copy(newItems, b.items)
 	// Rebuild maps from the surviving items so map bucket arrays
-	// also shrink. Pre-size by len(newItems) — a slight over-
-	// allocation when many items have empty IDs is cheaper than
-	// growing the map back up via subsequent appends.
-	newBySeq := make(map[uint64]Item, len(newItems))
-	var newByID map[string]Item
+	// also shrink. The maps re-key off the SAME pointers in newItems,
+	// preserving the items/byID/bySeq aliasing. Pre-size by
+	// len(newItems) — a slight over-allocation when many items have
+	// empty IDs is cheaper than growing the map back up via appends.
+	newBySeq := make(map[uint64]*Item, len(newItems))
+	var newByID map[string]*Item
 	for i := range newItems {
 		newBySeq[newItems[i].Seq] = newItems[i]
 		if newItems[i].ID != "" {
 			if newByID == nil {
-				newByID = make(map[string]Item, len(newItems))
+				newByID = make(map[string]*Item, len(newItems))
 			}
 			newByID[newItems[i].ID] = newItems[i]
 		}
@@ -203,7 +205,7 @@ func (b *scopeBuffer) deleteUpToSeq(maxSeq uint64) (int, error) {
 	var freedIDKeyBytes int64
 	for i := 0; i < idx; i++ {
 		removed := b.items[i]
-		freedBytes += approxItemSize(removed)
+		freedBytes += approxItemSize(*removed)
 		delete(b.bySeq, removed.Seq)
 		if removed.ID != "" {
 			delete(b.byID, removed.ID)
@@ -216,7 +218,7 @@ func (b *scopeBuffer) deleteUpToSeq(maxSeq uint64) (int, error) {
 	// original array behind a small remainder; this matters for the
 	// write-buffer pattern where repeated drain-from-front otherwise
 	// retains memory proportional to the historical high-watermark.
-	rest := make([]Item, len(b.items)-idx)
+	rest := make([]*Item, len(b.items)-idx)
 	copy(rest, b.items[idx:])
 	b.items = rest
 

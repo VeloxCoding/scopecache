@@ -42,9 +42,9 @@ import (
 // O(1) approxSizeBytesLocked path stays correct after a /warm or
 // /rebuild without forcing the commit to re-walk byID.
 type scopeReplacement struct {
-	items      []Item
-	byID       map[string]Item
-	bySeq      map[uint64]Item
+	items      []*Item
+	byID       map[string]*Item
+	bySeq      map[uint64]*Item
 	lastSeq    uint64
 	idKeyBytes int64
 }
@@ -57,16 +57,16 @@ type scopeReplacement struct {
 func buildReplacementState(items []Item) (scopeReplacement, error) {
 	if len(items) == 0 {
 		return scopeReplacement{
-			items: []Item{},
-			byID:  make(map[string]Item),
-			bySeq: make(map[uint64]Item),
+			items: []*Item{},
+			byID:  make(map[string]*Item),
+			bySeq: make(map[uint64]*Item),
 		}, nil
 	}
 
 	seen := make(map[string]struct{}, len(items))
 	nonEmptyIDs := 0
-	built := make([]Item, 0, len(items))
-	bySeq := make(map[uint64]Item, len(items))
+	built := make([]*Item, 0, len(items))
+	bySeq := make(map[uint64]*Item, len(items))
 
 	// seq is a cache-local cursor that is NOT stable across /warm or /rebuild.
 	// We regenerate it from 1 for every call so scope buffers have monotonic,
@@ -106,11 +106,13 @@ func buildReplacementState(items []Item) (scopeReplacement, error) {
 			item.renderBytes = precomputeRenderBytes(item.Payload)
 		}
 
-		built = append(built, item)
-		bySeq[item.Seq] = item
+		// One heap *Item shared by built and bySeq (and byID below).
+		stored := &item
+		built = append(built, stored)
+		bySeq[item.Seq] = stored
 	}
 
-	byID := make(map[string]Item, nonEmptyIDs)
+	byID := make(map[string]*Item, nonEmptyIDs)
 	var idKeyBytes int64
 	for _, item := range built {
 		if item.ID != "" {
@@ -130,10 +132,10 @@ func buildReplacementState(items []Item) (scopeReplacement, error) {
 
 // sumItemBytes returns the total approxItemSize across a flat item slice.
 // Used by batch operations to compute per-plan newBytes before commit.
-func sumItemBytes(items []Item) int64 {
+func sumItemBytes(items []*Item) int64 {
 	var n int64
 	for i := range items {
-		n += approxItemSize(items[i])
+		n += approxItemSize(*items[i])
 	}
 	return n
 }
@@ -233,5 +235,9 @@ func (b *scopeBuffer) replaceAll(items []Item) ([]Item, error) {
 
 	b.mu.RLock()
 	defer b.mu.RUnlock()
-	return append([]Item(nil), b.items...), nil
+	out := make([]Item, len(b.items))
+	for i, p := range b.items {
+		out[i] = *p
+	}
+	return out, nil
 }

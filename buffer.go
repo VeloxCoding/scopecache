@@ -22,6 +22,14 @@
 //     without serialising on the read counters. See recordRead in
 //     buffer_heat.go.
 //
+//  4. items, byID and bySeq hold *Item, and all three indexes alias
+//     the SAME *Item per entry. A method may mutate an item's fields
+//     in place through any one index under b.mu.Lock — the other two
+//     observe it with no re-sync. But a method MUST NOT hand a raw
+//     *Item to a caller or retain one past the unlock: read paths
+//     deref-copy into a value Item before returning. A leaked *Item
+//     would let a caller mutate cache state outside b.mu.
+//
 // Adding a new scopeBuffer method that violates rule 2 is the most
 // likely future deadlock — flag it in code review.
 //
@@ -58,10 +66,17 @@ type scopeBuffer struct {
 	// learns the write did not take effect, rather than silently writing
 	// into an orphan buffer that is unreachable and about to be GC'd.
 	detached bool
-	items    []Item
-	byID     map[string]Item
-	bySeq    map[uint64]Item
-	lastSeq  uint64
+	// items, byID and bySeq are pointer collections: every entry for a
+	// given item is the SAME *Item. An in-place field write through any
+	// one index is visible through the other two — no re-sync needed.
+	// The insert paths (insertNewItemLocked, counterAddSlow's create
+	// branch, buildReplacementState) must therefore store one shared
+	// pointer into all three; read paths must deref-copy before handing
+	// an item out so a caller never holds the live *Item.
+	items   []*Item
+	byID    map[string]*Item
+	bySeq   map[uint64]*Item
+	lastSeq uint64
 	// maxItems caps the number of items this scope may hold; writes
 	// past it produce *ScopeFullError. The unboundedScopeMaxItems
 	// sentinel (= 0) means "no count cap" — the write paths skip the

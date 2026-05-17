@@ -1146,8 +1146,8 @@ func TestApproxSizeBytes_GrowsWithItems(t *testing.T) {
 }
 
 // TestDeleteByID_ClearsBackingSlot verifies the GC invariant for deleteByID:
-// after the slice shift-and-shrink, the tail slot must be zeroed so the Item's
-// payload map is eligible for GC. The backing array still exists at full
+// after the slice shift-and-shrink, the tail slot must be nil-ed so the
+// removed *Item is eligible for GC. The backing array still exists at full
 // capacity, so we reslice past the current length to peek at the vacated slot.
 func TestDeleteByID_ClearsBackingSlot(t *testing.T) {
 	buf := newscopeBuffer(8)
@@ -1164,9 +1164,8 @@ func TestDeleteByID_ClearsBackingSlot(t *testing.T) {
 	}
 
 	full := buf.items[:3]
-	tail := full[2]
-	if tail.ID != "" || tail.Seq != 0 || tail.Payload != nil {
-		t.Fatalf("tail slot not cleared in backing array: %+v", tail)
+	if tail := full[2]; tail != nil {
+		t.Fatalf("tail slot not nil-ed in backing array: %+v", *tail)
 	}
 }
 
@@ -1180,7 +1179,7 @@ func walkApproxSize(b *scopeBuffer) int64 {
 	total += 64
 	total += int64(len(b.items)) * 32
 	for _, item := range b.items {
-		total += approxItemSize(item)
+		total += approxItemSize(*item)
 	}
 	total += int64(len(b.byID)) * 32
 	for k := range b.byID {

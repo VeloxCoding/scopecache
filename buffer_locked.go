@@ -3,10 +3,12 @@
 // never lock internally. precomputeRenderBytes is pure and
 // lock-agnostic.
 //
-// The helpers centralise three concerns that previously drifted
-// across parallel call-sites: bytes-accounting, secondary-index
-// sync, and counter-cell cleanup on payload-replace. Forgetting
-// any of them leaks state silently.
+// The helpers centralise the concerns that previously drifted across
+// parallel call-sites: bytes-accounting and counter-cell cleanup on
+// payload-replace. Secondary-index "sync" is no longer one of them —
+// items, byID and bySeq alias one *Item per entry, so an in-place
+// field write is visible through every index — but a forgotten
+// bytes-accounting update still leaks state silently.
 
 package scopecache
 
@@ -74,7 +76,7 @@ func (b *scopeBuffer) itemCapExceeded(proposed int) bool {
 // len(Payload) + len(renderBytes) otherwise. Used by replace paths
 // (upsert/update) to compute size deltas correctly when either side
 // is a counter item.
-func payloadAndRenderBytes(item Item) int64 {
+func payloadAndRenderBytes(item *Item) int64 {
 	if item.counter != nil {
 		return counterCellOverhead
 	}
@@ -82,19 +84,18 @@ func payloadAndRenderBytes(item Item) int64 {
 }
 
 // replaceItemAtIndexLocked overwrites payload + ts + renderBytes at
-// items[i], syncs the secondary indexes, applies delta to b.bytes,
-// and stamps lastWriteTS.
+// items[i], applies delta to b.bytes, and stamps lastWriteTS.
 //
 // PRECONDITION: caller holds b.mu and i is valid — callers derive i
 // from a checked lookup (indexBySeqLocked or a guaranteed-hit byID
 // resolution) just before the call.
 //
-// byID sync is conditional (id="" is legal on /append, so not every
-// item has a byID entry); bySeq is unconditional. Ts is always the
-// caller-supplied value (every caller stamps fresh under b.mu); the
-// "always refresh" rule lives at the call site, not here.
-// renderBytes is caller-supplied because the size delta the caller
-// passed in already accounts for it.
+// No secondary-index re-sync: items[i], bySeq and byID all hold the
+// same *Item, so the field writes below are visible through every
+// index at once. Ts is always the caller-supplied value (every caller
+// stamps fresh under b.mu); the "always refresh" rule lives at the
+// call site, not here. renderBytes is caller-supplied because the
+// size delta the caller passed in already accounts for it.
 func (b *scopeBuffer) replaceItemAtIndexLocked(i int, payload json.RawMessage, ts int64, renderBytes []byte, delta int64) {
 	b.items[i].Payload = payload
 	b.items[i].Ts = ts
@@ -104,14 +105,6 @@ func (b *scopeBuffer) replaceItemAtIndexLocked(i int, payload json.RawMessage, t
 	// promote branch on the new payload instead of using the
 	// orphaned cell.
 	b.items[i].counter = nil
-	updated := b.items[i]
-	// replaceItemAtIndexLocked is only reachable when the item already
-	// existed in this buffer, so bySeq and (when ID != "") byID have
-	// already been allocated by the original write that created it.
-	b.bySeq[updated.Seq] = updated
-	if updated.ID != "" {
-		b.byID[updated.ID] = updated
-	}
 	b.bytes += delta
 	b.lastWriteTS = ts
 	if b.store != nil {

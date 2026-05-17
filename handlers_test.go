@@ -2054,7 +2054,7 @@ func TestIntegration_MixedWorkload_StatsAndInvariants(t *testing.T) {
 	for _, buf := range storeScopes {
 		buf.mu.RLock()
 		for i := range buf.items {
-			ground += approxItemSize(buf.items[i])
+			ground += approxItemSize(*buf.items[i])
 		}
 		buf.mu.RUnlock()
 	}
@@ -2249,7 +2249,7 @@ func TestRace_ParallelMixedWorkload(t *testing.T) {
 			}
 		}
 		for i := range buf.items {
-			recomputedBytes += approxItemSize(buf.items[i])
+			recomputedBytes += approxItemSize(*buf.items[i])
 		}
 		buf.mu.RUnlock()
 	}

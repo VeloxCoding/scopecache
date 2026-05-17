@@ -76,7 +76,14 @@ func (b *scopeBuffer) tailOffset(limit int, offset int) ([]Item, bool) {
 		return []Item{}, false
 	}
 
-	return materialiseCountersInPlace(append([]Item(nil), b.items[start:end]...)), hasMore
+	// items is []*Item; deref-copy the window into a fresh value slice
+	// so the read path never hands back the live pointers.
+	window := b.items[start:end]
+	out := make([]Item, len(window))
+	for i, p := range window {
+		out[i] = *p
+	}
+	return materialiseCountersInPlace(out), hasMore
 }
 
 // sinceSeq returns items with seq > afterSeq, oldest-first, up to
@@ -116,7 +123,9 @@ func (b *scopeBuffer) sinceSeq(afterSeq uint64, limit int) ([]Item, bool) {
 		hasMore = true
 	}
 	out := make([]Item, take)
-	copy(out, b.items[idx:idx+take])
+	for j := 0; j < take; j++ {
+		out[j] = *b.items[idx+j]
+	}
 	return materialiseCountersInPlace(out), hasMore
 }
 
@@ -127,7 +136,7 @@ func (b *scopeBuffer) getByID(id string) (Item, bool) {
 	if !ok {
 		return Item{}, false
 	}
-	return materialiseCounter(item), true
+	return materialiseCounter(*item), true
 }
 
 func (b *scopeBuffer) getBySeq(seq uint64) (Item, bool) {
@@ -137,5 +146,5 @@ func (b *scopeBuffer) getBySeq(seq uint64) (Item, bool) {
 	if !ok {
 		return Item{}, false
 	}
-	return materialiseCounter(item), true
+	return materialiseCounter(*item), true
 }
