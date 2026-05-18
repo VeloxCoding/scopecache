@@ -167,11 +167,6 @@ type store struct {
 	// subscribe.go.
 	subsMu      sync.RWMutex
 	subscribers map[string]*subscriber
-
-	// uuidGen mints the cache-owned UUIDv7 stamped on every item at
-	// create time. One generator per store so the monotonic counter is
-	// store-wide (see uuid.go). Zero value is ready to use.
-	uuidGen uuidGenerator
 }
 
 // bumpLastWriteTS advances s.lastWriteTS to nowUs if nowUs > current.

@@ -8,68 +8,50 @@
 // stable link back to the source-of-truth row.
 //
 // Layout (RFC 9562 §5.7): bytes 0-5 are a 48-bit unix-millisecond
-// timestamp; byte 6 high nibble is version 7; the 12-bit rand_a field
-// (byte 6 low nibble + byte 7) is used as a monotonic counter; byte 8
-// top two bits are the variant (0b10); the remaining 62 bits are
-// random.
+// timestamp; byte 6 high nibble is version 7; byte 8 top two bits are
+// the variant (0b10). The remaining 74 bits — the 12-bit rand_a field
+// and the 62-bit rand_b field — are filled entirely with randomness.
+// That is RFC 9562 §5.7 "method 1".
 //
-// Why math/rand/v2, not crypto/rand. A `uuid` is an item *identity*
-// (the link to a source-of-truth row), not a secret or a capability —
-// possessing a scope name is what grants access, never knowing an
-// item's uuid. A per-mint crypto/rand read costs a getrandom syscall
-// (~500 ns measured), which nearly doubled /append latency; math/rand/
-// v2's auto-seeded ChaCha8 source delivers strong-quality bits in a
-// few ns with no syscall. Uniqueness + ordering come from the
-// monotonic counter below, NOT from the random bits.
+// No counter, no lock, no shared state. newUUIDv7 is a pure function:
+// one clock read plus two math/rand/v2 draws. An earlier draft used a
+// store-wide monotonic counter so that same-millisecond UUIDs were
+// strictly ordered; that counter needed a synchronised increment,
+// which funnelled every concurrent write through one cache line and
+// cost ~20% append throughput. Nothing in the cache needs
+// within-millisecond UUID ordering — firstUUID/lastUUID track insert
+// order directly, byUUID is an exact-match index, /delete_up_to
+// resolves a boundary UUID to a seq — so the counter was pure cost.
 //
-// Monotonicity, lock-free. The generator's whole state is one
-// atomic.Uint64, `packed`, holding (ms << 12 | counter): a 48-bit
-// millisecond timestamp and a 12-bit counter. next() runs a CAS loop:
-// load packed, derive the next (ms, counter) — new ms resets the
-// counter, same ms increments it, a >4095 overflow borrows the next
-// millisecond (RFC 9562 §6.2 method 2) — then CompareAndSwap. A
-// backwards clock step (NTP) is clamped: the new ms is never below
-// the stored one.
+// Uniqueness is probabilistic, not structural — and that is safe
+// here. Two UUIDs minted in different milliseconds can never collide
+// (distinct timestamp prefix). Within one millisecond, 74 random bits
+// give a birthday-collision probability of ~N²/2^75; at the cache's
+// measured peak (~200k writes/s ≈ 200 per ms) that is ~1e-18 per
+// millisecond — unobservable over any realistic process lifetime. A
+// cache is disposable and rebuildable besides; even an (effectively
+// impossible) collision would only make one item unreachable by uuid,
+// never corrupt state.
 //
-// Every successful CAS publishes a strictly greater `packed` value,
-// so the sequence of emitted (ms, counter) pairs is strictly
-// monotonic across all goroutines. That makes bytes 0-7 of every
-// minted UUID strictly increasing BY CONSTRUCTION — which is both the
-// ordering guarantee and the uniqueness guarantee (the random bytes
-// 8-15 add entropy but play no part in either). No mutex, no
-// post-hoc assertion: the CAS *is* the monotonicity proof.
-//
-// Lock-free matters on the write path: the generator is store-wide
-// (one per store, shared by every scope), so a mutex here would
-// serialise every concurrent /append regardless of scope. The CAS
-// loop contends only on the single cache line and retries at most a
-// few times under realistic write rates. next() takes no lock, so a
-// caller holding a buffer's b.mu can call it freely — no lock order
-// to reason about.
-//
-// Why math/rand/v2, not crypto/rand. A `uuid` is an item *identity*
-// (the link to a source-of-truth row), not a secret or a capability —
-// possessing a scope name is what grants access, never knowing an
-// item's uuid. A per-mint crypto/rand read costs a getrandom syscall
-// (~500 ns measured), which nearly doubled /append latency; math/rand/
-// v2's auto-seeded ChaCha8 source delivers strong-quality bits in a
-// few ns with no syscall.
+// Why math/rand/v2, not crypto/rand. A `uuid` is an item identity,
+// not a secret or a capability — possessing a scope name grants
+// access, never knowing an item's uuid. A per-mint crypto/rand read
+// costs a getrandom syscall (~500 ns measured); math/rand/v2's
+// auto-seeded ChaCha8 source delivers strong-quality bits in a few ns
+// with no syscall. Its global source is goroutine-safe, so newUUIDv7
+// is safe to call concurrently with no synchronisation of its own.
 
 package scopecache
 
 import (
 	"errors"
 	mathrand "math/rand/v2"
-	"sync/atomic"
 	"time"
 )
 
 // errInvalidUUIDv7 is returned by parseUUIDv7 for any input that is not
 // a canonical lowercase-hex UUIDv7 string.
 var errInvalidUUIDv7 = errors.New("the 'uuid' field must be a canonical lowercase UUIDv7 string")
-
-// uuidCounterMax is the largest value the 12-bit rand_a counter holds.
-const uuidCounterMax = 0xFFF
 
 // uuidStringLen is the length of a canonical UUID string (36 chars).
 // The validators' size pre-checks add it for the not-yet-minted uuid
@@ -79,44 +61,14 @@ const uuidStringLen = 36
 // hexDigits indexes a nibble to its lowercase-hex character.
 const hexDigits = "0123456789abcdef"
 
-// uuidGenerator mints strictly-monotonic UUIDv7 strings, lock-free.
-// One instance per store, shared by every scope. Zero value is ready
-// to use. See the file header for the CAS-monotonicity argument.
-type uuidGenerator struct {
-	// packed is (ms << 12 | counter): a 48-bit millisecond timestamp
-	// and the 12-bit rand_a counter, advanced by CAS in next().
-	packed atomic.Uint64
-}
-
-// next mints the next UUIDv7 as a 36-char lowercase-hex string.
-// Lock-free and infallible — the CAS loop cannot fail to make
-// progress, and the math/rand/v2 draw cannot error.
-func (g *uuidGenerator) next() string {
-	nowMs := uint64(time.Now().UnixMilli())
-	var ms, counter uint64
-	for {
-		old := g.packed.Load()
-		oldMs, oldCounter := old>>12, old&0xFFF
-		if nowMs > oldMs {
-			ms, counter = nowMs, 0
-		} else {
-			// Same millisecond, or the clock stepped backwards (NTP) —
-			// clamp to oldMs so the timestamp never regresses, and bump
-			// the counter. On a >4095 overflow borrow the next ms.
-			ms, counter = oldMs, oldCounter+1
-			if counter > uuidCounterMax {
-				ms, counter = oldMs+1, 0
-			}
-		}
-		if g.packed.CompareAndSwap(old, ms<<12|counter) {
-			break
-		}
-	}
-	// 62 random bits for rand_b (6 in byte 8, 56 in bytes 9-15). The
-	// math/rand/v2 global source is auto-seeded ChaCha8 — strong
-	// quality, no syscall (see the file header on the crypto/rand
-	// trade-off).
-	rnd := mathrand.Uint64()
+// newUUIDv7 mints a fresh UUIDv7 as a 36-char lowercase-hex string.
+// Pure function, no shared state — safe to call concurrently from any
+// goroutine. See the file header for the no-counter / collision
+// argument.
+func newUUIDv7() string {
+	ms := uint64(time.Now().UnixMilli())
+	randA := mathrand.Uint64() // only the low 12 bits are used (rand_a)
+	randB := mathrand.Uint64() // only the low 62 bits are used (rand_b)
 
 	var b [16]byte
 	b[0] = byte(ms >> 40)
@@ -125,17 +77,16 @@ func (g *uuidGenerator) next() string {
 	b[3] = byte(ms >> 16)
 	b[4] = byte(ms >> 8)
 	b[5] = byte(ms)
-	b[6] = 0x70 | byte(counter>>8) // version 7 + counter high nibble
-	b[7] = byte(counter)           // counter low byte
-	b[8] = 0x80 | byte(rnd&0x3F)   // variant 0b10 + 6 random bits
-	b[9] = byte(rnd >> 8)
-	b[10] = byte(rnd >> 16)
-	b[11] = byte(rnd >> 24)
-	b[12] = byte(rnd >> 32)
-	b[13] = byte(rnd >> 40)
-	b[14] = byte(rnd >> 48)
-	b[15] = byte(rnd >> 56)
-
+	b[6] = 0x70 | byte((randA>>8)&0x0F)  // version 7 + rand_a high nibble
+	b[7] = byte(randA)                   // rand_a low byte
+	b[8] = 0x80 | byte((randB>>56)&0x3F) // variant 0b10 + rand_b
+	b[9] = byte(randB >> 48)
+	b[10] = byte(randB >> 40)
+	b[11] = byte(randB >> 32)
+	b[12] = byte(randB >> 24)
+	b[13] = byte(randB >> 16)
+	b[14] = byte(randB >> 8)
+	b[15] = byte(randB)
 	return formatUUID(b)
 }
 

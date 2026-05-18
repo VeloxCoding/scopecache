@@ -313,12 +313,12 @@ func (b *scopeBuffer) insertNewItemLocked(item Item, nowUs int64) (Item, error) 
 		item.renderBytes = precomputeRenderBytes(item.Payload)
 	}
 	// Mint the cache-owned UUIDv7 before approxItemSize so its 36
-	// bytes are admitted against the cap. The generator is lock-free
-	// (uuid.go), so calling it under b.mu costs no lock ordering. An
-	// orphan buffer (store == nil, unit tests) has no generator, so
-	// its items carry no uuid.
+	// bytes are admitted against the cap. newUUIDv7 is a pure function
+	// (uuid.go) — no shared state, fine to call under b.mu. An orphan
+	// buffer (store == nil, unit tests) skips minting so its items
+	// match the no-store byte accounting those tests assert.
 	if b.store != nil && item.UUID == "" {
-		item.UUID = b.store.uuidGen.next()
+		item.UUID = newUUIDv7()
 	}
 
 	size := approxItemSize(item)

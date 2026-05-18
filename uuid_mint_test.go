@@ -41,16 +41,19 @@ func TestInbox_AppendMintsUUID(t *testing.T) {
 	mintedUUID(t, out)
 }
 
-func TestAppend_UUIDsAreDistinctAndIncreasing(t *testing.T) {
-	h, _ := newTestHandler(100)
-	prev := ""
-	for i := 0; i < 50; i++ {
+// The cache mints a random (not monotonic) UUIDv7 per item — the
+// contract is uniqueness, not ordering. Every /append must get a
+// distinct uuid.
+func TestAppend_UUIDsAreDistinct(t *testing.T) {
+	h, _ := newTestHandler(1000)
+	seen := make(map[string]struct{})
+	for i := 0; i < 500; i++ {
 		_, out, _ := doRequest(t, h, "POST", "/append", `{"scope":"s","payload":{"v":1}}`)
 		u := mintedUUID(t, out)
-		if u <= prev {
-			t.Fatalf("uuid #%d not strictly increasing: %q <= %q", i, u, prev)
+		if _, dup := seen[u]; dup {
+			t.Fatalf("/append #%d minted a duplicate uuid: %q", i, u)
 		}
-		prev = u
+		seen[u] = struct{}{}
 	}
 }
 

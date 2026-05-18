@@ -63,11 +63,11 @@ type scopeReplacement struct {
 // trim — if len(items) exceeds the cap it would simply build an over-full
 // state. The capacity check lives in the Store layer so one place owns it.
 //
-// gen is the store's UUIDv7 generator: items arriving without a uuid
-// have one minted (adopt-or-mint — see RFC). A nil gen (orphan test
-// buffer) leaves uuid-less items untouched, consistent with
-// insertNewItemLocked's b.store guard.
-func buildReplacementState(items []Item, gen *uuidGenerator) (scopeReplacement, error) {
+// mintUUID controls the adopt-or-mint contract (see RFC): when true,
+// an item arriving without a uuid has one minted. Store-attached
+// callers pass true; an orphan test buffer passes false so its items
+// stay uuid-less, consistent with insertNewItemLocked's b.store guard.
+func buildReplacementState(items []Item, mintUUID bool) (scopeReplacement, error) {
 	if len(items) == 0 {
 		return scopeReplacement{
 			items:  []*Item{},
@@ -115,10 +115,10 @@ func buildReplacementState(items []Item, gen *uuidGenerator) (scopeReplacement, 
 		item.Ts = nowUs
 		// uuid: adopt the client-supplied value (validateWriteItem
 		// already verified v7 shape on the /warm//rebuild path) or
-		// mint a fresh one. gen == nil (orphan test buffer) leaves it
+		// mint a fresh one. !mintUUID (orphan test buffer) leaves it
 		// empty, consistent with insertNewItemLocked.
-		if item.UUID == "" && gen != nil {
-			item.UUID = gen.next()
+		if item.UUID == "" && mintUUID {
+			item.UUID = newUUIDv7()
 		}
 		// /warm and /rebuild's per-item validateWriteItem already filled
 		// renderBytes for string payloads; recompute defensively for
@@ -271,11 +271,7 @@ func (b *scopeBuffer) replaceAll(items []Item) ([]Item, error) {
 	if b.itemCapExceeded(len(items)) {
 		return nil, &ScopeFullError{Count: len(items), Cap: b.maxItems}
 	}
-	var gen *uuidGenerator
-	if b.store != nil {
-		gen = &b.store.uuidGen
-	}
-	r, err := buildReplacementState(items, gen)
+	r, err := buildReplacementState(items, b.store != nil)
 	if err != nil {
 		return nil, err
 	}

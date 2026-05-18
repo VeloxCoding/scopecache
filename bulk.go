@@ -135,7 +135,7 @@ func (s *store) replaceScopes(grouped map[string][]Item) (int, error) {
 			})
 			continue
 		}
-		r, err := buildReplacementState(items, &s.uuidGen)
+		r, err := buildReplacementState(items, true)
 		if err != nil {
 			return 0, fmt.Errorf("%w: scope '%s': %s", ErrInvalidInput, scope, err.Error())
 		}
@@ -298,7 +298,7 @@ func (s *store) rebuildAll(grouped map[string][]Item) (int, int, error) {
 			})
 			continue
 		}
-		r, err := buildReplacementState(items, &s.uuidGen)
+		r, err := buildReplacementState(items, true)
 		if err != nil {
 			return 0, 0, fmt.Errorf("%w: scope '%s': %s", ErrInvalidInput, scope, err.Error())
 		}

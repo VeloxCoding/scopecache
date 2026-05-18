@@ -1,7 +1,6 @@
 package scopecache
 
 import (
-	"sort"
 	"sync"
 	"testing"
 )
@@ -30,28 +29,28 @@ func checkUUIDv7Shape(t *testing.T, s string) {
 }
 
 func TestUUIDv7_Format(t *testing.T) {
-	var g uuidGenerator
 	for i := 0; i < 1000; i++ {
-		checkUUIDv7Shape(t, g.next())
+		checkUUIDv7Shape(t, newUUIDv7())
 	}
 }
 
-func TestUUIDv7_Monotonic(t *testing.T) {
-	var g uuidGenerator
-	prev := g.next()
-	// Lowercase-hex strings with hyphens at fixed positions sort
-	// lexically in the same order as the underlying 16 bytes.
-	for i := 0; i < 200000; i++ {
-		u := g.next()
-		if u <= prev {
-			t.Fatalf("not strictly increasing at #%d: %q <= %q", i, u, prev)
+// newUUIDv7 is random within a millisecond — not monotonic. The
+// contract is uniqueness, not ordering: 74 random bits make a
+// collision astronomically improbable (see uuid.go). Minting a large
+// batch and finding every value distinct exercises that.
+func TestUUIDv7_Unique(t *testing.T) {
+	const n = 500000
+	seen := make(map[string]struct{}, n)
+	for i := 0; i < n; i++ {
+		u := newUUIDv7()
+		if _, dup := seen[u]; dup {
+			t.Fatalf("duplicate uuid minted at #%d: %q", i, u)
 		}
-		prev = u
+		seen[u] = struct{}{}
 	}
 }
 
-func TestUUIDv7_MonotonicConcurrent(t *testing.T) {
-	var g uuidGenerator
+func TestUUIDv7_UniqueConcurrent(t *testing.T) {
 	const goroutines = 50
 	const perG = 4000
 
@@ -63,32 +62,27 @@ func TestUUIDv7_MonotonicConcurrent(t *testing.T) {
 			defer wg.Done()
 			out := make([]string, 0, perG)
 			for i := 0; i < perG; i++ {
-				out = append(out, g.next())
+				out = append(out, newUUIDv7())
 			}
 			chunks[gi] = out
 		}(gi)
 	}
 	wg.Wait()
 
-	all := make([]string, 0, goroutines*perG)
+	seen := make(map[string]struct{}, goroutines*perG)
 	for _, c := range chunks {
-		all = append(all, c...)
-	}
-	sort.Strings(all)
-	for i := 1; i < len(all); i++ {
-		if all[i] == all[i-1] {
-			t.Fatalf("duplicate uuid minted: %q", all[i])
-		}
-		if all[i] <= all[i-1] {
-			t.Fatalf("non-monotonic after sort: %q <= %q", all[i], all[i-1])
+		for _, u := range c {
+			if _, dup := seen[u]; dup {
+				t.Fatalf("duplicate uuid minted across goroutines: %q", u)
+			}
+			seen[u] = struct{}{}
 		}
 	}
 }
 
 func TestUUIDv7_RoundTrip(t *testing.T) {
-	var g uuidGenerator
 	for i := 0; i < 5000; i++ {
-		u := g.next()
+		u := newUUIDv7()
 		b, err := parseUUIDv7(u)
 		if err != nil {
 			t.Fatalf("parseUUIDv7(%q): %v", u, err)
@@ -132,11 +126,10 @@ func TestParseUUIDv7_Rejects(t *testing.T) {
 	}
 }
 
-func BenchmarkUUIDGenerator_next(b *testing.B) {
-	var g uuidGenerator
+func BenchmarkNewUUIDv7(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		_ = g.next()
+		_ = newUUIDv7()
 	}
 }
 

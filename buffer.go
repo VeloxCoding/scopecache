@@ -10,11 +10,11 @@
 //     scopeShard.mu while holding b.mu — that buf → shard order
 //     deadlocks against deleteScope, replaceScopes, wipe and
 //     rebuildAll, which all take shard.mu first and then individual
-//     buf.mu's. Store-side accesses that take NO lock are safe under
-//     b.mu and used by the insert paths: the atomic byte/item
-//     counters (b.store.totalBytes.Add / b.store.reserveBytes) and
-//     the UUIDv7 generator (b.store.uuidGen.next — lock-free CAS,
-//     see uuid.go). Neither touches a buffer, so no cycle is possible.
+//     buf.mu's. The only Store-side access an insert path makes under
+//     b.mu is the atomic byte/item counters (b.store.totalBytes.Add /
+//     b.store.reserveBytes) — lock-free, no buffer touched. UUID
+//     minting (newUUIDv7, uuid.go) is a pure package function with no
+//     shared state at all.
 //
 //  3. Read-path bookkeeping (recordRead) runs without taking b.mu —
 //     it bumps the readCountTotal and lastAccessTS atomics directly.

@@ -224,9 +224,9 @@ func (b *scopeBuffer) counterAddSlow(scope, id string, by int64) (int64, bool, e
 		counter: cell,
 	}
 	// Mint the cache-owned UUIDv7 before approxItemSize, same as
-	// insertNewItemLocked. The generator is lock-free (uuid.go).
+	// insertNewItemLocked. newUUIDv7 is a pure function (uuid.go).
 	if b.store != nil {
-		item.UUID = b.store.uuidGen.next()
+		item.UUID = newUUIDv7()
 	}
 	// approxItemSize sees item.counter != nil and charges
 	// counterCellOverhead instead of len(Payload). No

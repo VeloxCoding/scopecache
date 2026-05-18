@@ -170,9 +170,11 @@ input — see the `uuid` bullet and §6.3.
   (rejected with 400). The one exception is `/warm` // `/rebuild`
   input, which **adopts** a supplied UUIDv7 (and mints one for any
   item that arrives without it) — see §6.3. `uuid` is an addressing
-  key on reads and on `/update` // `/delete` (§2.2). The cache mints
-  it with a store-wide monotonic generator, so within a process every
-  minted `uuid` is strictly greater than the previous one.
+  key on reads and on `/update` // `/delete` (§2.2). The cache mints a
+  random UUIDv7 (RFC 9562 method 1): time-ordered to the millisecond
+  by the timestamp prefix, random within one. Uniqueness is
+  probabilistic — 74 random bits make a collision unobservable at any
+  realistic write rate — not a counter; minting takes no lock.
 - **`payload`** — required, any valid JSON value (object, array,
   string, number, boolean). Literal `null` is rejected. The cache
   treats payload bytes as opaque; nothing inspects, parses, or
@@ -871,7 +873,7 @@ All three are owned by the cache. `seq` and `ts` are stamped on every
 write; `uuid` is minted once when an item is created. Accepting
 client-supplied values would silently break the invariants that `seq`
 is monotonic per scope, that `ts` reflects the cache's own write time,
-and that every `uuid` is a cache-minted, strictly-monotonic UUIDv7.
+and that every `uuid` is a cache-minted, well-formed UUIDv7.
 The validator rejects them with an explicit error rather than
 overwriting silently — clients that need a "client timestamp" can
 carry it inside `payload`, where the cache stays opaque.
