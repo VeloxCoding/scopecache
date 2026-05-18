@@ -135,7 +135,7 @@ func (s *store) replaceScopes(grouped map[string][]Item) (int, error) {
 			})
 			continue
 		}
-		r, err := buildReplacementState(items)
+		r, err := buildReplacementState(items, &s.uuidGen)
 		if err != nil {
 			return 0, fmt.Errorf("%w: scope '%s': %s", ErrInvalidInput, scope, err.Error())
 		}
@@ -298,7 +298,7 @@ func (s *store) rebuildAll(grouped map[string][]Item) (int, int, error) {
 			})
 			continue
 		}
-		r, err := buildReplacementState(items)
+		r, err := buildReplacementState(items, &s.uuidGen)
 		if err != nil {
 			return 0, 0, fmt.Errorf("%w: scope '%s': %s", ErrInvalidInput, scope, err.Error())
 		}
@@ -309,7 +309,10 @@ func (s *store) rebuildAll(grouped map[string][]Item) (int, int, error) {
 		buf.items = r.items
 		buf.byID = r.byID
 		buf.bySeq = r.bySeq
+		buf.byUUID = r.byUUID
 		buf.lastSeq = r.lastSeq
+		buf.firstUUID = r.firstUUID
+		buf.lastUUID = r.lastUUID
 		buf.bytes = sumItemBytes(r.items)
 		newShardMaps[s.shardIdxFor(scope)][scope] = buf
 		totalScopes++

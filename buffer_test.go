@@ -1511,7 +1511,7 @@ func TestBuildReplacementState_SeqFromOne(t *testing.T) {
 		newItem("s", "b", nil),
 		newItem("s", "c", nil),
 	}
-	r, err := buildReplacementState(items)
+	r, err := buildReplacementState(items, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

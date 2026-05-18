@@ -223,6 +223,11 @@ func (b *scopeBuffer) counterAddSlow(scope, id string, by int64) (int64, bool, e
 		Ts:      nowUs,
 		counter: cell,
 	}
+	// Mint the cache-owned UUIDv7 before approxItemSize, same as
+	// insertNewItemLocked. The generator is lock-free (uuid.go).
+	if b.store != nil {
+		item.UUID = b.store.uuidGen.next()
+	}
 	// approxItemSize sees item.counter != nil and charges
 	// counterCellOverhead instead of len(Payload). No
 	// precomputeRenderBytes needed — counters never have a renderBytes
@@ -249,6 +254,16 @@ func (b *scopeBuffer) counterAddSlow(scope, id string, by int64) (int64, bool, e
 	}
 	b.byID[id] = stored
 	b.idKeyBytes += int64(len(id))
+	if item.UUID != "" {
+		if b.byUUID == nil {
+			b.byUUID = make(map[string]*Item)
+		}
+		b.byUUID[item.UUID] = stored
+		if b.firstUUID == "" {
+			b.firstUUID = item.UUID
+		}
+		b.lastUUID = item.UUID
+	}
 	b.bytes += size
 	if b.store != nil {
 		b.store.totalItems.Add(1)

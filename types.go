@@ -290,11 +290,18 @@ func (m MB) MarshalJSON() ([]byte, error) {
 // millisecond) granularity keeps two writes inside the same ms
 // distinguishable, which matters for ordered /inbox draining and
 // counter "last activity" stamping under burst load.
+//
+// UUID is a cache-minted UUIDv7 — the stable identity that links the
+// item to its source-of-truth row and survives wipe/rebuild. Cache-
+// owned like Ts: clients must not supply it on a create/replace write
+// (400). Minting + the strict-v7 parser live in uuid.go; the byUUID
+// index lives in buffer.go.
 type Item struct {
 	Scope   string          `json:"scope,omitempty"`
 	ID      string          `json:"id,omitempty"`
 	Seq     uint64          `json:"seq,omitempty"`
 	Ts      int64           `json:"ts"`
+	UUID    string          `json:"uuid"`
 	Payload json.RawMessage `json:"payload"` // see MarshalJSON: serialised as `event` for _events items
 
 	// renderBytes is the JSON-string-decoded form of Payload, set at
@@ -321,15 +328,15 @@ type Item struct {
 	counter *counterCell
 }
 
-// MarshalJSON keeps the universal Item shape (scope/id/seq/ts +
-// payload-bearing field) but renames the payload-bearing key to
-// `event` when the item lives in the reserved `_events` scope. The
-// stored bytes there are a writeEvent envelope (see events.go), not
-// a user-supplied payload — calling that field `payload` would put
-// the same word at two nesting levels with two different meanings
-// (outer = envelope, inner = client-content). Renaming the outer
-// key removes the ambiguity: `payload` always means "the bytes the
-// client originally stored", at every level it appears.
+// MarshalJSON keeps the universal Item shape (scope/id/seq/ts/uuid +
+// payload-bearing field) but renames two keys when the item lives in
+// the reserved `_events` scope: the payload-bearing key becomes
+// `event`, and `uuid` becomes `event_uuid`. The stored bytes there
+// are a writeEvent envelope (see events.go), not a user payload —
+// `payload` and `uuid` at two nesting levels with two meanings
+// (outer = the event entry, inner = the user-item) would be
+// ambiguous. Renaming the outer keys fixes the meaning: inside an
+// `_events` entry, `payload`/`uuid` always describe the user-item.
 //
 // `id` is always emitted: items with no client-supplied id render
 // as `"id":null` rather than dropping the key. Uniform-shape rule
@@ -359,8 +366,10 @@ type Item struct {
 // any unexpected input.
 func (i Item) MarshalJSON() ([]byte, error) {
 	payloadKey := `"payload":`
+	uuidKey := `,"uuid":`
 	if i.Scope == EventsScopeName {
 		payloadKey = `"event":`
+		uuidKey = `,"event_uuid":`
 	}
 	buf := make([]byte, 0, 128)
 	buf = append(buf, `{"scope":`...)
@@ -375,6 +384,8 @@ func (i Item) MarshalJSON() ([]byte, error) {
 	buf = strconv.AppendUint(buf, i.Seq, 10)
 	buf = append(buf, `,"ts":`...)
 	buf = strconv.AppendInt(buf, i.Ts, 10)
+	buf = append(buf, uuidKey...)
+	buf = AppendJSONString(buf, i.UUID)
 	buf = append(buf, ',')
 	buf = append(buf, payloadKey...)
 	if len(i.Payload) == 0 {
@@ -419,15 +430,20 @@ type deleteRequest struct {
 	Scope string `json:"scope"`
 	ID    string `json:"id,omitempty"`
 	Seq   uint64 `json:"seq,omitempty"`
+	UUID  string `json:"uuid,omitempty"`
 }
 
 type deleteScopeRequest struct {
 	Scope string `json:"scope"`
 }
 
+// deleteUpToRequest addresses the drain boundary by exactly one of
+// max_seq or uuid. The uuid form names the last item to keep-or-drop;
+// the store resolves it to that item's seq and drains the seq prefix.
 type deleteUpToRequest struct {
 	Scope  string `json:"scope"`
-	MaxSeq uint64 `json:"max_seq"`
+	MaxSeq uint64 `json:"max_seq,omitempty"`
+	UUID   string `json:"uuid,omitempty"`
 }
 
 // counterAddRequest is the body of /counter_add. By is a pointer so
@@ -539,6 +555,7 @@ func approxItemSize(item Item) int64 {
 	n += 32
 	n += int64(len(item.Scope))
 	n += int64(len(item.ID))
+	n += int64(len(item.UUID))
 	n += 8 // Seq
 	n += 8 // Ts (always set, plain int64)
 	if item.counter != nil {

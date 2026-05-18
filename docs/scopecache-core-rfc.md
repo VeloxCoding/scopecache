@@ -144,7 +144,12 @@ The cache stores **items**. An item has the following fields:
 | `id`      | string         | no                 | client | yes        |
 | `seq`     | uint64         | n/a                | cache  | yes        |
 | `ts`      | int64          | n/a                | cache  | no         |
+| `uuid`    | string (v7)    | n/a¹               | cache  | yes        |
 | `payload` | any JSON value | yes                | client | no         |
+
+¹ `uuid` is cache-owned and must not be sent on `/append`, `/upsert`
+or `/counter_add` (400). The single exception is `/warm` // `/rebuild`
+input — see the `uuid` bullet and §6.3.
 
 - **`scope`** — required on every operation. Free-form, ≤ 256 bytes.
   Items inside the same scope share the same per-scope buffer (and
@@ -158,6 +163,16 @@ The cache stores **items**. An item has the following fields:
   (`time.Now().UnixMicro()`), refreshed on every write that touches
   the item. Observability only — not searchable, not indexed, not
   used for ordering.
+- **`uuid`** — cache-minted UUIDv7, the stable identity that links an
+  item to its source-of-truth row and survives `/wipe` and `/rebuild`.
+  Canonical lowercase-hex form, 36 characters. Cache-owned: clients
+  must not send `uuid` on `/append`, `/upsert` or `/counter_add`
+  (rejected with 400). The one exception is `/warm` // `/rebuild`
+  input, which **adopts** a supplied UUIDv7 (and mints one for any
+  item that arrives without it) — see §6.3. `uuid` is an addressing
+  key on reads and on `/update` // `/delete` (§2.2). The cache mints
+  it with a store-wide monotonic generator, so within a process every
+  minted `uuid` is strictly greater than the previous one.
 - **`payload`** — required, any valid JSON value (object, array,
   string, number, boolean). Literal `null` is rejected. The cache
   treats payload bytes as opaque; nothing inspects, parses, or
@@ -165,10 +180,13 @@ The cache stores **items**. An item has the following fields:
 
 ### 2.2 Addressing
 
-Items are addressed via `scope`, `scope`+`id`, or `scope`+`seq`.
-There is no global index, no secondary lookup by payload contents,
-and no range query other than a `seq`-prefix drain
-(`/delete_up_to`) and a sequential read (`/tail`, `/head`).
+Items are addressed via `scope`, `scope`+`id`, `scope`+`seq`, or
+`scope`+`uuid`. The single-item read and mutate endpoints (`/get`,
+`/render`, `/update`, `/delete`) take exactly one of `id`, `seq` or
+`uuid`; supplying none or more than one is a 400. There is no global
+index, no secondary lookup by payload contents, and no range query
+other than a prefix drain (`/delete_up_to`, by `max_seq` or by a
+boundary `uuid`) and a sequential read (`/tail`, `/head`).
 
 Within a scope, items appear in `seq` order. `seq` starts at 1 for
 the first write into a scope and increases monotonically per scope.
@@ -227,9 +245,10 @@ deltas off a scheduler — see §9.
 
 | field                | purpose                                                                        |
 |----------------------|--------------------------------------------------------------------------------|
-| `items []Item`       | the items themselves, in `seq` order                                           |
-| `byID`, `bySeq`      | id→item and seq→item lookup maps (lazy-allocated; absent until first item)     |
+| `items []*Item`      | the items themselves, in `seq` order                                           |
+| `byID`, `bySeq`, `byUUID` | id→item, seq→item and uuid→item lookup maps (lazy-allocated; absent until first item) |
 | `lastSeq`            | monotonic `seq` counter; never rewinds; deleted seqs are not reused            |
+| `firstUUID`, `lastUUID` | `uuid` of the oldest and newest item ever inserted into the scope; like `lastSeq` they never rewind on delete (a `/warm` // `/rebuild` resets them to the new batch's span) |
 | `maxItems`           | per-scope item cap (writes past this are rejected with 507)                    |
 | `bytes`              | Σ `approxItemSize` over items — feeds store-wide `totalBytes`                  |
 | `idKeyBytes`         | Σ `len(item.ID)` over `byID` — keeps `approxSizeBytes` O(1)                    |
@@ -239,10 +258,11 @@ deltas off a scheduler — see §9.
 | `readCountTotal`     | lifetime read-hit count (atomic, lock-free)                                    |
 | `detached`           | lifecycle flag set by `/delete_scope`, `/wipe`, `/rebuild` to fail in-flight writes against an orphan buffer |
 
-The seven primitives (`item_count`, `last_seq`, `approx_scope_mb`,
-`created_ts`, `last_write_ts`, `last_access_ts`, `read_count_total`)
-are surfaced as a per-scope bundle on `/scopelist` (§6.5), with
-optional prefix filtering and alphabetical cursor pagination.
+The nine primitives (`item_count`, `last_seq`, `first_uuid`,
+`last_uuid`, `approx_scope_mb`, `created_ts`, `last_write_ts`,
+`last_access_ts`, `read_count_total`) are surfaced as a per-scope
+bundle on `/scopelist` (§6.5), with optional prefix filtering and
+alphabetical cursor pagination.
 `/stats` itself stays aggregate-only (§2.5). In-process Go callers
 read the same per-scope fields via `*Gateway.ScopeList` (§7.2).
 
@@ -407,15 +427,17 @@ successful mutation, and how much each entry contains:
 | Mode | Semantics |
 |---|---|
 | `off` *(default)* | Auto-populate disabled; zero overhead on the write path. Operators opt in when a drainer is ready to consume. |
-| `notify` | Each committed mutation produces an event with addressing only — `{op, scope, id?, seq, ts}`. Sufficient for drainers that re-fetch from cache state on wake-up. |
-| `full` | Each committed mutation produces an event with the user-write payload included — `{op, scope, id?, seq, ts, payload}`. Sufficient for drainers replicating state without re-querying. |
+| `notify` | Each committed mutation produces an event with addressing only — `{op, scope, id?, seq, ts, uuid?}`. Sufficient for drainers that re-fetch from cache state on wake-up. |
+| `full` | Each committed mutation produces an event with the user-write payload included — `{op, scope, id?, seq, ts, uuid?, payload}`. Sufficient for drainers replicating state without re-querying. |
 
-`_events` items are special-marshaled on the wire: the cache's
-generic `Item.payload` field is renamed to `event` for items in the
-`_events` scope (see `Item.MarshalJSON`), and inside the writeEvent
-the user-write content travels under `payload` — same key name and
-same meaning as on every other endpoint. One word, one concept at
-every level.
+`_events` items are special-marshaled on the wire: for items in the
+`_events` scope the cache's generic `Item.payload` field is renamed
+to `event` and `Item.uuid` to `event_uuid` (see `Item.MarshalJSON`).
+Inside the writeEvent the user-write content travels under `payload`
+and the user-item's identity under `uuid` — same key names and
+meanings as on every other endpoint. One word, one concept at every
+level: `event_uuid` is the event entry's own minted identity,
+`event.uuid` the user-item it describes.
 
 For a user `/append` of `{"n":1}` on scope `counter` with
 `Events.Mode = full`, the resulting `_events` entry on the wire is:
@@ -426,16 +448,24 @@ For a user `/append` of `{"n":1}` on scope `counter` with
   "id": null,
   "seq": 2,
   "ts": 1700000000123456,
+  "event_uuid": "0192f3a1-2b4d-7e9f-8a1c-5d6e7f8a9b0c",
   "event": {
     "op": "append",
     "scope": "counter",
     "id": "msg-1",
     "seq": 1,
     "ts": 1700000000123440,
+    "uuid": "0192f3a0-6e1c-7c8a-b3d4-1f2e3a4b5c6d",
     "payload": {"n": 1}
   }
 }
 ```
+
+The outer `event_uuid` is the `_events` entry's own minted UUIDv7;
+the inner `event.uuid` is the appended `counter` item's. `append`
+and `upsert` events always carry the inner `uuid`. `update` and
+`delete` events carry it only when the caller addressed the write by
+`uuid` (otherwise the address travels as `id` or `seq`).
 
 `_events` entries are seq-only (the cache never assigns a client-
 facing `id` to an auto-populated event), so the outer envelope
@@ -776,10 +806,11 @@ Validation rules for the fields that appear across the API:
 | `scope`     | string          | required; ≤ 256 bytes; no leading/trailing whitespace; no control characters (0x00–0x1F, 0x7F) |
 | `id`        | string          | optional or required (per endpoint); same shape as `scope` when present |
 | `payload`   | any JSON value  | required; must be syntactically valid JSON; literal `null` is rejected; bytes are opaque to the cache |
-| `seq`       | uint64          | cache-assigned; clients must omit on every write; reads accept it as an addressing key |
+| `seq`       | uint64          | cache-assigned; clients must omit on every write; reads + `/update` // `/delete` accept it as an addressing key |
 | `ts`        | int64           | cache-assigned; clients must omit on every write |
+| `uuid`      | string (v7)     | cache-owned; clients must omit on `/append`, `/upsert`, `/counter_add`; `/warm` // `/rebuild` adopt a supplied value but it must be a canonical UUIDv7; reads + `/update` // `/delete` accept it as an addressing key |
 | `by`        | int64           | required for `/counter_add`; non-zero; within ±(2^53 − 1) |
-| `max_seq`   | uint64          | required for `/delete_up_to`; must be > 0 |
+| `max_seq`   | uint64          | for `/delete_up_to`; exactly one of `max_seq` or `uuid` (the boundary), `max_seq` must be > 0 |
 
 Per-item byte size (the sum of `scope`, `id`, fixed overhead, and
 payload bytes — see `approxItemSize` in code) is checked against
@@ -794,7 +825,7 @@ Every `item` value rendered on the wire — single-item responses
 which fields the original write supplied:
 
 ```json
-{"scope": "...", "id": "..." | null, "seq": 123, "ts": 1700000000000000, "payload": ...}
+{"scope": "...", "id": "..." | null, "seq": 123, "ts": 1700000000000000, "uuid": "0192...", "payload": ...}
 ```
 
 - `id` is always emitted. Items written without a client-supplied
@@ -802,6 +833,11 @@ which fields the original write supplied:
   Clients can read `item.id` directly without a presence check.
 - `seq` and `ts` are always emitted (cache-assigned, monotonic
   per scope and microsecond-stamped respectively).
+- `uuid` is always emitted — the cache-minted UUIDv7. On items in
+  the reserved `_events` scope it is renamed to `event_uuid`: an
+  `_events` entry has both its own identity and the user-item's, so
+  `event_uuid` is the entry and the inner envelope's `uuid` is the
+  user-item (see §2.6).
 - `payload` is always emitted, except on items in the reserved
   `_events` scope where the field is renamed to `event` (the
   bytes there are the cache-controlled writeEvent envelope, not a
@@ -819,23 +855,33 @@ Read endpoints accept query parameters with the following rules:
 | `scope`     | string  | —       | same shape rules as the body field            |
 | `id`        | string  | —       | same shape rules as the body field            |
 | `seq`       | uint64  | —       | parsed as unsigned integer                    |
+| `uuid`      | string  | —       | must be a canonical UUIDv7 string             |
 | `limit`     | int     | 1000    | must be > 0; values above 10000 are clamped, not rejected |
 | `offset`    | int     | 0       | must be ≥ 0                                   |
 | `after_seq` | uint64  | 0       | parsed as unsigned integer; 0 means "from the start" |
 
 Single-item read endpoints (`/get`, `/render`) require exactly one
-of `id` or `seq`. Supplying both, or neither, is rejected with
-`400 Bad Request`.
+of `id`, `seq` or `uuid`. Supplying none, or more than one, is
+rejected with `400 Bad Request`. A malformed `uuid` (not a canonical
+UUIDv7) is likewise a 400, not a silent miss.
 
-### 4.4 Why the cache rejects client-supplied `seq` and `ts`
+### 4.4 Why the cache rejects client-supplied `seq`, `ts` and `uuid`
 
-Both fields are owned by the cache and stamped on every write that
-touches an item. Accepting client-supplied values would silently
-break the invariant that `seq` is monotonic per scope and that `ts`
-reflects the cache's own write time. The validator rejects them
-with an explicit error rather than overwriting silently — clients
-that need a "client timestamp" can carry it inside `payload`, where
-the cache stays opaque.
+All three are owned by the cache. `seq` and `ts` are stamped on every
+write; `uuid` is minted once when an item is created. Accepting
+client-supplied values would silently break the invariants that `seq`
+is monotonic per scope, that `ts` reflects the cache's own write time,
+and that every `uuid` is a cache-minted, strictly-monotonic UUIDv7.
+The validator rejects them with an explicit error rather than
+overwriting silently — clients that need a "client timestamp" can
+carry it inside `payload`, where the cache stays opaque.
+
+`/warm` and `/rebuild` are the deliberate exception for `uuid`: their
+input mirrors a source-of-truth dataset that already holds the
+cache-minted UUIDs from earlier `/append`s, so the bulk paths
+**adopt** a supplied UUIDv7 (validated strictly) and mint one only
+for items that arrive without it. A within-scope duplicate `uuid` in
+a bulk batch is rejected (400) — same stance as a duplicate `id`.
 
 ---
 
@@ -1033,12 +1079,14 @@ Insert a new item into a scope. Rejects on duplicate `id`-in-scope.
 {
   "ok": true,
   "created": true,
-  "item": {"scope": "events", "id": "e1", "seq": 1, "ts": 1700000000000000}
+  "item": {"scope": "events", "id": "e1", "seq": 1, "ts": 1700000000000000, "uuid": "0192f3a0-6e1c-7c8a-b3d4-1f2e3a4b5c6d"}
 }
 ```
 
-The `item` object echoes the stored `scope`, `id`, `seq`, and `ts`.
-Payload bytes are not echoed (they doubled the wire cost on the
+The `item` object echoes the stored `scope`, `id`, `seq`, `ts`, and
+the cache-minted `uuid` — store the `uuid` alongside the source row
+so a later `/rebuild` can re-link it (see §6.3). Payload bytes are
+not echoed (they doubled the wire cost on the
 write path that just delivered them). `created` is always `true` on
 `/append` — kept for uniformity with `/upsert` and `/counter_add`
 (§5.1). When the request omits `id` the response renders
@@ -1082,14 +1130,14 @@ distinguishes create from replace via `created`.
 {
   "ok": true,
   "created": false,
-  "item": {"scope": "events", "id": "e1", "seq": 5, "ts": 1700000000000000}
+  "item": {"scope": "events", "id": "e1", "seq": 5, "ts": 1700000000000000, "uuid": "0192f3a0-6e1c-7c8a-b3d4-1f2e3a4b5c6d"}
 }
 ```
 
 `created` is `true` when the item did not exist before this call,
-`false` when an existing item was replaced. On replace, `seq`
-keeps its original value; on create, `seq` is freshly assigned.
-`ts` is always refreshed.
+`false` when an existing item was replaced. On replace, `seq` and
+`uuid` keep their original values; on create, both are freshly
+assigned. `ts` is always refreshed.
 
 **Endpoint-specific errors**
 
@@ -1110,18 +1158,19 @@ curl -s -X POST http://localhost:8080/upsert \
 
 #### `POST /update`
 
-Modify the payload of an existing item, addressed by `scope`+`id`
-or `scope`+`seq`. Soft-misses on a non-existent item (returns 200
-with `hit: false`).
+Modify the payload of an existing item, addressed by `scope`+`id`,
+`scope`+`seq`, or `scope`+`uuid`. Soft-misses on a non-existent item
+(returns 200 with `hit: false`).
 
 **Request body**
 
-| field     | type           | required               | notes                                |
-|-----------|----------------|------------------------|--------------------------------------|
-| `scope`   | string         | yes                    | shape per §4.1                       |
-| `id`      | string         | exactly one of id/seq  | shape per §4.1 when present          |
-| `seq`     | uint64         | exactly one of id/seq  | parsed as unsigned integer           |
-| `payload` | any JSON value | yes                    | not literal `null`                   |
+| field     | type           | required                    | notes                                |
+|-----------|----------------|-----------------------------|--------------------------------------|
+| `scope`   | string         | yes                         | shape per §4.1                       |
+| `id`      | string         | exactly one of id/seq/uuid  | shape per §4.1 when present          |
+| `seq`     | uint64         | exactly one of id/seq/uuid  | parsed as unsigned integer           |
+| `uuid`    | string (v7)    | exactly one of id/seq/uuid  | canonical UUIDv7; here an addressing key, not a value |
+| `payload` | any JSON value | yes                         | not literal `null`                   |
 
 **Response (200)**
 
@@ -1225,16 +1274,17 @@ curl -s -X POST http://localhost:8080/counter_add \
 
 #### `POST /delete`
 
-Delete a single item by `scope`+`id` or `scope`+`seq`. Soft-misses
-on a non-existent item.
+Delete a single item by `scope`+`id`, `scope`+`seq`, or
+`scope`+`uuid`. Soft-misses on a non-existent item.
 
 **Request body**
 
-| field   | type   | required              | notes                       |
-|---------|--------|-----------------------|-----------------------------|
-| `scope` | string | yes                   | shape per §4.1              |
-| `id`    | string | exactly one of id/seq | shape per §4.1 when present |
-| `seq`   | uint64 | exactly one of id/seq | parsed as unsigned integer  |
+| field   | type        | required                   | notes                       |
+|---------|-------------|----------------------------|-----------------------------|
+| `scope` | string      | yes                        | shape per §4.1              |
+| `id`    | string      | exactly one of id/seq/uuid | shape per §4.1 when present |
+| `seq`   | uint64      | exactly one of id/seq/uuid | parsed as unsigned integer  |
+| `uuid`  | string (v7) | exactly one of id/seq/uuid | canonical UUIDv7 addressing key |
 
 **Response (200)**
 
@@ -1260,17 +1310,25 @@ curl -s -X POST http://localhost:8080/delete \
 
 #### `POST /delete_up_to`
 
-Drain a `seq`-prefix from a scope: removes every item with
-`seq ≤ max_seq`. The write-buffer drain primitive — pair with
+Drain a prefix from a scope: removes every item up to and including
+a boundary. The boundary is given by exactly one of `max_seq`
+(remove every item with `seq ≤ max_seq`) or `uuid` (name the
+boundary item; the cache resolves it to that item's `seq` and drains
+the same prefix). The write-buffer drain primitive — pair with
 `/tail` to read items, then `/delete_up_to` with the last drained
-`seq` to release the buffer.
+item's `seq` or `uuid` to release the buffer.
+
+A `uuid` boundary that is not present in the scope is a no-op
+(`count: 0`): drains run front-to-back, so a boundary item that is
+already gone means everything before it is gone too.
 
 **Request body**
 
-| field      | type   | required | notes                          |
-|------------|--------|----------|--------------------------------|
-| `scope`    | string | yes      | shape per §4.1                 |
-| `max_seq`  | uint64 | yes      | must be > 0                    |
+| field      | type        | required                       | notes                          |
+|------------|-------------|--------------------------------|--------------------------------|
+| `scope`    | string      | yes                            | shape per §4.1                 |
+| `max_seq`  | uint64      | exactly one of max_seq/uuid    | must be > 0                    |
+| `uuid`     | string (v7) | exactly one of max_seq/uuid    | canonical UUIDv7 boundary item |
 
 **Response (200)**
 
@@ -1401,9 +1459,26 @@ capacity check).
 {"items": [{"scope":"...","id":"...","payload":...}, ...]}
 ```
 
-Each item validates against the same rules as `/append` (§4.1).
-Items are grouped by `scope` server-side; every scope mentioned in
-the batch is replaced as a unit.
+Each item validates against the same field-shape rules as `/append`
+(§4.1), with one deliberate difference for `uuid`. `/append` mints
+the `uuid` and rejects a client-supplied one; `/warm` and `/rebuild`
+**adopt-or-mint**: an item that carries a `uuid` keeps it (it must be
+a canonical UUIDv7), an item without one has a `uuid` minted at
+commit. A within-scope duplicate `uuid` rejects the whole batch
+(400), like a duplicate `id`. Items are grouped by `scope`
+server-side; every scope mentioned in the batch is replaced as a unit.
+
+**The uuid round-trip (integration obligation).** Because the cache
+mints `uuid` on `/append`, an application that uses *both* `/append`
+and `/rebuild` // `/warm` must persist the minted `uuid` — returned
+in the `/append` response (§6.1) — alongside its source-of-truth
+row, and feed it back in the bulk input. Skip that and a later
+`/rebuild` mints a *fresh* `uuid` for the row, breaking any external
+reference to the old one. This is a protocol obligation on the
+cache's user — the same category as "a drainer must read `_events`"
+— not cache logic. An application that never `/append`s (the cache
+is a pure projection of a DB it owns) can simply let the bulk paths
+mint every `uuid`.
 
 **Response (200)**
 
@@ -1429,6 +1504,8 @@ replaced scope detach (409).
 | status | error                                  | when                          |
 |--------|----------------------------------------|-------------------------------|
 | 400    | `scope '<name>' is reserved …`         | any item's `scope` is `_events` or `_inbox` (§2.6) |
+| 400    | `the 'uuid' field must be a canonical lowercase UUIDv7 string` | a supplied `uuid` is not a valid v7 |
+| 400    | `duplicate 'uuid' value within scope` | two items in one scope carry the same `uuid` |
 
 **Example**
 
@@ -1498,17 +1575,19 @@ curl -s -X POST http://localhost:8080/rebuild \
 
 #### `GET /get`
 
-Look up a single item by `scope`+`id` or `scope`+`seq`. Returns
-200 in both the hit and miss case; the response carries `hit:
-true|false`. See §5.3 for why misses are not 404.
+Look up a single item by `scope`+`id`, `scope`+`seq`, or
+`scope`+`uuid`. Returns 200 in both the hit and miss case; the
+response carries `hit: true|false`. See §5.3 for why misses are not
+404.
 
 **Query parameters**
 
-| parameter | type   | required              |
-|-----------|--------|-----------------------|
-| `scope`   | string | yes                   |
-| `id`      | string | exactly one of id/seq |
-| `seq`     | uint64 | exactly one of id/seq |
+| parameter | type        | required                   |
+|-----------|-------------|----------------------------|
+| `scope`   | string      | yes                        |
+| `id`      | string      | exactly one of id/seq/uuid |
+| `seq`     | uint64      | exactly one of id/seq/uuid |
+| `uuid`    | string (v7) | exactly one of id/seq/uuid |
 
 **Response (200, hit)**
 
@@ -1517,12 +1596,12 @@ true|false`. See §5.3 for why misses are not 404.
   "ok": true,
   "hit": true,
   "count": 1,
-  "item": {"scope":"events","id":"e1","seq":1,"ts":1700000000000000,"payload":{"v":1}},
+  "item": {"scope":"events","id":"e1","seq":1,"ts":1700000000000000,"uuid":"0192f3a0-6e1c-7c8a-b3d4-1f2e3a4b5c6d","payload":{"v":1}},
   "approx_response_mb": 0.0001
 }
 ```
 
-Every item carries the full `scope` / `id` / `seq` / `ts` /
+Every item carries the full `scope` / `id` / `seq` / `ts` / `uuid` /
 `payload` key set on the wire. Items written without a
 client-supplied `id` render as `"id":null` rather than dropping
 the key — uniform shape lets clients read `item.id` directly
@@ -1558,7 +1637,7 @@ an application layer in between.
 
 **Query parameters**
 
-Same as `/get`: `scope`, plus exactly one of `id` or `seq`.
+Same as `/get`: `scope`, plus exactly one of `id`, `seq` or `uuid`.
 
 **Response (200, hit)**
 
@@ -1826,7 +1905,7 @@ curl -s 'http://localhost:8080/stats' | jq .events_drops_total
 Return per-scope detail rows in alphabetical order, with an optional
 prefix filter and cursor pagination by name. The per-scope counterpart
 of `/stats`: where `/stats` is store-wide aggregate, `/scopelist` walks
-the scopes themselves and surfaces the seven primitives §2.4 maintains
+the scopes themselves and surfaces the nine primitives §2.4 maintains
 on every buffer.
 
 **Query parameters**
@@ -1857,6 +1936,8 @@ read-count) are explicitly out of core; addons that want them poll
       "scope": "events",
       "item_count": 42,
       "last_seq": 50,
+      "first_uuid": "0192f3a0-6e1c-7c8a-b3d4-1f2e3a4b5c6d",
+      "last_uuid": "0192f3a1-2b4d-7e9f-8a1c-5d6e7f8a9b0c",
       "approx_scope_mb": 0.0042,
       "created_ts": 1700000000000000,
       "last_write_ts": 1700000001234567,
@@ -1867,6 +1948,8 @@ read-count) are explicitly out of core; addons that want them poll
       "scope": "thread:42",
       "item_count": 3,
       "last_seq": 3,
+      "first_uuid": "0192f3a0-9c1e-7d2b-bf3a-4e5d6c7b8a90",
+      "last_uuid": "0192f3a0-9c1e-7d2b-bf3a-4e5d6c7b8a92",
       "approx_scope_mb": 0.0008,
       "created_ts": 1700000001000000,
       "last_write_ts": 1700000001500000,

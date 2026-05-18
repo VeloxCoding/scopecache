@@ -462,7 +462,7 @@ func TestStore_updateOne_MissingScope(t *testing.T) {
 
 func TestStore_deleteOne_MissingScope(t *testing.T) {
 	s := newStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
-	n, err := s.deleteOne("nope", "x", 0)
+	n, err := s.deleteOne("nope", "x", 0, "")
 	if err != nil {
 		t.Fatalf("err=%v; want nil", err)
 	}
@@ -473,7 +473,7 @@ func TestStore_deleteOne_MissingScope(t *testing.T) {
 
 func TestStore_deleteUpTo_MissingScope(t *testing.T) {
 	s := newStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
-	n, err := s.deleteUpTo("nope", 100)
+	n, err := s.deleteUpTo("nope", 100, "")
 	if err != nil {
 		t.Fatalf("err=%v; want nil", err)
 	}
@@ -519,14 +519,14 @@ func TestStore_tail_MissingScope(t *testing.T) {
 
 func TestStore_get_MissingScope(t *testing.T) {
 	s := newStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
-	if _, found := s.get("nope", "x", 0); found {
+	if _, found := s.get("nope", "x", 0, ""); found {
 		t.Error("found=true; want false")
 	}
 }
 
 func TestStore_render_MissingScope(t *testing.T) {
 	s := newStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
-	if _, found := s.render("nope", "x", 0); found {
+	if _, found := s.render("nope", "x", 0, ""); found {
 		t.Error("found=true; want false")
 	}
 }
@@ -540,7 +540,7 @@ func TestStore_render_PeelsJSONString(t *testing.T) {
 	if err != nil {
 		t.Fatalf("appendOne: %v", err)
 	}
-	body, found := s.render("s", "html", 0)
+	body, found := s.render("s", "html", 0, "")
 	if !found {
 		t.Fatal("found=false; want true")
 	}
@@ -1011,7 +1011,8 @@ func TestScopeBuffer_DeletesDetectDetached(t *testing.T) {
 // StoreFullError. State must stay untouched on rejection — same contract as
 // the per-scope ScopeFullError.
 func TestStore_Append_RejectsAtByteCap(t *testing.T) {
-	itemSize := approxItemSize(newItem("s", "", nil))
+	// itemSize includes the 36-byte uuid the cache mints on every append.
+	itemSize := approxItemSize(newItem("s", "", nil)) + uuidStringLen
 	// Cap fits reserved scopes (_events, _inbox) + 1 user-scope overhead + 3 items.
 	capBytes := reservedScopesOverhead + int64(scopeBufferOverhead) + itemSize*3
 
@@ -1051,7 +1052,7 @@ func TestStore_Append_RejectsAtByteCap(t *testing.T) {
 // byte counter has to drop by the removed item's size or the store drifts
 // into a permanently "full" state.
 func TestStore_Delete_FreesBytes(t *testing.T) {
-	itemSize := approxItemSize(newItem("s", "a", nil))
+	itemSize := approxItemSize(newItem("s", "a", nil)) + uuidStringLen // + minted uuid
 	// Cap fits reserved + 1 user-scope overhead + 2 items.
 	capBytes := reservedScopesOverhead + int64(scopeBufferOverhead) + itemSize*2
 
@@ -1083,7 +1084,7 @@ func TestStore_Delete_FreesBytes(t *testing.T) {
 }
 
 func TestStore_DeleteUpTo_FreesBytes(t *testing.T) {
-	itemSize := approxItemSize(newItem("s", "", nil))
+	itemSize := approxItemSize(newItem("s", "", nil)) + uuidStringLen // + minted uuid
 	capBytes := reservedScopesOverhead + int64(scopeBufferOverhead) + itemSize*3
 
 	s := newStore(Config{ScopeMaxItems: 100, MaxStoreBytes: capBytes, MaxItemBytes: 1 << 20})
@@ -1110,7 +1111,7 @@ func TestStore_DeleteUpTo_FreesBytes(t *testing.T) {
 }
 
 func TestStore_DeleteScope_FreesBytes(t *testing.T) {
-	itemSize := approxItemSize(newItem("s", "", nil))
+	itemSize := approxItemSize(newItem("s", "", nil)) + uuidStringLen // + minted uuid
 	capBytes := reservedScopesOverhead + int64(scopeBufferOverhead) + itemSize*4
 
 	s := newStore(Config{ScopeMaxItems: 100, MaxStoreBytes: capBytes, MaxItemBytes: 1 << 20})
@@ -1138,7 +1139,7 @@ func TestStore_Update_RejectsGrowAtByteCap(t *testing.T) {
 	small := newItem("s", "a", map[string]interface{}{"v": 1})
 	// Cap fits reserved + 1 user-scope overhead + small item + tiny slack
 	// (no room for the large replacement payload).
-	capBytes := reservedScopesOverhead + int64(scopeBufferOverhead) + approxItemSize(small) + 8
+	capBytes := reservedScopesOverhead + int64(scopeBufferOverhead) + approxItemSize(small) + uuidStringLen + 8
 
 	s := newStore(Config{ScopeMaxItems: 100, MaxStoreBytes: capBytes, MaxItemBytes: 1 << 20})
 	buf, _ := s.getOrCreateScope("s")
@@ -1431,7 +1432,7 @@ func TestStore_StatsCounters_Invariant_AcrossPaths(t *testing.T) {
 	assertStatsCountersInvariant(t, s, "after updateOne")
 
 	// deleteOne by id — drops one item.
-	if _, err := s.deleteOne("a", "1", 0); err != nil {
+	if _, err := s.deleteOne("a", "1", 0, ""); err != nil {
 		t.Fatalf("deleteOne: %v", err)
 	}
 	assertStatsCountersInvariant(t, s, "after deleteOne")
@@ -1445,7 +1446,7 @@ func TestStore_StatsCounters_Invariant_AcrossPaths(t *testing.T) {
 	assertStatsCountersInvariant(t, s, "after building scope b")
 
 	// deleteUpTo — drops the first 3 items in b. lastSeq is 5; cut at 3.
-	if n, err := s.deleteUpTo("b", 3); err != nil || n != 3 {
+	if n, err := s.deleteUpTo("b", 3, ""); err != nil || n != 3 {
 		t.Fatalf("deleteUpTo n=%d err=%v want n=3", n, err)
 	}
 	assertStatsCountersInvariant(t, s, "after deleteUpTo")
@@ -1752,7 +1753,7 @@ func TestStore_LastWriteTS_BumpsOnEveryWritePath(t *testing.T) {
 		}
 	})
 	step("deleteOne", func() {
-		if _, err := s.deleteOne("a", "1", 0); err != nil {
+		if _, err := s.deleteOne("a", "1", 0, ""); err != nil {
 			t.Fatalf("deleteOne: %v", err)
 		}
 	})
@@ -1763,7 +1764,7 @@ func TestStore_LastWriteTS_BumpsOnEveryWritePath(t *testing.T) {
 		}
 	}
 	step("deleteUpTo", func() {
-		if _, err := s.deleteUpTo("b", 2); err != nil {
+		if _, err := s.deleteUpTo("b", 2, ""); err != nil {
 			t.Fatalf("deleteUpTo: %v", err)
 		}
 	})

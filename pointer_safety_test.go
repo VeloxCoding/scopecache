@@ -148,7 +148,7 @@ func TestPointerSafety_PromoteRollbackOnStoreFull(t *testing.T) {
 
 	// The original item must be completely intact — still a regular
 	// item with payload `5`, not a half-promoted counter.
-	item, hit := s.get("s", "c", 0)
+	item, hit := s.get("s", "c", 0, "")
 	if !hit {
 		t.Fatal("item gone after a failed promote")
 	}

@@ -22,12 +22,15 @@ import "strconv"
 
 // AppendItemJSON appends item to buf as JSON, byte-identical to
 // Item.MarshalJSON. Items in the reserved _events scope rename
-// "payload" to "event"; empty Payload renders as `null` (defensive —
-// validatePayload rejects empty on write).
+// "payload" to "event" and "uuid" to "event_uuid"; empty Payload
+// renders as `null` (defensive — validatePayload rejects empty on
+// write).
 func AppendItemJSON(buf []byte, item Item) []byte {
 	payloadKey := "payload"
+	uuidKey := "uuid"
 	if item.Scope == EventsScopeName {
 		payloadKey = "event"
+		uuidKey = "event_uuid"
 	}
 
 	buf = append(buf, `{"scope":`...)
@@ -42,6 +45,10 @@ func AppendItemJSON(buf []byte, item Item) []byte {
 	buf = strconv.AppendUint(buf, item.Seq, 10)
 	buf = append(buf, `,"ts":`...)
 	buf = strconv.AppendInt(buf, item.Ts, 10)
+	buf = append(buf, ',', '"')
+	buf = append(buf, uuidKey...)
+	buf = append(buf, '"', ':')
+	buf = AppendJSONString(buf, item.UUID)
 	buf = append(buf, ',', '"')
 	buf = append(buf, payloadKey...)
 	buf = append(buf, '"', ':')
@@ -149,7 +156,7 @@ func appendItemsEnvelopeJSON(buf []byte, items []Item, truncated bool, offset *i
 }
 
 // AppendScopeListResponseJSON appends a /scopelist envelope. Each
-// entry's eight scalar fields are emitted in the same order as
+// entry's ten scalar fields are emitted in the same order as
 // ScopeListEntry's struct tags.
 func AppendScopeListResponseJSON(buf []byte, entries []ScopeListEntry, truncated bool) []byte {
 	startLen := len(buf)

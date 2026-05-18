@@ -286,10 +286,13 @@ func (api *API) handleGet(w http.ResponseWriter, r *http.Request) {
 		item  Item
 		found bool
 	)
-	if target.ByID {
-		item, found = api.store.get(target.Scope, target.ID, 0)
-	} else {
-		item, found = api.store.get(target.Scope, "", target.Seq)
+	switch {
+	case target.ID != "":
+		item, found = api.store.get(target.Scope, target.ID, 0, "")
+	case target.UUID != "":
+		item, found = api.store.get(target.Scope, "", 0, target.UUID)
+	default:
+		item, found = api.store.get(target.Scope, "", target.Seq, "")
 	}
 
 	if !found {
@@ -313,8 +316,9 @@ func (api *API) handleGet(w http.ResponseWriter, r *http.Request) {
 //   - The envelope shape is identical to the previous orderedFields
 //     emission: ok, hit, count, item, approx_response_mb.
 //   - For items in the reserved _events scope the payload-bearing
-//     field is named "event" (matching Item.MarshalJSON's special
-//     case); otherwise it is "payload".
+//     field is named "event" and the item's own uuid is named
+//     "event_uuid" (matching Item.MarshalJSON's special case);
+//     otherwise they are "payload" and "uuid".
 //   - Field-omission rules mirror Item's struct tags: scope, id,
 //     and seq are dropped when zero-valued; ts and the payload-
 //     bearing field are always present on a hit.
@@ -338,8 +342,10 @@ func writeGetResponse(w http.ResponseWriter, resp GetResponse) {
 		item := *resp.Item
 		payload = item.Payload
 		payloadKey := "payload"
+		uuidKey := "uuid"
 		if item.Scope == EventsScopeName {
 			payloadKey = "event"
+			uuidKey = "event_uuid"
 		}
 
 		prefix = append(prefix, `{"ok":true,"hit":true,"count":1,"item":{"scope":`...)
@@ -354,6 +360,10 @@ func writeGetResponse(w http.ResponseWriter, resp GetResponse) {
 		prefix = strconv.AppendUint(prefix, item.Seq, 10)
 		prefix = append(prefix, `,"ts":`...)
 		prefix = strconv.AppendInt(prefix, item.Ts, 10)
+		prefix = append(prefix, ',', '"')
+		prefix = append(prefix, uuidKey...)
+		prefix = append(prefix, '"', ':')
+		prefix = AppendJSONString(prefix, item.UUID)
 		prefix = append(prefix, ',', '"')
 		prefix = append(prefix, payloadKey...)
 		prefix = append(prefix, '"', ':')
@@ -433,10 +443,13 @@ func (api *API) handleRender(w http.ResponseWriter, r *http.Request) {
 		body  []byte
 		found bool
 	)
-	if target.ByID {
-		body, found = api.store.render(target.Scope, target.ID, 0)
-	} else {
-		body, found = api.store.render(target.Scope, "", target.Seq)
+	switch {
+	case target.ID != "":
+		body, found = api.store.render(target.Scope, target.ID, 0, "")
+	case target.UUID != "":
+		body, found = api.store.render(target.Scope, "", 0, target.UUID)
+	default:
+		body, found = api.store.render(target.Scope, "", target.Seq, "")
 	}
 	if !found {
 		writeMiss()

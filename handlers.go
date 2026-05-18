@@ -215,23 +215,26 @@ func methodNotAllowed(w http.ResponseWriter, allowed string) {
 }
 
 // lookupTarget is the parsed form of /get's and /render's URL query:
-// a scope plus exactly one of id or seq. Built by parseLookupTarget.
+// a scope plus exactly one of id, seq or uuid. Built by
+// parseLookupTarget; the addressing mode is whichever of ID/UUID is
+// non-empty, else Seq.
 type lookupTarget struct {
 	Scope string
-	ByID  bool
 	ID    string
 	Seq   uint64
+	UUID  string
 }
 
-// parseLookupTarget pulls scope + exactly one of id/seq from the query
-// string and validates each. Scope errors are labelled with the endpoint;
-// the id/seq shape errors are endpoint-agnostic since the rule is the same
-// on every single-item read.
+// parseLookupTarget pulls scope + exactly one of id/seq/uuid from the
+// query string and validates each. Scope errors are labelled with the
+// endpoint; the id/seq/uuid shape errors are endpoint-agnostic since
+// the rule is the same on every single-item read.
 func parseLookupTarget(r *http.Request, endpoint string) (lookupTarget, error) {
 	query := r.URL.Query()
 	scope := query.Get("scope")
 	id := query.Get("id")
 	seqStr := query.Get("seq")
+	uuid := query.Get("uuid")
 
 	if err := validateScope(scope, endpoint); err != nil {
 		return lookupTarget{}, err
@@ -239,15 +242,32 @@ func parseLookupTarget(r *http.Request, endpoint string) (lookupTarget, error) {
 
 	hasID := id != ""
 	hasSeq := seqStr != ""
-	if hasID == hasSeq {
-		return lookupTarget{}, errors.New("exactly one of 'id' or 'seq' must be provided")
+	hasUUID := uuid != ""
+	n := 0
+	for _, h := range [...]bool{hasID, hasSeq, hasUUID} {
+		if h {
+			n++
+		}
+	}
+	if n != 1 {
+		return lookupTarget{}, errors.New("exactly one of 'id', 'seq' or 'uuid' must be provided")
 	}
 
 	if hasID {
 		if err := validateID(id); err != nil {
 			return lookupTarget{}, err
 		}
-		return lookupTarget{Scope: scope, ByID: true, ID: id}, nil
+		return lookupTarget{Scope: scope, ID: id}, nil
+	}
+
+	if hasUUID {
+		// Strict v7 check — a malformed uuid is a caller bug, rejected
+		// loudly with 400 rather than silently missing (same loud-on-
+		// malformed-address rule as seq=0 below).
+		if !isValidUUIDv7(uuid) {
+			return lookupTarget{}, errors.New("the 'uuid' parameter must be a valid UUIDv7")
+		}
+		return lookupTarget{Scope: scope, UUID: uuid}, nil
 	}
 
 	seq, err := strconv.ParseUint(seqStr, 10, 64)

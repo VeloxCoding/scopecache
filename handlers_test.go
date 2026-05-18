@@ -478,21 +478,21 @@ func TestUpdate_RejectsNeitherIDNorSeq(t *testing.T) {
 // the only thing under test.
 func TestUpdate_BySeq_EnforcesPerItemCap(t *testing.T) {
 	api := NewAPI(
-		NewGateway(Config{ScopeMaxItems: 10, MaxStoreBytes: 1 << 20, MaxItemBytes: 100}),
+		NewGateway(Config{ScopeMaxItems: 10, MaxStoreBytes: 1 << 20, MaxItemBytes: 136}),
 		APIConfig{},
 	)
 	mux := http.NewServeMux()
 	api.RegisterRoutes(mux)
 
-	// Seed: scope=1B, id=10B, payload=7B → approxItemSize = 48+1+10+7 = 66 ≤ 100
+	// Seed: scope=1B, id=10B, uuid=36B, payload=7B → 48+1+10+36+7 = 102 ≤ 136
 	if code, _, _ := doRequest(t, mux, "POST", "/append",
 		`{"scope":"s","id":"abcdefghij","payload":{"v":1}}`); code != 200 {
 		t.Fatalf("seed append: code=%d want 200", code)
 	}
 
 	// Build a payload that, with the stored id (10B), exceeds the cap:
-	// 48+1+10+45 = 104 > 100. Without the stored id, 48+1+0+45 = 94 ≤ 100,
-	// so the validator alone does not reject.
+	// 48+1+10+36+45 = 140 > 136. Without the stored id, 48+1+0+36+45 = 130
+	// ≤ 136, so the validator alone does not reject.
 	n := 45
 	buf := make([]byte, n)
 	buf[0] = '['
@@ -753,20 +753,20 @@ func TestCounterAdd_EnforcesPerItemCap_Create(t *testing.T) {
 // must remain untouched.
 func TestCounterAdd_EnforcesPerItemCap_Promote(t *testing.T) {
 	api := NewAPI(
-		NewGateway(Config{ScopeMaxItems: 10, MaxStoreBytes: 1 << 20, MaxItemBytes: 64}),
+		NewGateway(Config{ScopeMaxItems: 10, MaxStoreBytes: 1 << 20, MaxItemBytes: 100}),
 		APIConfig{},
 	)
 	mux := http.NewServeMux()
 	api.RegisterRoutes(mux)
 
-	// Seed a small regular item: 48+1+1+1 = 51 ≤ 64.
+	// Seed a small regular item: 48+1+1+36+1 = 87 ≤ 100.
 	if code, _, raw := doRequest(t, mux, "POST", "/append",
 		`{"scope":"t","id":"y","payload":5}`); code != 200 {
 		t.Fatalf("seed append: code=%d body=%s", code, raw)
 	}
 
 	// /counter_add at the same scope/id would promote to a counter
-	// shape (48+1+1+56 = 106 > 64). The validator must reject.
+	// shape (48+1+1+36+56 = 142 > 100). The validator must reject.
 	code, _, raw := doRequest(t, mux, "POST", "/counter_add", `{"scope":"t","id":"y","by":1}`)
 	if code != http.StatusBadRequest {
 		t.Fatalf("promote-path /counter_add: code=%d want 400 (body=%s)", code, raw)

@@ -221,24 +221,25 @@ To fully unlock the potential of FrankenPHP, you need more than an embedded PHP 
 
 ScopeCache’s internal storage model is deliberately simple.
 
-Each scope owns one ordered slice of items, stored in append order. Around that slice, ScopeCache maintains lightweight hashmap indexes for direct lookup by `id` and `seq`.
+Each scope owns one ordered slice of items, stored in append order. Around that slice, ScopeCache maintains lightweight hashmap indexes for direct lookup by `id`, `seq`, and `uuid`.
 
 Conceptually, the core shape is:
 
 ```go
 type scopeBuffer struct {
-    items []*Item             // primary storage, in append order
-    byID  map[string]*Item    // id  -> item
-    bySeq map[uint64]*Item    // seq -> item
-    mu    sync.RWMutex        // one lock per scope
+    items  []*Item            // primary storage, in append order
+    byID   map[string]*Item   // id   -> item
+    bySeq  map[uint64]*Item   // seq  -> item
+    byUUID map[string]*Item   // uuid -> item (cache-minted UUIDv7)
+    mu     sync.RWMutex       // one lock per scope
 }
 ```
 
 The slice is the ordered storage. It defines the physical order of the data in memory and makes operations such as `head`, `tail`, and cursor-based reads natural.
 
-The maps exist to avoid scanning. A lookup by `id` or `seq` is an O(1) hashmap lookup on average, independent of the number of items in the scope.
+The maps exist to avoid scanning. A lookup by `id`, `seq`, or `uuid` is an O(1) hashmap lookup on average, independent of the number of items in the scope.
 
-The slice and both maps hold pointers to the same items, so each item lives in memory once, no matter how many indexes address it.
+The slice and all three maps hold pointers to the same items, so each item lives in memory once, no matter how many indexes address it.
 
 A classical key-value store is conceptually built around:
 

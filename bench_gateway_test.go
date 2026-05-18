@@ -255,7 +255,7 @@ func BenchmarkStore_GetDirect(b *testing.B) {
 			b.ResetTimer()
 
 			for i := 0; i < b.N; i++ {
-				if _, ok := s.get(scope, ids[i%count], 0); !ok {
+				if _, ok := s.get(scope, ids[i%count], 0, ""); !ok {
 					b.Fatalf("get miss")
 				}
 			}
@@ -375,7 +375,7 @@ func BenchmarkStore_RenderDirect(b *testing.B) {
 			b.ResetTimer()
 
 			for i := 0; i < b.N; i++ {
-				if _, ok := s.render(scope, ids[i%len(ids)], 0); !ok {
+				if _, ok := s.render(scope, ids[i%len(ids)], 0, ""); !ok {
 					b.Fatalf("render miss")
 				}
 			}

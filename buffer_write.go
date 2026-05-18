@@ -4,6 +4,7 @@
 //   - upsertByID    — insert-or-replace by id; replace-whole-item on hit
 //   - updateByID    — modify payload at an existing id
 //   - updateBySeq   — same, addressed by seq
+//   - updateByUUID  — same, addressed by uuid
 //
 // All four take b.mu exclusively, check b.detached first, and route
 // their byte-budget reservation through s.reserveBytes. Shared
@@ -194,6 +195,7 @@ func (b *scopeBuffer) updateBySeq(seq uint64, payload json.RawMessage, preRender
 		candidate := Item{
 			Scope:       existing.Scope,
 			ID:          existing.ID,
+			UUID:        existing.UUID,
 			Payload:     payload,
 			renderBytes: newRender,
 		}
@@ -220,12 +222,66 @@ func (b *scopeBuffer) updateBySeq(seq uint64, payload json.RawMessage, preRender
 	return 1, nil
 }
 
+// updateByUUID mirrors updateBySeq for uuid addressing: the request
+// body carries no id (uuid is the address), so the validator's
+// checkItemSize undercounts by len(stored.ID) and the post-load
+// re-check below is required — see updateBySeq for the full rationale.
+func (b *scopeBuffer) updateByUUID(uuid string, payload json.RawMessage, preRender []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.detached {
+		return 0, &ScopeDetachedError{}
+	}
+
+	existing, ok := b.byUUID[uuid]
+	if !ok {
+		return 0, nil
+	}
+
+	newRender := preRender
+	if newRender == nil {
+		newRender = precomputeRenderBytes(payload)
+	}
+
+	if b.store != nil {
+		maxItemBytes := b.store.maxItemBytesFor(existing.Scope)
+		candidate := Item{
+			Scope:       existing.Scope,
+			ID:          existing.ID,
+			UUID:        existing.UUID,
+			Payload:     payload,
+			renderBytes: newRender,
+		}
+		if size := approxItemSize(candidate); size > maxItemBytes {
+			return 0, fmt.Errorf("%w: the item's approximate size (%d bytes) exceeds the maximum of %d bytes",
+				ErrInvalidInput, size, maxItemBytes)
+		}
+	}
+
+	delta, err := b.reservePayloadDeltaLocked(
+		payloadAndRenderBytes(existing),
+		int64(len(payload)+len(newRender)),
+	)
+	if err != nil {
+		return 0, err
+	}
+
+	i, ok := b.indexBySeqLocked(existing.Seq)
+	if !ok {
+		// Unreachable under b.mu: byUUID confirmed the item exists.
+		return 0, nil
+	}
+	b.replaceItemAtIndexLocked(i, payload, time.Now().UnixMicro(), newRender, delta)
+	return 1, nil
+}
+
 // insertNewItemLocked is the shared fresh-insert pipeline used by
 // appendItem and upsertByID's miss-branch. Pipeline order is
 // intentional and must stay coherent across both paths:
-// ts-stamp → renderBytes precompute → size → store-byte reservation
-// → seq assignment → b.items append → b.bySeq sync → b.byID sync
-// (when ID != "") → b.bytes update.
+// ts-stamp → renderBytes precompute → uuid-mint → size → store-byte
+// reservation → seq assignment → b.items append → b.bySeq sync →
+// b.byID sync (when ID != "") → b.byUUID sync → b.bytes update.
 //
 // PRECONDITIONS — caller responsibilities, not re-checked:
 //   - holds b.mu (write lock)
@@ -255,6 +311,14 @@ func (b *scopeBuffer) insertNewItemLocked(item Item, nowUs int64) (Item, error) 
 	// tests that built an Item without going through the validator.
 	if item.renderBytes == nil {
 		item.renderBytes = precomputeRenderBytes(item.Payload)
+	}
+	// Mint the cache-owned UUIDv7 before approxItemSize so its 36
+	// bytes are admitted against the cap. The generator is lock-free
+	// (uuid.go), so calling it under b.mu costs no lock ordering. An
+	// orphan buffer (store == nil, unit tests) has no generator, so
+	// its items carry no uuid.
+	if b.store != nil && item.UUID == "" {
+		item.UUID = b.store.uuidGen.next()
 	}
 
 	size := approxItemSize(item)
@@ -296,6 +360,16 @@ func (b *scopeBuffer) insertNewItemLocked(item Item, nowUs int64) (Item, error) 
 		}
 		b.byID[item.ID] = stored
 		b.idKeyBytes += int64(len(item.ID))
+	}
+	if item.UUID != "" {
+		if b.byUUID == nil {
+			b.byUUID = make(map[string]*Item)
+		}
+		b.byUUID[item.UUID] = stored
+		if b.firstUUID == "" {
+			b.firstUUID = item.UUID
+		}
+		b.lastUUID = item.UUID
 	}
 	b.bytes += size
 	if b.store != nil {

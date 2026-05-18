@@ -119,7 +119,7 @@ func (api *API) handleScopeList(w http.ResponseWriter, r *http.Request) {
 
 // writeScopeListResponse mirrors writeItemsResponse for /scopelist:
 // single-buffer manual JSON, no marshal+splice doubling. Each
-// scopeListEntry has eight scalar fields with no payload bytes, so
+// scopeListEntry has ten scalar fields with no payload bytes, so
 // the per-row cost is small — but the 1000-entry × 100-byte-name
 // envelope still benefits from skipping the splice copy that
 // writeJSONWithMetaCap performs in marshalWithApproxSize.
@@ -185,6 +185,10 @@ func appendScopeListEntryJSON(buf []byte, e scopeListEntry) []byte {
 	buf = strconv.AppendInt(buf, int64(e.ItemCount), 10)
 	buf = append(buf, `,"last_seq":`...)
 	buf = strconv.AppendUint(buf, e.LastSeq, 10)
+	buf = append(buf, `,"first_uuid":`...)
+	buf = AppendJSONString(buf, e.FirstUUID)
+	buf = append(buf, `,"last_uuid":`...)
+	buf = AppendJSONString(buf, e.LastUUID)
 	buf = append(buf, `,"approx_scope_mb":`...)
 	buf = strconv.AppendFloat(buf, float64(e.ApproxScopeMB)/1048576.0, 'f', 4, 64)
 	buf = append(buf, `,"created_ts":`...)

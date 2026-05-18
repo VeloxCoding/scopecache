@@ -213,7 +213,7 @@ func TestStore_Wipe_ResetsTotalBytes(t *testing.T) {
 // must include the reserved-scope overhead because /wipe re-creates _events
 // and _inbox before returning.
 func TestStore_Wipe_FreesHeadroomForNextAppend(t *testing.T) {
-	itemSize := approxItemSize(newItem("s", "", nil))
+	itemSize := approxItemSize(newItem("s", "", nil)) + uuidStringLen // + minted uuid
 	// Cap room for: reserved-scope overhead (NewStore + post-wipe init
 	// re-creates _events and _inbox) + per-scope overhead for "s" + 3 items.
 	// The fourth item then exceeds the cap.
@@ -598,7 +598,7 @@ func TestStore_RebuildAll_RejectsDuplicateIDs(t *testing.T) {
 // whose net byte delta would push the store over the cap is rejected as a
 // whole with StoreFullError, and no scope is applied.
 func TestStore_ReplaceScopes_RejectsAtByteCap(t *testing.T) {
-	itemSize := approxItemSize(newItem("s", "", nil))
+	itemSize := approxItemSize(newItem("s", "", nil)) + uuidStringLen // + minted uuid
 	// Reserved-scope overhead (NewStore pre-creates _events + _inbox) +
 	// one scope-buffer overhead (for the pre-seed) + 3 items worth.
 	// The /warm batch needs 2 new scopes (overhead × 2) + 4 items, so
@@ -641,7 +641,7 @@ func TestStore_ReplaceScopes_RejectsAtByteCap(t *testing.T) {
 	if len(pre.items) != preLen {
 		t.Fatalf("untouched scope mutated: len=%d want %d", len(pre.items), preLen)
 	}
-	preSize := approxItemSize(newItem("untouched", "u", nil))
+	preSize := approxItemSize(newItem("untouched", "u", nil)) + uuidStringLen // stored item carries a minted uuid
 	if got, want := s.totalBytes.Load(), int64(scopeBufferOverhead)+preSize+reservedScopesOverhead; got != want {
 		t.Fatalf("totalBytes=%d want %d (only pre-seed scope+item + reserved-overhead should count)", got, want)
 	}
@@ -796,8 +796,12 @@ func TestStore_RebuildAll_ResetsByteCounter(t *testing.T) {
 	}
 
 	// 1 new scope (overhead) + 2 items + reserved-scope overhead
-	// (post-rebuild init re-creates _events and _inbox).
-	expected := int64(scopeBufferOverhead) + approxItemSize(newItem("new", "n1", nil)) + approxItemSize(newItem("new", "n2", nil)) + reservedScopesOverhead
+	// (post-rebuild init re-creates _events and _inbox). Each item
+	// also carries a minted 36-byte uuid (+uuidStringLen).
+	expected := int64(scopeBufferOverhead) +
+		approxItemSize(newItem("new", "n1", nil)) + uuidStringLen +
+		approxItemSize(newItem("new", "n2", nil)) + uuidStringLen +
+		reservedScopesOverhead
 	if got := s.totalBytes.Load(); got != expected {
 		t.Fatalf("totalBytes=%d want %d (counter must be reset to new total)", got, expected)
 	}
