@@ -123,9 +123,13 @@ func (api *API) writeItemsResponse(
 	offset *int,
 ) {
 	// Pre-grow buf so the per-item appends don't trigger slice
-	// re-grows on the hot path. The 32-byte per-item slack covers
-	// the JSON skeleton plus seq/ts digits.
-	estCapacity := 192 + len(items)*32
+	// re-grows on the hot path. The 80-byte per-item slack covers
+	// the JSON skeleton + per-item comma (~44 bytes), max-width seq
+	// digits (~20), max-width ts digits (~20), and a small safety
+	// margin. Under-sizing here forces a slice-doubling memcpy of the
+	// full response on /tail-5k-style payloads — measured 500 KiB of
+	// wasted memcpy per request before this fix.
+	estCapacity := 192 + len(items)*80
 	for i := range items {
 		estCapacity += len(items[i].Scope) + len(items[i].ID) + len(items[i].Payload)
 	}
