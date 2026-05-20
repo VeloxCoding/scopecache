@@ -22,11 +22,9 @@ import (
 )
 
 // writeAck is the response shape /append and /upsert nest under
-// "item". Mirrors Item's JSON layout for scope/id/seq/ts/uuid but
+// "item". Mirrors Item's JSON layout for scope/id/seq/ts but
 // deliberately excludes Payload — the client supplied it on the way
 // in, and echoing it would double the wire cost on a 1 MiB write.
-// UUID carries the cache-minted identity back so the caller can
-// store it alongside the source-of-truth row.
 // ID is rendered via writeAckIDJSON so seq-only writes emit
 // `"id":null` rather than dropping the key — matches the uniform
 // item-shape rule applied across the read endpoints.
@@ -35,7 +33,6 @@ type writeAck struct {
 	ID    *string `json:"id"`
 	Seq   uint64  `json:"seq"`
 	Ts    int64   `json:"ts"`
-	UUID  string  `json:"uuid"`
 }
 
 // newWriteAck builds a writeAck from an Item, mapping an empty ID
@@ -47,7 +44,7 @@ func newWriteAck(item Item) writeAck {
 		id := item.ID
 		idPtr = &id
 	}
-	return writeAck{Scope: item.Scope, ID: idPtr, Seq: item.Seq, Ts: item.Ts, UUID: wireUUID(item.UUID)}
+	return writeAck{Scope: item.Scope, ID: idPtr, Seq: item.Seq, Ts: item.Ts}
 }
 
 func (api *API) handleAppend(w http.ResponseWriter, r *http.Request) {

@@ -2,15 +2,13 @@
 //
 //   - deleteByID     — single-item delete by id
 //   - deleteBySeq    — single-item delete by seq
-//   - deleteByUUID   — single-item delete by uuid
 //   - deleteUpToSeq  — drain the prefix [seq=1 .. seq=maxSeq] in one shot
-//   - deleteUpToUUID — same prefix drain, boundary named by a uuid
 //
-// All take b.mu exclusively, check b.detached first, and route byte
-// releases through the store-wide totalBytes counter. The low-level
-// helper deleteIndexLocked centralises the GC-zeroing, secondary-index
-// sync, and counter update so the callers cannot drift; the prefix
-// drains share deleteUpToSeqLocked.
+// All three take b.mu exclusively, check b.detached first, and route
+// byte releases through the store-wide totalBytes counter. The
+// low-level helper deleteIndexLocked centralises the GC-zeroing,
+// secondary-index sync, and counter update so the three callers cannot
+// drift.
 
 package scopecache
 
@@ -30,9 +28,7 @@ import "sort"
 //     payload bytes) and prevents GC.
 //  2. b.bytes and s.totalBytes update lockstep.
 //  3. byID delete is conditional on removed.ID != "" — empty-id
-//     items have no byID entry to remove; byUUID delete is conditional
-//     on removed.UUID != "" — orphan-buffer items carry no uuid.
-//     firstUUID / lastUUID are NOT touched: they survive deletes.
+//     items have no byID entry to remove.
 func (b *scopeBuffer) deleteIndexLocked(i int) {
 	removed := b.items[i]
 	removedSize := approxItemSize(*removed)
@@ -48,9 +44,6 @@ func (b *scopeBuffer) deleteIndexLocked(i int) {
 	if removed.ID != "" {
 		delete(b.byID, removed.ID)
 		b.idKeyBytes -= int64(len(removed.ID))
-	}
-	if !removed.UUID.IsZero() {
-		delete(b.byUUID, removed.UUID)
 	}
 
 	b.bytes -= removedSize
@@ -97,12 +90,11 @@ func (b *scopeBuffer) shrinkIfSparseLocked() {
 	copy(newItems, b.items)
 	// Rebuild maps from the surviving items so map bucket arrays
 	// also shrink. The maps re-key off the SAME pointers in newItems,
-	// preserving the items/byID/bySeq/byUUID aliasing. Pre-size by
+	// preserving the items/byID/bySeq aliasing. Pre-size by
 	// len(newItems) — a slight over-allocation when many items have
 	// empty IDs is cheaper than growing the map back up via appends.
 	newBySeq := make(map[uint64]*Item, len(newItems))
 	var newByID map[string]*Item
-	var newByUUID map[UUID]*Item
 	for i := range newItems {
 		newBySeq[newItems[i].Seq] = newItems[i]
 		if newItems[i].ID != "" {
@@ -111,17 +103,10 @@ func (b *scopeBuffer) shrinkIfSparseLocked() {
 			}
 			newByID[newItems[i].ID] = newItems[i]
 		}
-		if !newItems[i].UUID.IsZero() {
-			if newByUUID == nil {
-				newByUUID = make(map[UUID]*Item, len(newItems))
-			}
-			newByUUID[newItems[i].UUID] = newItems[i]
-		}
 	}
 	b.items = newItems
 	b.bySeq = newBySeq
 	b.byID = newByID
-	b.byUUID = newByUUID
 }
 
 // resetIfEmptyLocked drops the high-watermark backing storage when a
@@ -132,10 +117,9 @@ func (b *scopeBuffer) shrinkIfSparseLocked() {
 //
 // nil-ing is safe: write paths lazy-init the maps on first write
 // after a reset, and append() on a nil slice grows naturally.
-// b.lastSeq, b.firstUUID and b.lastUUID are intentionally not reset —
-// the seq cursor and the uuid span must stay stable across
-// drain/refill cycles so downstream consumers tracking them cannot
-// observe a regression.
+// b.lastSeq is intentionally not reset — the seq cursor must stay
+// monotonic across drain/refill cycles so downstream consumers
+// tracking it cannot observe a regression.
 //
 // PRECONDITION: caller holds b.mu and the delete that produced the
 // empty state has already updated b.bytes / counters.
@@ -146,7 +130,6 @@ func (b *scopeBuffer) resetIfEmptyLocked() {
 	b.items = nil
 	b.bySeq = nil
 	b.byID = nil
-	b.byUUID = nil
 	// b.idKeyBytes is already zero — every removed item subtracted its
 	// id length on delete; the explicit assignment is a defensive
 	// guard against future delete-paths that forget the subtract.
@@ -196,28 +179,6 @@ func (b *scopeBuffer) deleteBySeq(seq uint64) (int, error) {
 	return 1, nil
 }
 
-func (b *scopeBuffer) deleteByUUID(u UUID) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	if b.detached {
-		return 0, &ScopeDetachedError{}
-	}
-
-	existing, ok := b.byUUID[u]
-	if !ok {
-		return 0, nil
-	}
-
-	i, ok := b.indexBySeqLocked(existing.Seq)
-	if !ok {
-		// Defensive: byUUID and items stay in sync under b.mu.
-		return 0, nil
-	}
-	b.deleteIndexLocked(i)
-	return 1, nil
-}
-
 // deleteUpToSeq removes every item with Seq <= maxSeq. b.items is
 // always ordered ascending by Seq — appendItem assigns monotonic
 // seqs, and the delete paths preserve relative order of the
@@ -232,37 +193,12 @@ func (b *scopeBuffer) deleteUpToSeq(maxSeq uint64) (int, error) {
 	if b.detached {
 		return 0, &ScopeDetachedError{}
 	}
-	return b.deleteUpToSeqLocked(maxSeq), nil
-}
 
-// deleteUpToUUID drains the [seq=1 .. boundary.seq] prefix where the
-// boundary item is the one carrying `uuid`. A uuid not present in the
-// scope means the boundary item is already gone — drains run
-// front-to-back, so everything before it is gone too: a no-op (0).
-func (b *scopeBuffer) deleteUpToUUID(u UUID) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	if b.detached {
-		return 0, &ScopeDetachedError{}
-	}
-	boundary, ok := b.byUUID[u]
-	if !ok {
-		return 0, nil
-	}
-	return b.deleteUpToSeqLocked(boundary.Seq), nil
-}
-
-// deleteUpToSeqLocked removes every item with Seq <= maxSeq and
-// returns the count removed. PRECONDITION: caller holds b.mu and has
-// checked b.detached. b.items is seq-ascending so the cut point is a
-// binary search.
-func (b *scopeBuffer) deleteUpToSeqLocked(maxSeq uint64) int {
 	idx := sort.Search(len(b.items), func(i int) bool {
 		return b.items[i].Seq > maxSeq
 	})
 	if idx == 0 {
-		return 0
+		return 0, nil
 	}
 
 	var freedBytes int64
@@ -274,9 +210,6 @@ func (b *scopeBuffer) deleteUpToSeqLocked(maxSeq uint64) int {
 		if removed.ID != "" {
 			delete(b.byID, removed.ID)
 			freedIDKeyBytes += int64(len(removed.ID))
-		}
-		if !removed.UUID.IsZero() {
-			delete(b.byUUID, removed.UUID)
 		}
 	}
 	// Copy the kept suffix into a fresh backing array so the old one —
@@ -302,5 +235,5 @@ func (b *scopeBuffer) deleteUpToSeqLocked(maxSeq uint64) int {
 	// still matters for the maps (their buckets don't shrink on
 	// delete) when this drain emptied the scope.
 	b.resetIfEmptyLocked()
-	return idx
+	return idx, nil
 }

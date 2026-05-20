@@ -30,7 +30,7 @@ func (api *API) handleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	deleted, err := api.store.deleteOne(req.Scope, req.ID, req.Seq, req.UUID)
+	deleted, err := api.store.deleteOne(req.Scope, req.ID, req.Seq)
 	if err != nil {
 		if errors.Is(err, ErrInvalidInput) {
 			badRequest(w, err.Error())
@@ -67,7 +67,7 @@ func (api *API) handleDeleteUpTo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	deleted, err := api.store.deleteUpTo(req.Scope, req.MaxSeq, req.UUID)
+	deleted, err := api.store.deleteUpTo(req.Scope, req.MaxSeq)
 	if err != nil {
 		if errors.Is(err, ErrInvalidInput) {
 			badRequest(w, err.Error())

@@ -37,12 +37,10 @@ import "encoding/json"
 // cache marshals one writeEvent per committed mutation (when Mode
 // != Off) and stores the marshaled bytes as the entry's Item.Payload.
 // On the wire the `_events` Item exposes that wrapper under the JSON
-// key `event` and its own minted uuid under `event_uuid`
-// (Item.MarshalJSON in types.go switches both key names when scope is
-// `_events`). Inside the writeEvent the user-write's payload travels
-// under `payload` and the user-item's UUIDv7 under `uuid` — same key
-// names and meanings as on every other endpoint. One word, one
-// concept: `uuid` is always the user-item, `event_uuid` the event.
+// key `event` (Item.MarshalJSON in types.go switches the key name
+// when scope is `_events`); inside the writeEvent the user-write's
+// payload travels under `payload` — same key name and same meaning
+// as on every other endpoint. One word, one concept.
 //
 // Action-payload, not result-payload: the cache logs the inputs the
 // caller sent, never the result it computed. /counter_add events
@@ -53,12 +51,12 @@ import "encoding/json"
 //
 // Field shape per op:
 //
-//	append       — scope, id?, seq, ts, uuid, payload?
-//	upsert       — scope, id, seq, ts, uuid, payload?
-//	update       — scope, id|seq|uuid, payload? (no ts; updateBy* don't return it)
+//	append       — scope, id?, seq, ts, payload?
+//	upsert       — scope, id, seq, ts, payload?
+//	update       — scope, id|seq, payload?      (no ts; updateByID/Seq don't return it)
 //	counter_add  — scope, id, by                (no payload, no ts)
-//	delete       — scope, id|seq|uuid           (no payload, no ts)
-//	delete_up_to — scope, max_seq|uuid          (no id, no per-item seq, no payload, no ts)
+//	delete       — scope, id|seq                (no payload, no ts)
+//	delete_up_to — scope, max_seq               (no id, no per-item seq, no payload, no ts)
 //	warm         — ts                           (no scope: /warm replaces multiple scopes;
 //	                                             list omitted to avoid wire bloat)
 //	delete_scope — scope, ts                    (the scope being deleted)
@@ -81,7 +79,6 @@ type writeEvent struct {
 	ID      string          `json:"id,omitempty"`
 	Seq     uint64          `json:"seq,omitempty"`
 	Ts      int64           `json:"ts,omitempty"`
-	UUID    string          `json:"uuid,omitempty"`
 	Payload json.RawMessage `json:"payload,omitempty"`
 	By      *int64          `json:"by,omitempty"`
 	MaxSeq  uint64          `json:"max_seq,omitempty"`
@@ -126,40 +123,39 @@ func (s *store) eventsEnabled(scope string) bool {
 }
 
 // emitAppendEvent fires after a successful Store.appendOne commit.
-// uuid is the appended item's cache-minted UUIDv7 — the inner-
-// envelope identity a replicating drainer writes to its DB row.
-func (s *store) emitAppendEvent(scope, id string, seq uint64, ts int64, uuid string, payload json.RawMessage) {
+func (s *store) emitAppendEvent(scope, id string, seq uint64, ts int64, payload json.RawMessage) {
 	if !s.eventsEnabled(scope) {
 		return
 	}
 	s.emitEvent(writeEvent{
-		Op: "append", Scope: scope, ID: id, Seq: seq, Ts: ts, UUID: uuid, Payload: payload,
+		Op: "append", Scope: scope, ID: id, Seq: seq, Ts: ts, Payload: payload,
 	})
 }
 
 // emitUpsertEvent — same envelope as /append (scope, id, seq, ts,
-// uuid, payload). The created-vs-replaced distinction is not on the
-// wire: action-logging captures "upsert this id with this payload",
-// regardless of prior cache state. uuid is the item's identity —
-// freshly minted on create, the preserved one on replace.
-func (s *store) emitUpsertEvent(scope, id string, seq uint64, ts int64, uuid string, payload json.RawMessage) {
+// payload). The created-vs-replaced distinction is not on the wire:
+// action-logging captures "upsert this id with this payload",
+// regardless of prior cache state.
+func (s *store) emitUpsertEvent(scope, id string, seq uint64, ts int64, payload json.RawMessage) {
 	if !s.eventsEnabled(scope) {
 		return
 	}
 	s.emitEvent(writeEvent{
-		Op: "upsert", Scope: scope, ID: id, Seq: seq, Ts: ts, UUID: uuid, Payload: payload,
+		Op: "upsert", Scope: scope, ID: id, Seq: seq, Ts: ts, Payload: payload,
 	})
 }
 
-// emitUpdateEvent emits the addressing key the caller used: exactly
-// one of id, seq or uuid is non-zero (the other two omitempty off the
-// wire). No Ts on the wire — drainers needing freshness /get the item.
-func (s *store) emitUpdateEvent(scope, id string, seq uint64, uuid string, payload json.RawMessage) {
+// emitUpdateEvent emits one of two shapes depending on addressing:
+//   - by id: id non-empty, seq=0 (omitempty drops it from the wire)
+//   - by seq: id empty, seq non-zero
+//
+// No Ts on the wire — drainers needing freshness /get the item.
+func (s *store) emitUpdateEvent(scope, id string, seq uint64, payload json.RawMessage) {
 	if !s.eventsEnabled(scope) {
 		return
 	}
 	s.emitEvent(writeEvent{
-		Op: "update", Scope: scope, ID: id, Seq: seq, UUID: uuid, Payload: payload,
+		Op: "update", Scope: scope, ID: id, Seq: seq, Payload: payload,
 	})
 }
 
@@ -175,31 +171,28 @@ func (s *store) emitCounterAddEvent(scope, id string, by int64) {
 	})
 }
 
-// emitDeleteEvent — addressed by exactly one of id, seq or uuid (the
-// validator enforces the choose-one rule upstream). No payload, no
-// ts: scope + address fully capture the action. Caller (deleteOne)
-// emits only on hit.
-func (s *store) emitDeleteEvent(scope, id string, seq uint64, uuid string) {
+// emitDeleteEvent — addressed by id OR seq (validator enforces
+// id-xor-seq upstream). No payload, no ts: scope + address fully
+// capture the action. Caller (deleteOne) emits only on hit.
+func (s *store) emitDeleteEvent(scope, id string, seq uint64) {
 	if !s.eventsEnabled(scope) {
 		return
 	}
 	s.emitEvent(writeEvent{
-		Op: "delete", Scope: scope, ID: id, Seq: seq, UUID: uuid,
+		Op: "delete", Scope: scope, ID: id, Seq: seq,
 	})
 }
 
 // emitDeleteUpToEvent — bulk-delete with the cursor as action-vector.
-// The boundary travels as the caller addressed it: max_seq for the
-// seq form, uuid for the uuid form (the other omitempty off the
-// wire). Per-item seqs are not enumerated (drainers apply the same
-// delete-everything-up-to-the-boundary rule). Caller (deleteUpTo)
-// emits only on hit.
-func (s *store) emitDeleteUpToEvent(scope string, maxSeq uint64, uuid string) {
+// Only scope + maxSeq go on the wire; per-item seqs are not
+// enumerated (drainers apply the same delete-everything-<=N rule).
+// Caller (deleteUpTo) emits only on hit.
+func (s *store) emitDeleteUpToEvent(scope string, maxSeq uint64) {
 	if !s.eventsEnabled(scope) {
 		return
 	}
 	s.emitEvent(writeEvent{
-		Op: "delete_up_to", Scope: scope, UUID: uuid, MaxSeq: maxSeq,
+		Op: "delete_up_to", Scope: scope, MaxSeq: maxSeq,
 	})
 }
 

@@ -88,13 +88,9 @@ func writeMutationError(w http.ResponseWriter, err error, scopeForSFE string) {
 // decodeBody caps the request body at max bytes and decodes JSON into out.
 // The MaxBytesReader guard runs at read time, so it protects against clients
 // that omit Content-Length or stream chunked bodies just as much as sized ones.
-//
-// Three error shapes are distinguished so the caller's 400 is meaningful:
-// an exceeded-cap error, a field-level rejection that surfaces a known
-// sentinel (errInvalidUUIDv7 — a structurally valid JSON body whose `uuid`
-// value failed UUID.UnmarshalJSON, e.g. a non-v7 uuid in a /warm batch), and
-// a plain JSON syntax error. A second Decode is used to reject trailing
-// content (a second object or garbage after the first value), which
+// An exceeded-cap error is distinguished from a plain JSON syntax error so
+// callers can return a meaningful message. A second Decode is used to reject
+// trailing content (a second object or garbage after the first value), which
 // json.Decoder would otherwise silently ignore.
 func decodeBody(w http.ResponseWriter, r *http.Request, max int64, out interface{}) error {
 	r.Body = http.MaxBytesReader(w, r.Body, max)
@@ -104,9 +100,6 @@ func decodeBody(w http.ResponseWriter, r *http.Request, max int64, out interface
 		if errors.As(err, &mbe) {
 			return errors.New("the request body exceeds the maximum allowed size of " +
 				strconv.FormatInt(mbe.Limit, 10) + " bytes")
-		}
-		if errors.Is(err, errInvalidUUIDv7) {
-			return errInvalidUUIDv7
 		}
 		return errors.New("the request body must contain valid JSON")
 	}
@@ -222,26 +215,23 @@ func methodNotAllowed(w http.ResponseWriter, allowed string) {
 }
 
 // lookupTarget is the parsed form of /get's and /render's URL query:
-// a scope plus exactly one of id, seq or uuid. Built by
-// parseLookupTarget; the addressing mode is whichever of ID/UUID is
-// non-empty, else Seq.
+// a scope plus exactly one of id or seq. Built by parseLookupTarget.
 type lookupTarget struct {
 	Scope string
+	ByID  bool
 	ID    string
 	Seq   uint64
-	UUID  string
 }
 
-// parseLookupTarget pulls scope + exactly one of id/seq/uuid from the
-// query string and validates each. Scope errors are labelled with the
-// endpoint; the id/seq/uuid shape errors are endpoint-agnostic since
-// the rule is the same on every single-item read.
+// parseLookupTarget pulls scope + exactly one of id/seq from the query
+// string and validates each. Scope errors are labelled with the endpoint;
+// the id/seq shape errors are endpoint-agnostic since the rule is the same
+// on every single-item read.
 func parseLookupTarget(r *http.Request, endpoint string) (lookupTarget, error) {
 	query := r.URL.Query()
 	scope := query.Get("scope")
 	id := query.Get("id")
 	seqStr := query.Get("seq")
-	uuid := query.Get("uuid")
 
 	if err := validateScope(scope, endpoint); err != nil {
 		return lookupTarget{}, err
@@ -249,32 +239,15 @@ func parseLookupTarget(r *http.Request, endpoint string) (lookupTarget, error) {
 
 	hasID := id != ""
 	hasSeq := seqStr != ""
-	hasUUID := uuid != ""
-	n := 0
-	for _, h := range [...]bool{hasID, hasSeq, hasUUID} {
-		if h {
-			n++
-		}
-	}
-	if n != 1 {
-		return lookupTarget{}, errors.New("exactly one of 'id', 'seq' or 'uuid' must be provided")
+	if hasID == hasSeq {
+		return lookupTarget{}, errors.New("exactly one of 'id' or 'seq' must be provided")
 	}
 
 	if hasID {
 		if err := validateID(id); err != nil {
 			return lookupTarget{}, err
 		}
-		return lookupTarget{Scope: scope, ID: id}, nil
-	}
-
-	if hasUUID {
-		// Strict v7 check — a malformed uuid is a caller bug, rejected
-		// loudly with 400 rather than silently missing (same loud-on-
-		// malformed-address rule as seq=0 below).
-		if !isValidUUIDv7(uuid) {
-			return lookupTarget{}, errors.New("the 'uuid' parameter must be a valid UUIDv7")
-		}
-		return lookupTarget{Scope: scope, UUID: uuid}, nil
+		return lookupTarget{Scope: scope, ByID: true, ID: id}, nil
 	}
 
 	seq, err := strconv.ParseUint(seqStr, 10, 64)

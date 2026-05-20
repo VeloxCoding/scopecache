@@ -41,19 +41,11 @@ import (
 // walks every item) and assigned wholesale at commit time, so the
 // O(1) approxSizeBytesLocked path stays correct after a /warm or
 // /rebuild without forcing the commit to re-walk byID.
-//
-// byUUID, firstUUID and lastUUID are built the same way: a /warm or
-// /rebuild fully replaces the scope, so it also replaces the uuid
-// index and span (the seq cursor resets too — see the comment in
-// buildReplacementState).
 type scopeReplacement struct {
 	items      []*Item
 	byID       map[string]*Item
 	bySeq      map[uint64]*Item
-	byUUID     map[UUID]*Item
 	lastSeq    uint64
-	firstUUID  UUID
-	lastUUID   UUID
 	idKeyBytes int64
 }
 
@@ -62,18 +54,12 @@ type scopeReplacement struct {
 // to have already enforced the per-scope capacity; this function does not
 // trim — if len(items) exceeds the cap it would simply build an over-full
 // state. The capacity check lives in the Store layer so one place owns it.
-//
-// mintUUID controls the adopt-or-mint contract (see RFC): when true,
-// an item arriving without a uuid has one minted. Store-attached
-// callers pass true; an orphan test buffer passes false so its items
-// stay uuid-less, consistent with insertNewItemLocked's b.store guard.
-func buildReplacementState(items []Item, mintUUID bool) (scopeReplacement, error) {
+func buildReplacementState(items []Item) (scopeReplacement, error) {
 	if len(items) == 0 {
 		return scopeReplacement{
-			items:  []*Item{},
-			byID:   make(map[string]*Item),
-			bySeq:  make(map[uint64]*Item),
-			byUUID: make(map[UUID]*Item),
+			items: []*Item{},
+			byID:  make(map[string]*Item),
+			bySeq: make(map[uint64]*Item),
 		}, nil
 	}
 
@@ -113,13 +99,6 @@ func buildReplacementState(items []Item, mintUUID bool) (scopeReplacement, error
 		item.counter = nil
 		item.Seq = lastSeq
 		item.Ts = nowUs
-		// uuid: adopt the client-supplied value (validateWriteItem
-		// already verified v7 shape on the /warm//rebuild path) or
-		// mint a fresh one. !mintUUID (orphan test buffer) leaves it
-		// zero, consistent with insertNewItemLocked.
-		if item.UUID.IsZero() && mintUUID {
-			item.UUID = newUUIDv7()
-		}
 		// /warm and /rebuild's per-item validateWriteItem already filled
 		// renderBytes for string payloads; recompute defensively for
 		// internal callers / tests that bypass the validator.
@@ -142,29 +121,11 @@ func buildReplacementState(items []Item, mintUUID bool) (scopeReplacement, error
 		}
 	}
 
-	// byUUID + the per-scope uuid span. A duplicate uuid within the
-	// scope is a data error (the source supplied two rows with the
-	// same identity) — reject the whole batch, mirroring the byID
-	// duplicate check above.
-	byUUID := make(map[UUID]*Item, len(built))
-	for _, item := range built {
-		if item.UUID.IsZero() {
-			continue
-		}
-		if _, dup := byUUID[item.UUID]; dup {
-			return scopeReplacement{}, errors.New("duplicate 'uuid' value within scope: '" + formatUUID(item.UUID) + "'")
-		}
-		byUUID[item.UUID] = item
-	}
-
 	return scopeReplacement{
 		items:      built,
 		byID:       byID,
 		bySeq:      bySeq,
-		byUUID:     byUUID,
 		lastSeq:    lastSeq,
-		firstUUID:  built[0].UUID,
-		lastUUID:   built[len(built)-1].UUID,
 		idKeyBytes: idKeyBytes,
 	}, nil
 }
@@ -213,10 +174,7 @@ func (b *scopeBuffer) commitReplacement(r scopeReplacement, newBytes int64) {
 	b.items = r.items
 	b.byID = r.byID
 	b.bySeq = r.bySeq
-	b.byUUID = r.byUUID
 	b.lastSeq = r.lastSeq
-	b.firstUUID = r.firstUUID
-	b.lastUUID = r.lastUUID
 	b.lastWriteTS = now
 }
 
@@ -260,10 +218,7 @@ func (b *scopeBuffer) commitReplacementPreReserved(r scopeReplacement, newBytes 
 	b.items = r.items
 	b.byID = r.byID
 	b.bySeq = r.bySeq
-	b.byUUID = r.byUUID
 	b.lastSeq = r.lastSeq
-	b.firstUUID = r.firstUUID
-	b.lastUUID = r.lastUUID
 	b.lastWriteTS = now
 }
 
@@ -271,7 +226,7 @@ func (b *scopeBuffer) replaceAll(items []Item) ([]Item, error) {
 	if b.itemCapExceeded(len(items)) {
 		return nil, &ScopeFullError{Count: len(items), Cap: b.maxItems}
 	}
-	r, err := buildReplacementState(items, b.store != nil)
+	r, err := buildReplacementState(items)
 	if err != nil {
 		return nil, err
 	}

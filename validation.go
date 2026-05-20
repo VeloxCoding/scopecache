@@ -115,33 +115,19 @@ func requireID(id, endpoint string) error {
 	return checkKeyField("id", id, MaxIDBytes)
 }
 
-// validateIDSeqUUID enforces the "exactly one of id, seq or uuid"
-// addressing contract used by /update and /delete: passing none or
-// more than one is rejected. When an id is supplied its shape is
+// validateIDOrSeq enforces the "exactly one of id or seq" addressing
+// contract used by /update and /delete: passing neither (id=="" &&
+// seq==0) or both is rejected. When an id is supplied, its shape is
 // validated via checkKeyField; seq has no shape to validate beyond
 // the non-zero check.
-//
-// hasUUID / uuidValid are computed by the caller because the uuid
-// arrives typed differently per endpoint: /update reads a decoded
-// Item.UUID (shape already guaranteed by UUID.UnmarshalJSON on the
-// HTTP path), /delete reads a raw string off deleteRequest.
-func validateIDSeqUUID(endpoint, id string, seq uint64, hasUUID, uuidValid bool) error {
+func validateIDOrSeq(endpoint, id string, seq uint64) error {
 	hasID := id != ""
 	hasSeq := seq != 0
-	n := 0
-	for _, h := range [...]bool{hasID, hasSeq, hasUUID} {
-		if h {
-			n++
-		}
-	}
-	if n != 1 {
-		return errors.New("exactly one of 'id', 'seq' or 'uuid' must be provided for the '" + endpoint + "' endpoint")
+	if hasID == hasSeq {
+		return errors.New("exactly one of 'id' or 'seq' must be provided for the '" + endpoint + "' endpoint")
 	}
 	if hasID {
 		return checkKeyField("id", id, MaxIDBytes)
-	}
-	if hasUUID && !uuidValid {
-		return errors.New("the 'uuid' field must be a canonical lowercase UUIDv7 string for the '" + endpoint + "' endpoint")
 	}
 	return nil
 }
@@ -192,13 +178,6 @@ func checkItemSize(item *Item, maxItemBytes int64) error {
 		item.renderBytes = precomputeRenderBytes(item.Payload)
 	}
 	size := approxItemSize(*item)
-	if item.UUID.IsZero() {
-		// The cache mints a uuid after validation; charge its accounting
-		// cost now so the per-item cap is enforced on the post-write
-		// shape (approxItemSize charges the same uuidStringLen once the
-		// item carries a non-zero uuid).
-		size += uuidStringLen
-	}
 	if size > maxItemBytes {
 		return errors.New("the item's approximate size (" + strconv.FormatInt(size, 10) +
 			" bytes) exceeds the maximum of " + strconv.FormatInt(maxItemBytes, 10) + " bytes")
@@ -271,36 +250,6 @@ func rejectClientTs(item Item, endpoint string) error {
 	return nil
 }
 
-// rejectClientUUID catches a client-supplied uuid on a write that
-// mints its own (/append, /upsert). UUID is cache-owned there; a clear
-// 400 beats silently overwriting. Zero (field absent) passes. /warm
-// and /rebuild are the exception — they adopt-or-mint via
-// checkWriteUUID instead of calling this.
-func rejectClientUUID(item Item, endpoint string) error {
-	if !item.UUID.IsZero() {
-		return errors.New("the 'uuid' field is managed by the cache and must not be provided to the '" + endpoint + "' endpoint")
-	}
-	return nil
-}
-
-// checkWriteUUID enforces the per-endpoint uuid contract for the three
-// validateWriteItem callers. /append mints the uuid itself, so a
-// client-supplied one is rejected. /warm and /rebuild adopt-or-mint: a
-// supplied uuid is kept (it must be a well-formed UUIDv7), an absent
-// one is minted at commit time in buildReplacementState.
-//
-// The HTTP path already enforced v7 shape in UUID.UnmarshalJSON; the
-// isValidV7 guard here is for Go-API callers hand-building an Item.
-func checkWriteUUID(item Item, endpoint string) error {
-	if endpoint == "/append" {
-		return rejectClientUUID(item, endpoint)
-	}
-	if !item.UUID.IsZero() && !item.UUID.isValidV7() {
-		return errors.New("the 'uuid' field must be a canonical lowercase UUIDv7 string")
-	}
-	return nil
-}
-
 func validateWriteItem(item *Item, endpoint string, maxItemBytes int64) (returnErr error) {
 	defer func() { returnErr = wrapValidation(returnErr) }()
 	if err := validateScope(item.Scope, endpoint); err != nil {
@@ -327,9 +276,6 @@ func validateWriteItem(item *Item, endpoint string, maxItemBytes int64) (returnE
 	if err := rejectClientTs(*item, endpoint); err != nil {
 		return err
 	}
-	if err := checkWriteUUID(*item, endpoint); err != nil {
-		return err
-	}
 	return checkItemSize(item, maxItemBytes)
 }
 
@@ -353,9 +299,6 @@ func validateUpsertItem(item *Item, maxItemBytes int64) (returnErr error) {
 	if err := rejectClientTs(*item, "/upsert"); err != nil {
 		return err
 	}
-	if err := rejectClientUUID(*item, "/upsert"); err != nil {
-		return err
-	}
 	return checkItemSize(item, maxItemBytes)
 }
 
@@ -367,7 +310,7 @@ func validateUpdateItem(item *Item, maxItemBytes int64) (returnErr error) {
 	if isReservedScope(item.Scope) {
 		return errors.New("scope '" + item.Scope + "' is reserved; in-place mutation (/update) is not supported on the drain-stream scopes")
 	}
-	if err := validateIDSeqUUID("/update", item.ID, item.Seq, !item.UUID.IsZero(), item.UUID.isValidV7()); err != nil {
+	if err := validateIDOrSeq("/update", item.ID, item.Seq); err != nil {
 		return err
 	}
 	if err := validatePayload(item.Payload); err != nil {
@@ -416,9 +359,7 @@ func validateCounterAddRequest(req counterAddRequest, maxItemBytes int64) (by in
 	// provisioning a realistic per-item budget.
 	if maxItemBytes > 0 {
 		candidate := Item{Scope: req.Scope, ID: req.ID, counter: &counterCell{}}
-		// The cache mints a 36-char uuid on the counter create path;
-		// count it against the cap (the candidate above is pre-mint).
-		if size := approxItemSize(candidate) + uuidStringLen; size > maxItemBytes {
+		if size := approxItemSize(candidate); size > maxItemBytes {
 			return 0, fmt.Errorf("the counter item's approximate size (%d bytes) exceeds the maximum of %d bytes", size, maxItemBytes)
 		}
 	}
@@ -430,7 +371,7 @@ func validateDeleteRequest(req deleteRequest) (returnErr error) {
 	if err := validateScope(req.Scope, "/delete"); err != nil {
 		return err
 	}
-	return validateIDSeqUUID("/delete", req.ID, req.Seq, req.UUID != "", isValidUUIDv7(req.UUID))
+	return validateIDOrSeq("/delete", req.ID, req.Seq)
 }
 
 func validateDeleteScopeRequest(req deleteScopeRequest) (returnErr error) {
@@ -449,13 +390,8 @@ func validateDeleteUpToRequest(req deleteUpToRequest) (returnErr error) {
 	if err := validateScope(req.Scope, "/delete_up_to"); err != nil {
 		return err
 	}
-	hasSeq := req.MaxSeq != 0
-	hasUUID := req.UUID != ""
-	if hasSeq == hasUUID {
-		return errors.New("exactly one of 'max_seq' or 'uuid' must be provided for the '/delete_up_to' endpoint")
-	}
-	if hasUUID && !isValidUUIDv7(req.UUID) {
-		return errors.New("the 'uuid' field must be a canonical lowercase UUIDv7 string for the '/delete_up_to' endpoint")
+	if req.MaxSeq == 0 {
+		return errors.New("the 'max_seq' field is required and must be a positive integer for the '/delete_up_to' endpoint")
 	}
 	return nil
 }

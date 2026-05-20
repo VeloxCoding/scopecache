@@ -69,7 +69,7 @@ func (g *Gateway) RunInitCommand(ctx context.Context, command string, extraEnv [
 	// in file-header). A failure on the wipe is logged but not
 	// surfaced — an empty cache plus a stale event stream is still
 	// a working cache, and the next operator action will overwrite it.
-	if _, delErr := g.DeleteUpTo(EventsScopeName, math.MaxUint64, ""); delErr != nil {
+	if _, delErr := g.DeleteUpTo(EventsScopeName, math.MaxUint64); delErr != nil {
 		logf("init: clear %s: %v", EventsScopeName, delErr)
 	}
 

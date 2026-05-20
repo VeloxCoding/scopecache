@@ -187,14 +187,14 @@ func TestGateway_DeletesRoundtrip(t *testing.T) {
 	}
 
 	// Delete by id.
-	n, err := g.Delete("posts", "p-0", 0, "")
+	n, err := g.Delete("posts", "p-0", 0)
 	if err != nil || n != 1 {
 		t.Errorf("Delete(p-0): n=%d err=%v want (1, nil)", n, err)
 	}
 
 	// DeleteUpTo: remove items with seq <= 3 (so seq 1,2,3 — but 1 was
 	// already gone via id delete above; items 2 and 3 remain).
-	n, err = g.DeleteUpTo("posts", 3, "")
+	n, err = g.DeleteUpTo("posts", 3)
 	if err != nil {
 		t.Fatalf("DeleteUpTo: %v", err)
 	}

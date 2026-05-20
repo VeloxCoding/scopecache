@@ -6,15 +6,15 @@
 //     Multi-shard ops additionally acquire shard.mu in ascending
 //     shard-index order (see numShards comment in store.go).
 //
-//  2. scopeBuffer methods MUST NOT reach back up to acquire a
-//     scopeShard.mu while holding b.mu — that buf → shard order
-//     deadlocks against deleteScope, replaceScopes, wipe and
-//     rebuildAll, which all take shard.mu first and then individual
-//     buf.mu's. The only Store-side access an insert path makes under
-//     b.mu is the atomic byte/item counters (b.store.totalBytes.Add /
-//     b.store.reserveBytes) — lock-free, no buffer touched. UUID
-//     minting (newUUIDv7, uuid.go) is a pure package function with no
-//     shared state at all.
+//  2. scopeBuffer methods MUST NOT reach back up to acquire any
+//     Store-level lock — neither scopeShard.mu nor any future
+//     Store-side mutex — while holding b.mu. The only Store-state a
+//     scopeBuffer method may touch with b.mu held is the atomic
+//     counter (b.store.totalBytes.Add / b.store.reserveBytes); those
+//     take no locks. Reverse-direction locking (buf → shard) would
+//     deadlock against deleteScope, replaceScopes, wipe and
+//     rebuildAll, all of which take shard.mu first and then
+//     individual buf.mu's.
 //
 //  3. Read-path bookkeeping (recordRead) runs without taking b.mu —
 //     it bumps the readCountTotal and lastAccessTS atomics directly.
@@ -22,11 +22,11 @@
 //     without serialising on the read counters. See recordRead in
 //     buffer_heat.go.
 //
-//  4. items, byID, bySeq and byUUID hold *Item, and every index
-//     aliases the SAME *Item per entry. A method may mutate an item's
-//     fields in place through any one index under b.mu.Lock — the
-//     others observe it with no re-sync. But a method MUST NOT hand a
-//     raw *Item to a caller or retain one past the unlock: read paths
+//  4. items, byID and bySeq hold *Item, and all three indexes alias
+//     the SAME *Item per entry. A method may mutate an item's fields
+//     in place through any one index under b.mu.Lock — the other two
+//     observe it with no re-sync. But a method MUST NOT hand a raw
+//     *Item to a caller or retain one past the unlock: read paths
 //     deref-copy into a value Item before returning. A leaked *Item
 //     would let a caller mutate cache state outside b.mu.
 //
@@ -66,28 +66,17 @@ type scopeBuffer struct {
 	// learns the write did not take effect, rather than silently writing
 	// into an orphan buffer that is unreachable and about to be GC'd.
 	detached bool
-	// items, byID, bySeq and byUUID are pointer collections: every
-	// entry for a given item is the SAME *Item. An in-place field write
-	// through any one index is visible through the others — no re-sync
-	// needed. The insert paths (insertNewItemLocked, counterAddSlow's
-	// create branch, buildReplacementState) must therefore store one
-	// shared pointer into all of them; read paths must deref-copy
-	// before handing an item out so a caller never holds the live *Item.
-	items []*Item
-	byID  map[string]*Item
-	bySeq map[uint64]*Item
-	// byUUID indexes items by their cache-minted UUIDv7. Lazy-allocated
-	// like byID/bySeq; populated only when the buffer is store-attached
-	// (orphan test buffers mint no uuid, so their items have a zero
-	// UUID and no byUUID entry). The key is the raw 16-byte UUID — no
-	// per-entry string allocation.
-	byUUID  map[UUID]*Item
+	// items, byID and bySeq are pointer collections: every entry for a
+	// given item is the SAME *Item. An in-place field write through any
+	// one index is visible through the other two — no re-sync needed.
+	// The insert paths (insertNewItemLocked, counterAddSlow's create
+	// branch, buildReplacementState) must therefore store one shared
+	// pointer into all three; read paths must deref-copy before handing
+	// an item out so a caller never holds the live *Item.
+	items   []*Item
+	byID    map[string]*Item
+	bySeq   map[uint64]*Item
 	lastSeq uint64
-	// firstUUID / lastUUID hold the UUIDv7 of the oldest and newest
-	// item ever inserted into this scope. Set on insert, NEVER reset on
-	// delete (like lastSeq) so /scopelist can report the scope's span.
-	firstUUID UUID
-	lastUUID  UUID
 	// maxItems caps the number of items this scope may hold; writes
 	// past it produce *ScopeFullError. The unboundedScopeMaxItems
 	// sentinel (= 0) means "no count cap" — the write paths skip the

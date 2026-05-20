@@ -85,18 +85,17 @@ func (g *Gateway) CounterAdd(scope, id string, by int64) (int64, bool, error) {
 
 // --- Data-plane: deletes --------------------------------------------
 
-// Delete removes a single item addressed by exactly one of scope+id,
-// scope+seq or scope+uuid (pass "" / 0 for the unused keys).
+// Delete removes a single item addressed by scope+id (id != "") or
+// scope+seq (id == "").
 // Returns (deleted_count, err).
-func (g *Gateway) Delete(scope, id string, seq uint64, uuid string) (int, error) {
-	return g.store.deleteOne(scope, id, seq, uuid)
+func (g *Gateway) Delete(scope, id string, seq uint64) (int, error) {
+	return g.store.deleteOne(scope, id, seq)
 }
 
-// DeleteUpTo drains a scope's prefix up to a boundary given as exactly
-// one of maxSeq or uuid (pass 0 / "" for the unused one).
+// DeleteUpTo removes every item in the scope with seq <= maxSeq.
 // Returns (deleted_count, err).
-func (g *Gateway) DeleteUpTo(scope string, maxSeq uint64, uuid string) (int, error) {
-	return g.store.deleteUpTo(scope, maxSeq, uuid)
+func (g *Gateway) DeleteUpTo(scope string, maxSeq uint64) (int, error) {
+	return g.store.deleteUpTo(scope, maxSeq)
 }
 
 // DeleteScope removes the entire scope and every item in it.
@@ -171,37 +170,25 @@ func (g *Gateway) Tail(scope string, limit, offset int) ([]Item, bool, bool) {
 
 // GetByID returns (item, hit) at (scope, id).
 func (g *Gateway) GetByID(scope, id string) (Item, bool) {
-	item, hit := g.store.get(scope, id, 0, "")
+	item, hit := g.store.get(scope, id, 0)
 	return cloneItemPayload(item), hit
 }
 
 // GetBySeq returns (item, hit) at (scope, seq).
 func (g *Gateway) GetBySeq(scope string, seq uint64) (Item, bool) {
-	item, hit := g.store.get(scope, "", seq, "")
-	return cloneItemPayload(item), hit
-}
-
-// GetByUUID returns (item, hit) at (scope, uuid).
-func (g *Gateway) GetByUUID(scope, uuid string) (Item, bool) {
-	item, hit := g.store.get(scope, "", 0, uuid)
+	item, hit := g.store.get(scope, "", seq)
 	return cloneItemPayload(item), hit
 }
 
 // RenderByID returns (rendered_bytes, hit) for the item at (scope, id).
 func (g *Gateway) RenderByID(scope, id string) ([]byte, bool) {
-	rendered, hit := g.store.render(scope, id, 0, "")
+	rendered, hit := g.store.render(scope, id, 0)
 	return clonePayload(rendered), hit
 }
 
 // RenderBySeq returns (rendered_bytes, hit) for the item at (scope, seq).
 func (g *Gateway) RenderBySeq(scope string, seq uint64) ([]byte, bool) {
-	rendered, hit := g.store.render(scope, "", seq, "")
-	return clonePayload(rendered), hit
-}
-
-// RenderByUUID returns (rendered_bytes, hit) for the item at (scope, uuid).
-func (g *Gateway) RenderByUUID(scope, uuid string) ([]byte, bool) {
-	rendered, hit := g.store.render(scope, "", 0, uuid)
+	rendered, hit := g.store.render(scope, "", seq)
 	return clonePayload(rendered), hit
 }
 

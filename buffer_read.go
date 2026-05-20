@@ -4,7 +4,6 @@
 //   - sinceSeq    — window after a seq cursor, oldest-first (drives /head)
 //   - getByID     — single-item lookup by id (drives /get?id=, /render)
 //   - getBySeq    — single-item lookup by seq (drives /get?seq=)
-//   - getByUUID   — single-item lookup by uuid (drives /get?uuid=, /render?uuid=)
 //
 // All four take b.mu.RLock so multiple readers run concurrently. None
 // check b.detached: reading from a detached buffer returns the state
@@ -144,16 +143,6 @@ func (b *scopeBuffer) getBySeq(seq uint64) (Item, bool) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	item, ok := b.bySeq[seq]
-	if !ok {
-		return Item{}, false
-	}
-	return materialiseCounter(*item), true
-}
-
-func (b *scopeBuffer) getByUUID(u UUID) (Item, bool) {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-	item, ok := b.byUUID[u]
 	if !ok {
 		return Item{}, false
 	}

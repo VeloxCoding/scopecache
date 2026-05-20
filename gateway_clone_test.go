@@ -408,7 +408,6 @@ func TestGateway_CounterPointerDoesNotCrossBoundary_Append(t *testing.T) {
 	carrier.ID = ""
 	carrier.Seq = 0
 	carrier.Ts = 0
-	carrier.UUID = UUID{} // cache-owned; clear it to reuse the item as a fresh write
 	carrier.Payload = json.RawMessage(`{"title":"hello"}`)
 
 	committed, err := g.Append(carrier)
@@ -444,7 +443,6 @@ func TestGateway_CounterPointerDoesNotCrossBoundary_Upsert(t *testing.T) {
 	carrier.ID = "p-1"
 	carrier.Seq = 0
 	carrier.Ts = 0
-	carrier.UUID = UUID{} // cache-owned; clear it to reuse the item as a fresh write
 	carrier.Payload = json.RawMessage(`["a","b","c"]`)
 
 	if _, _, err := g.Upsert(carrier); err != nil {
@@ -479,7 +477,6 @@ func TestGateway_CounterPointerDoesNotCrossBoundary_Warm(t *testing.T) {
 	carrier.ID = "p-warmed"
 	carrier.Seq = 0 // /warm rejects client-supplied seq; mirror that here.
 	carrier.Ts = 0
-	carrier.UUID = UUID{} // cache-owned; clear it to reuse the item as a fresh write
 	carrier.Payload = json.RawMessage(`{"warm":true}`)
 
 	if _, err := g.Warm(map[string][]Item{"posts": {carrier}}); err != nil {

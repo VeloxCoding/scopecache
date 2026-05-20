@@ -82,7 +82,6 @@ A scope is a named partition, similar to a namespace or bucket. Each scope conta
 - `id` — optional stable application-owned identifier
 - `seq` — cache-owned sequence number, monotonically increasing per scope, assigned by ScopeCache on every append
 - `ts` — cache-owned microsecond timestamp, set by ScopeCache on every write; observability only, not searchable and not used for ordering
-- `uuid` — cache-minted UUIDv7 identity, assigned by ScopeCache when an item is created; a direct lookup key like `id` and `seq`
 - `payload` — required JSON value, treated as opaque application data
 
 ScopeCache does not inspect the payload for filtering or querying. Filtering, addressing, and cursoring only operate on official top-level item fields. IDs, when present, are plain strings whose meaning is decided by the application.
@@ -118,7 +117,7 @@ Because each scope is ordered by its cache-assigned `seq`, retrieving the latest
 /tail?scope=user:42:unread&limit=100
 ```
 
-**ScopeCache combines key-value style access with ordered per-scope collections.** Direct lookups by `id`, `seq`, or `uuid` behave like simple key-value reads, while the built-in sequence order makes operations such as `tail`, `head`, and `since(seq)` natural core primitives.
+**ScopeCache combines key-value style access with ordered per-scope collections.** Direct lookups by `id` or `seq` behave like simple key-value reads, while the built-in sequence order makes operations such as `tail`, `head`, and `since(seq)` natural core primitives.
 
 ## Main use cases
 
@@ -222,25 +221,24 @@ To fully unlock the potential of FrankenPHP, you need more than an embedded PHP 
 
 ScopeCache’s internal storage model is deliberately simple.
 
-Each scope owns one ordered slice of items, stored in append order. Around that slice, ScopeCache maintains lightweight hashmap indexes for direct lookup by `id`, `seq`, and `uuid`.
+Each scope owns one ordered slice of items, stored in append order. Around that slice, ScopeCache maintains lightweight hashmap indexes for direct lookup by `id` and `seq`.
 
 Conceptually, the core shape is:
 
 ```go
 type scopeBuffer struct {
-    items  []*Item            // primary storage, in append order
-    byID   map[string]*Item   // id   -> item
-    bySeq  map[uint64]*Item   // seq  -> item
-    byUUID map[UUID]*Item     // uuid -> item (cache-minted UUIDv7, a raw 16-byte value)
-    mu     sync.RWMutex       // one lock per scope
+    items []*Item             // primary storage, in append order
+    byID  map[string]*Item    // id  -> item
+    bySeq map[uint64]*Item    // seq -> item
+    mu    sync.RWMutex        // one lock per scope
 }
 ```
 
 The slice is the ordered storage. It defines the physical order of the data in memory and makes operations such as `head`, `tail`, and cursor-based reads natural.
 
-The maps exist to avoid scanning. A lookup by `id`, `seq`, or `uuid` is an O(1) hashmap lookup on average, independent of the number of items in the scope.
+The maps exist to avoid scanning. A lookup by `id` or `seq` is an O(1) hashmap lookup on average, independent of the number of items in the scope.
 
-The slice and all three maps hold pointers to the same items, so each item lives in memory once, no matter how many indexes address it.
+The slice and both maps hold pointers to the same items, so each item lives in memory once, no matter how many indexes address it.
 
 A classical key-value store is conceptually built around:
 

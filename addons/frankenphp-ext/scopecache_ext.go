@@ -345,7 +345,7 @@ func scopecache_delete(scope *C.zend_string, id *C.zend_string) unsafe.Pointer {
 	if gw == nil {
 		return nil
 	}
-	n, err := gw.Delete(zendStringView(scope), zendStringView(id), 0, "")
+	n, err := gw.Delete(zendStringView(scope), zendStringView(id), 0)
 	if err != nil {
 		return errorEnvelope(err.Error())
 	}
@@ -360,7 +360,7 @@ func scopecache_delete_by_seq(scope *C.zend_string, seq int64) unsafe.Pointer {
 	if gw == nil {
 		return nil
 	}
-	n, err := gw.Delete(zendStringView(scope), "", uint64(seq), "")
+	n, err := gw.Delete(zendStringView(scope), "", uint64(seq))
 	if err != nil {
 		return errorEnvelope(err.Error())
 	}
@@ -376,7 +376,7 @@ func scopecache_delete_up_to(scope *C.zend_string, maxSeq int64) unsafe.Pointer 
 	if gw == nil {
 		return nil
 	}
-	n, err := gw.DeleteUpTo(zendStringView(scope), uint64(maxSeq), "")
+	n, err := gw.DeleteUpTo(zendStringView(scope), uint64(maxSeq))
 	if err != nil {
 		return errorEnvelope(err.Error())
 	}

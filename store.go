@@ -665,7 +665,7 @@ func (s *store) appendOneTrusted(item Item) (Item, error) {
 	// per append. The recursive emitAppendEvent → appendOneTrusted
 	// (_events) frame still notifies _events because _events IS
 	// reserved, so EventsModeFull drainers stay woken correctly.
-	s.emitAppendEvent(result.Scope, result.ID, result.Seq, result.Ts, wireUUID(result.UUID), result.Payload)
+	s.emitAppendEvent(result.Scope, result.ID, result.Seq, result.Ts, result.Payload)
 	if isReservedScope(result.Scope) {
 		s.notifySubscriber(result.Scope)
 	}
@@ -691,7 +691,7 @@ func (s *store) upsertOne(item Item) (Item, bool, error) {
 		}
 		return result, itemCreated, upsertErr
 	}
-	s.emitUpsertEvent(result.Scope, result.ID, result.Seq, result.Ts, wireUUID(result.UUID), result.Payload)
+	s.emitUpsertEvent(result.Scope, result.ID, result.Seq, result.Ts, result.Payload)
 	return result, itemCreated, nil
 }
 
@@ -734,12 +734,12 @@ func (s *store) counterAddOne(scope, id string, by int64) (int64, bool, error) {
 	return value, counterCreated, nil
 }
 
-// updateOne mutates the payload of an item addressed by exactly one
-// of scope+id, scope+seq or scope+uuid. Returns (updated_count, err);
-// a missing scope is reported as (0, nil), the same wire shape an
-// absent address inside an existing scope would produce. The caller-
-// side validator enforces the choose-one invariant; updateOne routes
-// id → uuid → seq.
+// updateOne mutates the payload of an item addressed by scope+id or
+// scope+seq. Returns (updated_count, err); a missing scope is reported
+// as (0, nil), the same wire shape an absent id/seq inside an existing
+// scope would produce. The caller-side validator enforces the
+// id-xor-seq invariant; updateOne assumes id != "" picks the id path
+// and otherwise routes by seq.
 //
 // Emits an update event into `_events` ONLY on hit (updated > 0): a
 // miss is a no-op against cache state, so emitting it would be result-
@@ -758,32 +758,28 @@ func (s *store) updateOne(item Item) (int, error) {
 		updated int
 		err     error
 	)
-	switch {
-	case item.ID != "":
+	if item.ID != "" {
 		updated, err = buf.updateByID(item.ID, item.Payload, item.renderBytes)
-	case !item.UUID.IsZero():
-		updated, err = buf.updateByUUID(item.UUID, item.Payload, item.renderBytes)
-	default:
+	} else {
 		updated, err = buf.updateBySeq(item.Seq, item.Payload, item.renderBytes)
 	}
 	if err != nil {
 		return updated, err
 	}
 	if updated > 0 {
-		s.emitUpdateEvent(item.Scope, item.ID, item.Seq, wireUUID(item.UUID), item.Payload)
+		s.emitUpdateEvent(item.Scope, item.ID, item.Seq, item.Payload)
 	}
 	return updated, nil
 }
 
-// deleteOne removes a single item addressed by exactly one of
-// scope+id, scope+seq or scope+uuid. Returns (deleted_count, err);
-// missing scope reports (0, nil) — same miss shape as updateOne.
-// Validator-enforced choose-one invariant; routes id → uuid → seq.
+// deleteOne removes a single item by scope+id or scope+seq. Returns
+// (deleted_count, err); missing scope reports (0, nil) — same miss
+// shape as updateOne. Validator-enforced id-xor-seq invariant.
 //
 // Emits a delete event on hit (count > 0); see updateOne for the
 // action-logging-on-effective-change rationale.
-func (s *store) deleteOne(scope, id string, seq uint64, uuid string) (int, error) {
-	if err := validateDeleteRequest(deleteRequest{Scope: scope, ID: id, Seq: seq, UUID: uuid}); err != nil {
+func (s *store) deleteOne(scope, id string, seq uint64) (int, error) {
+	if err := validateDeleteRequest(deleteRequest{Scope: scope, ID: id, Seq: seq}); err != nil {
 		return 0, err
 	}
 	buf, ok := s.getScope(scope)
@@ -794,57 +790,38 @@ func (s *store) deleteOne(scope, id string, seq uint64, uuid string) (int, error
 		deleted int
 		err     error
 	)
-	switch {
-	case id != "":
+	if id != "" {
 		deleted, err = buf.deleteByID(id)
-	case uuid != "":
-		// validateDeleteRequest already confirmed canonical v7 shape,
-		// so the parse cannot fail here.
-		u, _ := parseUUIDv7(uuid)
-		deleted, err = buf.deleteByUUID(u)
-	default:
+	} else {
 		deleted, err = buf.deleteBySeq(seq)
 	}
 	if err != nil {
 		return deleted, err
 	}
 	if deleted > 0 {
-		s.emitDeleteEvent(scope, id, seq, uuid)
+		s.emitDeleteEvent(scope, id, seq)
 	}
 	return deleted, nil
 }
 
-// deleteUpTo drains a scope's prefix up to a boundary given as
-// exactly one of max_seq or uuid (the uuid form names the boundary
-// item; the store resolves it to that item's seq). Returns
-// (deleted_count, err); missing scope reports (0, nil). Emits a
-// delete_up_to event on hit (count > 0); a boundary that selects no
+// deleteUpTo removes every item in the scope with seq <= maxSeq.
+// Returns (deleted_count, err); missing scope reports (0, nil). Emits
+// a delete_up_to event on hit (count > 0); a cursor that selects no
 // items is a no-op against cache state and is not emitted.
-func (s *store) deleteUpTo(scope string, maxSeq uint64, uuid string) (int, error) {
-	if err := validateDeleteUpToRequest(deleteUpToRequest{Scope: scope, MaxSeq: maxSeq, UUID: uuid}); err != nil {
+func (s *store) deleteUpTo(scope string, maxSeq uint64) (int, error) {
+	if err := validateDeleteUpToRequest(deleteUpToRequest{Scope: scope, MaxSeq: maxSeq}); err != nil {
 		return 0, err
 	}
 	buf, ok := s.getScope(scope)
 	if !ok {
 		return 0, nil
 	}
-	var (
-		deleted int
-		err     error
-	)
-	if uuid != "" {
-		// validateDeleteUpToRequest already confirmed canonical v7
-		// shape, so the parse cannot fail here.
-		u, _ := parseUUIDv7(uuid)
-		deleted, err = buf.deleteUpToUUID(u)
-	} else {
-		deleted, err = buf.deleteUpToSeq(maxSeq)
-	}
+	deleted, err := buf.deleteUpToSeq(maxSeq)
 	if err != nil {
 		return deleted, err
 	}
 	if deleted > 0 {
-		s.emitDeleteUpToEvent(scope, maxSeq, uuid)
+		s.emitDeleteUpToEvent(scope, maxSeq)
 	}
 	return deleted, nil
 }
@@ -881,29 +858,19 @@ func (s *store) tail(scope string, limit, offset int) ([]Item, bool, bool) {
 	return items, truncated, true
 }
 
-// get returns one item by scope+id, scope+seq, or scope+uuid.
-// (item, found) — the found flag is true only when both the scope and
-// the item exist. recordRead fires on hit only. Addressing precedence
-// id → uuid → seq; callers supply exactly one (HTTP enforces it in
-// parseLookupTarget, Gateway via its per-mode methods).
-func (s *store) get(scope, id string, seq uint64, uuid string) (Item, bool) {
+// get returns one item by scope+id or scope+seq. (item, found) — the
+// found flag is true only when both the scope and the item exist.
+// recordRead fires on hit only.
+func (s *store) get(scope, id string, seq uint64) (Item, bool) {
 	buf, ok := s.getScope(scope)
 	if !ok {
 		return Item{}, false
 	}
 	var item Item
 	var found bool
-	switch {
-	case id != "":
+	if id != "" {
 		item, found = buf.getByID(id)
-	case uuid != "":
-		// Reads are permissive: a malformed uuid (only reachable via a
-		// Gateway caller — the HTTP layer pre-validates in
-		// parseLookupTarget) leaves found false, a clean miss.
-		if u, perr := parseUUIDv7(uuid); perr == nil {
-			item, found = buf.getByUUID(u)
-		}
-	default:
+	} else {
 		item, found = buf.getBySeq(seq)
 	}
 	if !found {
@@ -917,25 +884,16 @@ func (s *store) get(scope, id string, seq uint64, uuid string) (Item, bool) {
 // renderBytes shortcut for JSON-string payloads at the Store boundary
 // so the handler does not need to know the renderBytes field exists.
 // (bytes, found) — same hit semantics as get; recordRead fires on hit.
-// Addressing precedence id → uuid → seq, as in get.
-func (s *store) render(scope, id string, seq uint64, uuid string) ([]byte, bool) {
+func (s *store) render(scope, id string, seq uint64) ([]byte, bool) {
 	buf, ok := s.getScope(scope)
 	if !ok {
 		return nil, false
 	}
 	var item Item
 	var found bool
-	switch {
-	case id != "":
+	if id != "" {
 		item, found = buf.getByID(id)
-	case uuid != "":
-		// Reads are permissive: a malformed uuid (only reachable via a
-		// Gateway caller — the HTTP layer pre-validates in
-		// parseLookupTarget) leaves found false, a clean miss.
-		if u, perr := parseUUIDv7(uuid); perr == nil {
-			item, found = buf.getByUUID(u)
-		}
-	default:
+	} else {
 		item, found = buf.getBySeq(seq)
 	}
 	if !found {
@@ -1181,16 +1139,12 @@ func (s *store) listScopes() map[string]*scopeBuffer {
 }
 
 // scopeListEntry is one row in a /scopelist response: the scope name plus
-// the per-scope primitives §2.4 of the RFC maintains directly.
-// first_uuid / last_uuid are the scope's UUIDv7 span (empty on a
-// never-written scope). Field declaration order = wire field order
-// (encoding/json honours it).
+// the seven per-scope primitives §2.4 of the RFC maintains directly.
+// Field declaration order = wire field order (encoding/json honours it).
 type scopeListEntry struct {
 	Scope          string `json:"scope"`
 	ItemCount      int    `json:"item_count"`
 	LastSeq        uint64 `json:"last_seq"`
-	FirstUUID      UUID   `json:"first_uuid"`
-	LastUUID       UUID   `json:"last_uuid"`
 	ApproxScopeMB  MB     `json:"approx_scope_mb"`
 	CreatedTS      int64  `json:"created_ts"`
 	LastWriteTS    int64  `json:"last_write_ts"`
@@ -1261,8 +1215,6 @@ func (s *store) scopeList(prefix, after string, limit int) ([]scopeListEntry, bo
 			Scope:          r.name,
 			ItemCount:      st.ItemCount,
 			LastSeq:        st.LastSeq,
-			FirstUUID:      st.FirstUUID,
-			LastUUID:       st.LastUUID,
 			ApproxScopeMB:  st.ApproxScopeMB,
 			CreatedTS:      st.CreatedTS,
 			LastWriteTS:    st.LastWriteTS,
