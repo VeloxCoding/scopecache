@@ -3,13 +3,11 @@
 //   - /delete         — single-item delete by scope+id or scope+seq
 //   - /delete_up_to   — bulk-delete every item with seq <= max_seq
 //   - /delete_scope   — remove a whole scope
-//   - /wipe           — reset the store; reserved scopes are recreated
+//   - /wipe           — reset the store
 //
 // These endpoints have no built-in auth/admin tier; access control
 // belongs at the adapter, proxy, socket layer, or in an access-policy
-// addon. Store-side validation still protects reserved scopes where
-// the operation would violate their contract (e.g. /delete_scope on
-// `_events` or `_inbox` returns 400).
+// addon.
 
 package scopecache
 

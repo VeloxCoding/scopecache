@@ -43,16 +43,13 @@ func (b *scopeBuffer) deleteIndexLocked(i int) {
 	delete(b.bySeq, removed.Seq)
 	if removed.ID != "" {
 		delete(b.byID, removed.ID)
-		b.idKeyBytes -= int64(len(removed.ID))
 	}
 
 	b.bytes -= removedSize
 	now := nowUnixMicro()
-	if b.store != nil {
-		b.store.totalBytes.Add(-removedSize)
-		b.store.totalItems.Add(-1)
-		b.store.bumpLastWriteTS(now)
-	}
+	b.store.totalBytes.Add(-removedSize)
+	b.store.totalItems.Add(-1)
+	b.store.bumpLastWriteTS(now)
 	b.lastWriteTS = now
 	b.resetIfEmptyLocked()
 	b.shrinkIfSparseLocked()
@@ -130,10 +127,6 @@ func (b *scopeBuffer) resetIfEmptyLocked() {
 	b.items = nil
 	b.bySeq = nil
 	b.byID = nil
-	// b.idKeyBytes is already zero — every removed item subtracted its
-	// id length on delete; the explicit assignment is a defensive
-	// guard against future delete-paths that forget the subtract.
-	b.idKeyBytes = 0
 }
 
 func (b *scopeBuffer) deleteByID(id string) (int, error) {
@@ -202,14 +195,12 @@ func (b *scopeBuffer) deleteUpToSeq(maxSeq uint64) (int, error) {
 	}
 
 	var freedBytes int64
-	var freedIDKeyBytes int64
 	for i := 0; i < idx; i++ {
 		removed := b.items[i]
 		freedBytes += approxItemSize(*removed)
 		delete(b.bySeq, removed.Seq)
 		if removed.ID != "" {
 			delete(b.byID, removed.ID)
-			freedIDKeyBytes += int64(len(removed.ID))
 		}
 	}
 	// Copy the kept suffix into a fresh backing array so the old one —
@@ -223,13 +214,10 @@ func (b *scopeBuffer) deleteUpToSeq(maxSeq uint64) (int, error) {
 	b.items = rest
 
 	b.bytes -= freedBytes
-	b.idKeyBytes -= freedIDKeyBytes
 	now := nowUnixMicro()
-	if b.store != nil {
-		b.store.totalBytes.Add(-freedBytes)
-		b.store.totalItems.Add(-int64(idx))
-		b.store.bumpLastWriteTS(now)
-	}
+	b.store.totalBytes.Add(-freedBytes)
+	b.store.totalItems.Add(-int64(idx))
+	b.store.bumpLastWriteTS(now)
 	b.lastWriteTS = now
 	// `rest` already freed the items-slice backing array; the reset
 	// still matters for the maps (their buckets don't shrink on

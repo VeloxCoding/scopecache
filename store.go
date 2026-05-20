@@ -15,9 +15,9 @@
 //     the matching Adds in lockstep with the per-scope mutation —
 //     drift corrupts /stats silently.
 //   - **lastWriteTS.** Store-wide freshness signal, advanced via
-//     bumpLastWriteTS (CAS-max). User-write success bumps it; counter
-//     activity is silent (see buffer_counter.go), and pre-create /
-//     rollback paths must NOT bump or polling clients see ghost ticks.
+//     bumpLastWriteTS (CAS-max). User-write success bumps it; pre-
+//     create / rollback paths must NOT bump or polling clients see
+//     ghost ticks.
 //   - **Byte budget.** reserveBytes is the only path that may push
 //     totalBytes upward. Positive deltas use a CAS loop with overflow-
 //     safe arithmetic; negative deltas (releases) always succeed. A
@@ -80,8 +80,7 @@ type store struct {
 	// walks.
 	//
 	// Lockstep paths to maintain:
-	//   - item insert: insertNewItemLocked + counterAdd create
-	//     branch — totalItems.Add(+1) under b.mu.
+	//   - item insert: insertNewItemLocked — totalItems.Add(+1) under b.mu.
 	//   - item delete: deleteIndexLocked Add(-1); deleteUpToSeq
 	//     Add(-N) for the batch.
 	//   - bulk replace: commitReplacement(PreReserved) computes
@@ -255,9 +254,10 @@ func (s *store) reserveBytes(delta int64) (bool, int64, int64) {
 }
 
 // addClampedInt64 returns a + b, saturating at math.MaxInt64 / math.MinInt64
-// instead of wrapping. Used to derive caps (eventsMaxItemBytes) from operator
-// inputs that could be near the int64 boundary without making the derived cap
-// silently negative. Callers stay correct under any pathological config.
+// instead of wrapping. Used by request-body cap helpers (bulkRequestBytesFor,
+// singleRequestBytesFor) to derive request-body limits from operator inputs
+// that could be near the int64 boundary without producing a silently
+// negative cap. Callers stay correct under any pathological config.
 func addClampedInt64(a, b int64) int64 {
 	if b > 0 && a > math.MaxInt64-b {
 		return math.MaxInt64
@@ -285,16 +285,21 @@ func addClampedInt64(a, b int64) int64 {
 // matches actual memory pressure, not just item bytes.
 const scopeBufferOverhead = 1024
 
-// newscopeBuffer builds a fresh scopeBuffer bound to this store so its
-// mutations can participate in byte tracking. Keeping this helper on the
-// store means every production path creates bound buffers; tests that
-// exercise scopeBuffer in isolation use newscopeBuffer directly and
-// accept that byte tracking is a no-op there.
+// newscopeBuffer builds a fresh scopeBuffer bound to this store. Per-
+// scope item-count and per-item byte caps live on the store (s.defaultMaxItems,
+// s.maxItemBytes), so the buffer carries only the per-scope mutable
+// state. items, byID and bySeq grow on-demand — pre-allocating any of
+// them under unique-scope-per-write workloads (millions of one-item
+// buffers) is a GC bottleneck, and items without an `id` never need
+// byID at all. Write paths and replaceItemAtIndexLocked lazily
+// initialise these maps before assigning into them.
 func (s *store) newscopeBuffer() *scopeBuffer {
-	b := newscopeBuffer(s.defaultMaxItems)
-	b.store = s
-	b.maxItemBytes = s.maxItemBytes
-	return b
+	now := nowUnixMicro()
+	return &scopeBuffer{
+		store:       s,
+		createdTS:   now,
+		lastWriteTS: now,
+	}
 }
 
 func (s *store) getOrCreateScope(scope string) (*scopeBuffer, error) {
@@ -303,11 +308,11 @@ func (s *store) getOrCreateScope(scope string) (*scopeBuffer, error) {
 }
 
 // getOrCreateScopeTrackingCreated is the variant used by the atomic
-// write paths (appendOne, upsertOne, counterAddOne) that need to know
-// whether the buffer was freshly allocated by this call. Callers use
-// the `created` flag to roll the empty scope back when the subsequent
-// item-byte reservation fails — see cleanupIfEmptyAndUnused. All other
-// callers go through getOrCreateScope, which discards the flag.
+// write paths (appendOne, upsertOne) that need to know whether the
+// buffer was freshly allocated by this call. Callers use the
+// `created` flag to roll the empty scope back when the subsequent
+// item-byte reservation fails — see cleanupIfEmptyAndUnused. All
+// other callers go through getOrCreateScope, which discards the flag.
 func (s *store) getOrCreateScopeTrackingCreated(scope string) (*scopeBuffer, bool, error) {
 	if scope == "" {
 		return nil, false, errors.New("the 'scope' field is required")
@@ -466,12 +471,6 @@ func (s *store) upsertOne(item Item) (Item, bool, error) {
 // scope would produce. The caller-side validator enforces the
 // id-xor-seq invariant; updateOne assumes id != "" picks the id path
 // and otherwise routes by seq.
-//
-// Emits an update event into `_events` ONLY on hit (updated > 0): a
-// miss is a no-op against cache state, so emitting it would be result-
-// logging (the request) rather than action-logging (the change).
-// Drainers replaying `_events` against an empty cache produce the
-// same final state without these noise entries.
 func (s *store) updateOne(item Item) (int, error) {
 	if err := validateUpdateItem(&item, s.maxItemBytes); err != nil {
 		return 0, err
@@ -680,10 +679,9 @@ func (s *store) getScope(scope string) (*scopeBuffer, bool) {
 
 func (s *store) deleteScope(scope string) (int, bool, error) {
 	// validateDeleteScopeRequest enforces the same shape rules as
-	// /delete_scope (scope present + non-reserved). Empty scope
-	// triggers the validator's "scope required" reject; reserved scope
-	// triggers the "is reserved" reject — both come back wrapped in
-	// ErrInvalidInput so the handler can map to 400.
+	// /delete_scope: empty scope triggers the validator's "scope
+	// required" reject, wrapped in ErrInvalidInput so the handler can
+	// map to 400.
 	if err := validateDeleteScopeRequest(deleteScopeRequest{Scope: scope}); err != nil {
 		return 0, false, err
 	}

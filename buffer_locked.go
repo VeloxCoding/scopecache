@@ -3,12 +3,11 @@
 // never lock internally. precomputeRenderBytes is pure and
 // lock-agnostic.
 //
-// The helpers centralise the concerns that previously drifted across
-// parallel call-sites: bytes-accounting and counter-cell cleanup on
-// payload-replace. Secondary-index "sync" is no longer one of them —
-// items, byID and bySeq alias one *Item per entry, so an in-place
-// field write is visible through every index — but a forgotten
-// bytes-accounting update still leaks state silently.
+// The helpers centralise bytes-accounting on payload-replace.
+// Secondary-index "sync" is not one of them — items, byID and bySeq
+// alias one *Item per entry, so an in-place field write is visible
+// through every index — but a forgotten bytes-accounting update
+// still leaks state silently.
 
 package scopecache
 
@@ -36,9 +35,8 @@ func precomputeRenderBytes(payload json.RawMessage) []byte {
 }
 
 // reservePayloadDeltaLocked reserves (newSize − oldSize) against the
-// store-wide byte budget when delta != 0 and the buffer is store-
-// attached, and returns the delta so the caller can update b.bytes
-// consistently after a successful mutation.
+// store-wide byte budget when delta != 0 and returns the delta so the
+// caller can update b.bytes consistently after a successful mutation.
 //
 // PRECONDITION: caller holds b.mu.
 //
@@ -46,7 +44,7 @@ func precomputeRenderBytes(payload json.RawMessage) []byte {
 // state mutated, caller returns the error without rollback.
 func (b *scopeBuffer) reservePayloadDeltaLocked(oldSize, newSize int64) (int64, error) {
 	delta := newSize - oldSize
-	if b.store != nil && delta != 0 {
+	if delta != 0 {
 		ok, current, max := b.store.reserveBytes(delta)
 		if !ok {
 			return 0, &StoreFullError{StoreBytes: current, AddedBytes: delta, Cap: max}
@@ -56,18 +54,17 @@ func (b *scopeBuffer) reservePayloadDeltaLocked(oldSize, newSize int64) (int64, 
 }
 
 // itemCapExceeded reports whether `proposed` items would violate the
-// per-scope item-count cap. The unbounded sentinel (b.maxItems == 0,
-// set by maxItemsFor for `_events`) disables the check — that
-// scope's contract is "byte budget only".
+// per-scope item-count cap (b.store.defaultMaxItems).
 //
 // Single-item callers pass len(b.items) + 1; bulk callers pass the
 // proposed batch size.
 //
-// Lock-agnostic: b.maxItems is set once at buffer construction and
-// never reassigned. Callers that also read len(b.items) still hold
-// b.mu so the (proposed, len) pair is consistent.
+// Lock-agnostic: b.store.defaultMaxItems is set once at store
+// construction and never reassigned. Callers that also read
+// len(b.items) still hold b.mu so the (proposed, len) pair is
+// consistent.
 func (b *scopeBuffer) itemCapExceeded(proposed int) bool {
-	return b.maxItems > 0 && proposed > b.maxItems
+	return proposed > b.store.defaultMaxItems
 }
 
 // payloadAndRenderBytes returns the byte cost approxItemSize charges
@@ -96,9 +93,7 @@ func (b *scopeBuffer) replaceItemAtIndexLocked(i int, payload json.RawMessage, t
 	b.items[i].renderBytes = renderBytes
 	b.bytes += delta
 	b.lastWriteTS = ts
-	if b.store != nil {
-		b.store.bumpLastWriteTS(ts)
-	}
+	b.store.bumpLastWriteTS(ts)
 }
 
 // indexBySeqLocked returns the slice position of the item with seq in

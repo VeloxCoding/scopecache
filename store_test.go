@@ -202,11 +202,11 @@ func TestStore_render_PeelsJSONString(t *testing.T) {
 	}
 }
 
-// appendOne, upsertOne, counterAddOne must roll back the freshly-created
-// scope when the item-byte reservation fails. Without rollback, every
-// failed write to a new scope would leak scopeBufferOverhead onto the
-// store-byte cap — a multi-tenant attacker could fill the cap with
-// empty scopes and DoS legitimate writers (see ChatGPT bug review).
+// appendOne and upsertOne must roll back the freshly-created scope
+// when the item-byte reservation fails. Without rollback, every failed
+// write to a new scope would leak scopeBufferOverhead onto the store-
+// byte cap — a multi-tenant attacker could fill the cap with empty
+// scopes and DoS legitimate writers.
 
 // bigPayload returns a JSON string payload of approximately the given
 // total byte count. Used by the rollback tests to push past the
@@ -333,8 +333,6 @@ func TestStore_DeleteScope(t *testing.T) {
 // post-fix it must return ok=false.
 func TestStore_ReserveBytes_DoesNotFailOpenOnInt64Overflow(t *testing.T) {
 	s := newStore(Config{ScopeMaxItems: 100, MaxStoreBytes: math.MaxInt64, MaxItemBytes: 1 << 20})
-	// Drop totalBytes back to a known baseline so the math is exact —
-	// newStore pre-creates reserved scopes which moves it forward.
 	s.totalBytes.Store(math.MaxInt64 - 100)
 
 	ok, current, gotCap := s.reserveBytes(200)
@@ -353,10 +351,11 @@ func TestStore_ReserveBytes_DoesNotFailOpenOnInt64Overflow(t *testing.T) {
 	}
 }
 
-// addClampedInt64 saturates instead of wrapping. The eventsMaxItemBytes
-// derivation (`MaxItemBytes + eventsItemEnvelopeOverhead`) uses it so
-// pathological MaxItemBytes values can't produce a negative cap that
-// silently rejects every _events write.
+// addClampedInt64 saturates instead of wrapping at the int64
+// boundary. The request-body cap helpers (bulkRequestBytesFor,
+// singleRequestBytesFor) use it so a near-MaxInt64 operator cap can't
+// produce a negative request-body cap that silently rejects every
+// write.
 func TestAddClampedInt64(t *testing.T) {
 	cases := []struct {
 		a, b, want int64
@@ -493,26 +492,21 @@ func TestStore_LastWriteTS_StartsAtZero(t *testing.T) {
 	}
 }
 
-// TestNewStore_PreCreatesReservedScopes_NonReserved verifies the negative
-// half of the init contract: NewStore creates exactly the reserved scopes,
-// nothing else. Probes a handful of names that are NOT in the
-// reservedScopeNames list (including underscore-prefixed names that
-// might be confused with reserved-by-prefix) to make sure they don't
-// exist on a fresh store.
-func TestNewStore_PreCreatesReservedScopes_NonReserved(t *testing.T) {
+// TestNewStore_NoPreCreatedScopes verifies that NewStore does not
+// pre-create any scopes. All scopes are user-managed; they appear on
+// first write and disappear on /delete_scope or /wipe.
+func TestNewStore_NoPreCreatedScopes(t *testing.T) {
 	s := newStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
 
 	for _, name := range []string{
-		"thread:42",     // ordinary user scope
-		"events",        // ordinary user scope
-		"_tokens",       // addon-convention prefix; NOT reserved by core
-		"_counters_x",   // same
-		"_events_extra", // close to reserved name but not exactly
-		"_inbox2",       // same
-		"_",             // underscore alone
+		"thread:42",
+		"events",
+		"_tokens",     // addon-convention prefix; nothing special about underscore
+		"_counters_x", // same
+		"_",           // underscore alone
 	} {
 		if _, ok := s.getScope(name); ok {
-			t.Errorf("scope %q exists on fresh store; only the reserved names should be pre-created", name)
+			t.Errorf("scope %q exists on fresh store; no scope should be pre-created", name)
 		}
 	}
 }

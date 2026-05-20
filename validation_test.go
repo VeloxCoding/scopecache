@@ -145,11 +145,10 @@ func TestValidateWriteItem_RejectsMissingAndNullPayload(t *testing.T) {
 // Direct Gateway callers (Append/Upsert/Update/Warm/Rebuild) hand
 // json.RawMessage in as-is, so the validator is the only place that
 // can catch malformed JSON before the bytes reach the store and
-// propagate to /get, /head, /tail, /render and `_events` envelopes.
-// The HTTP path's encoding/json decode would already fail these
-// shapes during the structural scan that fills RawMessage; the
-// validator's json.Valid check makes the same guarantee for direct
-// Go callers.
+// propagate to /get, /head, /tail and /render. The HTTP path's
+// encoding/json decode would already fail these shapes during the
+// structural scan that fills RawMessage; the validator's json.Valid
+// check makes the same guarantee for direct Go callers.
 func TestValidateWriteItem_RejectsInvalidJSON(t *testing.T) {
 	cases := []struct {
 		name    string

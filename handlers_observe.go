@@ -8,17 +8,10 @@
 // than JSON — it is documentation the cache hands out about itself, not
 // observability data.
 //
-// /stats is aggregate-only for user-managed scopes — at 100k+ scopes
-// the per-scope enumeration dominated /stats latency and the response
-// routinely blew past practical client/proxy limits. Per-scope detail
-// for user scopes lives at /scopelist, which pages it via a stable
-// alphabetical cursor.
-//
-// reserved_scopes is the small, fixed exception: `_events` and
-// `_inbox` are cache infrastructure (drainer-backlog and fan-in queue
-// depth) that operators monitor independently of user scopes. The set
-// is bounded by the reserved-scope list (currently 2 entries), so
-// /stats stays O(1) regardless of total scope count.
+// /stats is aggregate-only — at 100k+ scopes the per-scope
+// enumeration dominated /stats latency and the response routinely
+// blew past practical client/proxy limits. Per-scope detail lives at
+// /scopelist, which pages it via a stable alphabetical cursor.
 
 package scopecache
 

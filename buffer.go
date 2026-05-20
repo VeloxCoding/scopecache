@@ -41,7 +41,6 @@
 //	                     reservePayloadDeltaLocked)
 //	buffer_heat.go     — lock-free recordRead bookkeeping
 //	buffer_write.go    — appendItem, upsertByID, updateByID, updateBySeq
-//	buffer_counter.go  — counterAdd, parseCounterValue
 //	buffer_delete.go   — deleteByID, deleteBySeq, deleteUpToSeq, deleteIndexLocked
 //	buffer_replace.go  — scopeReplacement type, build / commit pipeline, replaceAll
 //	buffer_read.go     — tailOffset, sinceSeq, getByID, getBySeq
@@ -56,9 +55,12 @@ import (
 
 type scopeBuffer struct {
 	mu sync.RWMutex
-	// store is set when the buffer is owned by a Store. When nil (orphan
-	// buffers used in unit tests) byte-budget accounting is skipped — the
-	// tests exercise item-count and seq logic without spinning up a store.
+	// store is always non-nil: production buffers are built by
+	// s.newscopeBuffer() and bind to their owning store, test buffers
+	// go through newTestBuffer which wires a permissive private store
+	// internally. The per-scope item-count cap and per-item byte cap
+	// both read from b.store directly so admission rules cannot drift
+	// between a per-scope cache and the store-level source of truth.
 	store *store
 	// detached is set true when the buffer has been unlinked from its Store
 	// by /delete_scope, /wipe or /rebuild. Writes that reach a detached
@@ -69,44 +71,20 @@ type scopeBuffer struct {
 	// items, byID and bySeq are pointer collections: every entry for a
 	// given item is the SAME *Item. An in-place field write through any
 	// one index is visible through the other two — no re-sync needed.
-	// The insert paths (insertNewItemLocked, counterAddSlow's create
-	// branch, buildReplacementState) must therefore store one shared
-	// pointer into all three; read paths must deref-copy before handing
-	// an item out so a caller never holds the live *Item.
+	// The insert paths (insertNewItemLocked, buildReplacementState)
+	// must therefore store one shared pointer into all three; read
+	// paths must deref-copy before handing an item out so a caller
+	// never holds the live *Item.
 	items   []*Item
 	byID    map[string]*Item
 	bySeq   map[uint64]*Item
 	lastSeq uint64
-	// maxItems caps the number of items this scope may hold; writes
-	// past it produce *ScopeFullError. The unboundedScopeMaxItems
-	// sentinel (= 0) means "no count cap" — the write paths skip the
-	// check entirely. Only the reserved `_events` scope is created with
-	// the sentinel (best-effort observability gated by the global byte
-	// budget alone); every other scope, including `_inbox`, gets a
-	// concrete positive cap installed at create time. See maxItemsFor
-	// in store.go for the per-scope dispatch.
-	maxItems int
-	// maxItemBytes caches store.maxItemBytesFor(scope) at create time
-	// so insertNewItemLocked's per-item cap check is a single int64
-	// compare rather than a method call with string-switch dispatch
-	// under b.mu.Lock(). The cache eliminates roughly 15% RPS on
-	// contended-scope hot paths (append-same on the bench) where
-	// every nanosecond of held lock-time amplifies through the wait
-	// queue.
-	maxItemBytes int64
 	// bytes is the running sum of approxItemSize(item) over items. Only
 	// mutated under b.mu; the store-level total is kept in sync via
 	// s.reserveBytes (single-item write paths) and
 	// scopeBuffer.commitReplacement (bulk /warm and /rebuild).
-	bytes int64
-	// idKeyBytes is the running sum of len(item.ID) over items with a
-	// non-empty ID. Lets approxSizeBytesLocked surface a per-scope
-	// memory estimate in O(1) without re-walking byID. Mutated under
-	// b.mu by every path that mutates b.byID. Observability-only —
-	// NOT charged against the store-byte cap (admission control stays
-	// layout-independent).
-	idKeyBytes int64
-	createdTS  int64
+	bytes     int64
+	createdTS int64
 	// lastWriteTS is the microsecond timestamp of the most recent
 	// write that touched this scope. Set under b.mu by every write
 	// path; read under b.mu.RLock by stats(). Initialised equal to
@@ -121,23 +99,4 @@ type scopeBuffer struct {
 	// workloads. Keep it atomic.
 	lastAccessTS   atomic.Int64
 	readCountTotal atomic.Uint64
-}
-
-func newscopeBuffer(maxItems int) *scopeBuffer {
-	// items, byID and bySeq grow on-demand. Pre-allocating any of
-	// them on every scope-create is the wrong default: under unique-
-	// scope-per-write workloads (millions of one-item buffers) the
-	// pre-alloc was a GC bottleneck, and items without an `id` never
-	// need byID at all.
-	//
-	// Write paths (buffer_write.go, buffer_counter.go) and
-	// replaceItemAtIndexLocked lazily initialise these maps before
-	// assigning into them. Reads, deletes, len and range are nil-safe
-	// in Go and need no guard.
-	now := nowUnixMicro()
-	return &scopeBuffer{
-		maxItems:    maxItems,
-		createdTS:   now,
-		lastWriteTS: now,
-	}
 }

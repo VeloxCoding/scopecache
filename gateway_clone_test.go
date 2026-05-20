@@ -364,27 +364,3 @@ func TestClonePayload_DistinctBackingArray(t *testing.T) {
 		t.Errorf("mutation of clone reached input: in=%q", in)
 	}
 }
-
-// --- Counter-pointer round-trip hazard -------------------------------
-//
-// approxItemSize and the read path both consult the unexported
-// counter pointer on Item. If a counter Item retrieved via Gateway.Get
-// keeps that pointer set, the caller can swap exported fields and pass
-// it back through Append/Upsert/Warm/Rebuild — and the cache will
-// happily store a "counter-shaped" item in the new slot. Result:
-// MaxItemBytes is under-counted (counterCellOverhead replaces
-// len(Payload)) and reads return the original counter value instead
-// of the freshly-supplied payload bytes. Silent data corruption.
-//
-// The fix lives in two places:
-//   - Gateway clone helpers strip counter+renderBytes on every cross
-//     of the public boundary (input + output), so callers can never
-//     observe nor smuggle the unexported state.
-//   - Buffer write paths (insertNewItemLocked, buildReplacementState)
-//     defensively clear counter on entry, covering future internal
-//     callers that might bypass the Gateway clone.
-//
-// The tests below exercise both layers. Each one uses an actual
-// Gateway round-trip (Get → caller-mutate → write → Get) so the
-// observable contract is "caller sees what they wrote", not a more
-// brittle "internal field is zero" assertion.

@@ -21,34 +21,29 @@ package scopecache
 // approx_scope_mb this function surfaces does not.
 //
 // O(1) by construction: every term is a constant, a slice/map length,
-// or an incrementally-maintained counter (b.bytes, b.idKeyBytes).
+// or an incrementally-maintained counter (b.bytes).
 //
-// Term breakdown — the per-entry constants are deliberately rough
-// fixed estimates, not a precise model of Go's runtime layout. Since
-// the conversion to pointer indexes, items/byID/bySeq each hold an
-// *Item, so a real entry costs a small slice/map slot plus a share of
-// the separately heap-allocated Item struct; the flat constants below
-// approximate that and are observability-only (admission control uses
-// store.totalBytes, which is layout-independent).
+// Term breakdown — the per-entry constants are estimates that
+// roll Go's runtime map/slice layout plus typical inline value sizes
+// into a single per-entry number. Each *Item lives on the heap once;
+// the items/byID/bySeq entries hold pointers into it.
 //   - 64                : *scopeBuffer struct overhead (constant)
 //   - len(b.items) * 32 : per-item slice slot + *Item heap estimate
 //   - b.bytes           : Σ approxItemSize(item)
-//   - len(b.byID) * 32  : per-entry byID map overhead estimate
-//   - b.idKeyBytes      : Σ len(item.ID) over the byID keys
-//   - len(b.bySeq) * 16 : per-entry bySeq map overhead estimate
+//   - len(b.byID) * 64  : per-entry byID bucket + assumed id-key bytes
+//   - len(b.bySeq) * 16 : per-entry bySeq bucket (uint64 keys, inline)
 //
 // PRECONDITION: caller holds b.mu (read or write).
 func (b *scopeBuffer) approxSizeBytesLocked() int64 {
 	const structOverhead = int64(64)
 	const itemSlotOverhead = int64(32)
-	const byIDBucketOverhead = int64(32)
+	const byIDBucketOverhead = int64(64)
 	const bySeqBucketOverhead = int64(16)
 
 	return structOverhead +
 		int64(len(b.items))*itemSlotOverhead +
 		b.bytes +
 		int64(len(b.byID))*byIDBucketOverhead +
-		b.idKeyBytes +
 		int64(len(b.bySeq))*bySeqBucketOverhead
 }
 

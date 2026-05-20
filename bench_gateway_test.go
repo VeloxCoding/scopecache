@@ -33,8 +33,8 @@ import (
 //
 //   - 64 B    — tiny structured event ("op":"create","id":"abc")
 //   - 1 KiB   — typical small record
-//   - 64 KiB  — _inbox per-item cap default; medium structured doc
-//   - 1 MiB   — global per-item cap default; pre-rendered HTML page
+//   - 64 KiB  — medium structured doc
+//   - 1 MiB   — per-item cap default; pre-rendered HTML page
 //
 // The clone cost is dominated by memmove → expect ns/op to scale
 // roughly linearly with size. B/op shows the extra alloc per call.

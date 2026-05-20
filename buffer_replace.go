@@ -36,17 +36,11 @@ import (
 // swapped into a scopeBuffer. Separating "prepare" from "commit" lets callers
 // like /warm and /rebuild validate every scope up-front and only mutate state
 // once they know all scopes will succeed.
-//
-// idKeyBytes is computed during buildReplacementState (which already
-// walks every item) and assigned wholesale at commit time, so the
-// O(1) approxSizeBytesLocked path stays correct after a /warm or
-// /rebuild without forcing the commit to re-walk byID.
 type scopeReplacement struct {
-	items      []*Item
-	byID       map[string]*Item
-	bySeq      map[uint64]*Item
-	lastSeq    uint64
-	idKeyBytes int64
+	items   []*Item
+	byID    map[string]*Item
+	bySeq   map[uint64]*Item
+	lastSeq uint64
 }
 
 // buildReplacementState converts a caller-supplied item list into the
@@ -106,20 +100,17 @@ func buildReplacementState(items []Item) (scopeReplacement, error) {
 	}
 
 	byID := make(map[string]*Item, nonEmptyIDs)
-	var idKeyBytes int64
 	for _, item := range built {
 		if item.ID != "" {
 			byID[item.ID] = item
-			idKeyBytes += int64(len(item.ID))
 		}
 	}
 
 	return scopeReplacement{
-		items:      built,
-		byID:       byID,
-		bySeq:      bySeq,
-		lastSeq:    lastSeq,
-		idKeyBytes: idKeyBytes,
+		items:   built,
+		byID:    byID,
+		bySeq:   bySeq,
+		lastSeq: lastSeq,
 	}, nil
 }
 
@@ -150,20 +141,17 @@ func (b *scopeBuffer) commitReplacement(r scopeReplacement, newBytes int64) {
 	defer b.mu.Unlock()
 
 	now := time.Now().UnixMicro()
-	if b.store != nil {
-		b.store.totalBytes.Add(newBytes - b.bytes)
-		// itemDelta uses the CURRENT len(b.items) under b.mu, not a
-		// pre-snapshot, so a stale-pointer concurrent /append that
-		// landed between the caller's snapshot and this commit is
-		// folded into the delta naturally — its +1 to totalItems is
-		// undone here because its item is being discarded by the
-		// swap. No drift parameter needed (unlike newBytes - oldSnapshot
-		// for bytes, which is pre-reserved in the PreReserved variant).
-		b.store.totalItems.Add(int64(len(r.items)) - int64(len(b.items)))
-		b.store.bumpLastWriteTS(now)
-	}
+	b.store.totalBytes.Add(newBytes - b.bytes)
+	// itemDelta uses the CURRENT len(b.items) under b.mu, not a
+	// pre-snapshot, so a stale-pointer concurrent /append that
+	// landed between the caller's snapshot and this commit is
+	// folded into the delta naturally — its +1 to totalItems is
+	// undone here because its item is being discarded by the
+	// swap. No drift parameter needed (unlike newBytes - oldSnapshot
+	// for bytes, which is pre-reserved in the PreReserved variant).
+	b.store.totalItems.Add(int64(len(r.items)) - int64(len(b.items)))
+	b.store.bumpLastWriteTS(now)
 	b.bytes = newBytes
-	b.idKeyBytes = r.idKeyBytes
 	b.items = r.items
 	b.byID = r.byID
 	b.bySeq = r.bySeq
@@ -195,19 +183,16 @@ func (b *scopeBuffer) commitReplacementPreReserved(r scopeReplacement, newBytes 
 	defer b.mu.Unlock()
 
 	now := time.Now().UnixMicro()
-	if b.store != nil {
-		drift := b.bytes - oldSnapshot
-		if drift != 0 {
-			b.store.totalBytes.Add(-drift)
-		}
-		// totalItems has no pre-reservation: len(b.items) under the
-		// lock captures any concurrent /append's contribution
-		// naturally — its item is being discarded by the swap.
-		b.store.totalItems.Add(int64(len(r.items)) - int64(len(b.items)))
-		b.store.bumpLastWriteTS(now)
+	drift := b.bytes - oldSnapshot
+	if drift != 0 {
+		b.store.totalBytes.Add(-drift)
 	}
+	// totalItems has no pre-reservation: len(b.items) under the
+	// lock captures any concurrent /append's contribution
+	// naturally — its item is being discarded by the swap.
+	b.store.totalItems.Add(int64(len(r.items)) - int64(len(b.items)))
+	b.store.bumpLastWriteTS(now)
 	b.bytes = newBytes
-	b.idKeyBytes = r.idKeyBytes
 	b.items = r.items
 	b.byID = r.byID
 	b.bySeq = r.bySeq
@@ -217,7 +202,7 @@ func (b *scopeBuffer) commitReplacementPreReserved(r scopeReplacement, newBytes 
 
 func (b *scopeBuffer) replaceAll(items []Item) ([]Item, error) {
 	if b.itemCapExceeded(len(items)) {
-		return nil, &ScopeFullError{Count: len(items), Cap: b.maxItems}
+		return nil, &ScopeFullError{Count: len(items), Cap: b.store.defaultMaxItems}
 	}
 	r, err := buildReplacementState(items)
 	if err != nil {

@@ -80,19 +80,13 @@ func (g *Gateway) DeleteUpTo(scope string, maxSeq uint64) (int, error) {
 
 // DeleteScope removes the entire scope and every item in it.
 // Returns (deleted_item_count, found, err).
-// Reserved scopes are rejected with ErrInvalidInput.
 func (g *Gateway) DeleteScope(scope string) (int, bool, error) {
 	return g.store.deleteScope(scope)
 }
 
-// Wipe drops every scope (user-managed AND reserved) and resets the
-// byte counter, then re-creates the reserved scopes (`_events`,
-// `_inbox`) under the same all-shard write lock so subscribers do
-// not observe a gap.
+// Wipe drops every scope and resets the byte counter.
 // Returns (scope_count, total_items, freed_bytes) reflecting the
-// pre-wipe state across ALL scopes — the just-dropped reserved
-// scopes count toward these totals. A freshly-booted store wiped
-// immediately therefore returns (2, 0, 2 * scopeBufferOverhead).
+// pre-wipe state.
 func (g *Gateway) Wipe() (int, int, int64) {
 	return g.store.wipe()
 }
@@ -103,17 +97,14 @@ func (g *Gateway) Wipe() (int, int, int64) {
 // validation failure.
 
 // Warm replaces the contents of every scope present in `grouped`.
+// Scopes not in `grouped` are left untouched.
 // Returns the number of scopes affected.
-// Scopes not in `grouped` are left untouched; reserved scopes are
-// rejected.
 func (g *Gateway) Warm(grouped map[string][]Item) (int, error) {
 	return g.store.replaceScopes(cloneGroupedItemPayloads(grouped))
 }
 
-// Rebuild atomically replaces the entire user-managed cache state
-// with `grouped`.
+// Rebuild atomically replaces the entire cache state with `grouped`.
 // Returns (scope_count, item_count, err).
-// Reserved scopes are wiped and re-created.
 func (g *Gateway) Rebuild(grouped map[string][]Item) (int, int, error) {
 	return g.store.rebuildAll(cloneGroupedItemPayloads(grouped))
 }

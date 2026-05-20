@@ -26,7 +26,7 @@ import (
 // a returned item's scalar fields must not change stored state — if a
 // read method ever returned the live *Item this fails.
 func TestPointerSafety_BufferReadReturnsValueCopy(t *testing.T) {
-	buf := newscopeBuffer(100)
+	buf := newTestBuffer(100)
 	for _, id := range []string{"a", "b", "c"} {
 		if _, err := buf.appendItem(Item{Scope: "s", ID: id, Payload: json.RawMessage(`{"v":1}`)}); err != nil {
 			t.Fatalf("append %s: %v", id, err)

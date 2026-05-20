@@ -1,18 +1,13 @@
 // Single-item write handlers on the public mux:
 //
-//   - /append       — insert; rejects on dup id, capacity, or byte cap
-//   - /upsert       — insert-or-replace by id; replace-whole-item semantics
-//   - /update       — modify payload at an existing id or seq
-//   - /counter_add  — atomic int64 add on existing id; auto-creates on miss
+//   - /append   — insert; rejects on dup id, capacity, or byte cap
+//   - /upsert   — insert-or-replace by id; replace-whole-item semantics
+//   - /update   — modify payload at an existing id or seq
 //
-// All four decode an Item body, run shape validation (which rejects
-// reserved scopes where applicable), route through the matching
-// store method (appendOne / upsertOne / counterAddOne / updateOne),
-// and map errors uniformly. /append, /upsert, /update use the shared
-// writeMutationError helper (handlers.go) — ErrInvalidInput → 400,
-// capacity → 507, else 409. /counter_add stays inline because it has
-// two extra error types (*CounterPayloadError → 409,
-// *CounterOverflowError → 400) that don't fit the helper's vocabulary.
+// All three decode an Item body, run shape validation, route through
+// the matching store method (appendOne / upsertOne / updateOne), and
+// map errors uniformly via writeMutationError (handlers.go):
+// ErrInvalidInput → 400, capacity → 507, else 409.
 
 package scopecache
 

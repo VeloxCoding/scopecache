@@ -140,9 +140,8 @@ func validateIDOrSeq(endpoint, id string, seq uint64) error {
 // the structural scan that populates RawMessage, but direct Gateway
 // callers (Append / Upsert / Update / Warm / Rebuild) hand the slice
 // in as-is. Without the explicit json.Valid check, invalid bytes
-// would be stored opaquely and re-served by /get, /head, /tail,
-// /render and `_events` envelopes, breaking any downstream consumer
-// that json.Unmarshals.
+// would be stored opaquely and re-served by /get, /head, /tail and
+// /render, breaking any downstream consumer that json.Unmarshals.
 //
 // The UTF-8 check closes the same round-trip-corruption hazard
 // checkKeyField guards on scope/id: json.Valid accepts a bare 0x80

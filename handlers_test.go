@@ -1122,11 +1122,6 @@ func mustScopeNames(t *testing.T, out map[string]interface{}) []string {
 // Cursor pagination: limit + after is the only paging mode shipped.
 // `truncated` flips when more matching scopes exist past the page,
 // and resuming with after=<last scope> walks the next page.
-//
-// Reserved scopes (_events, _inbox) sort before every user scope because
-// '_' (0x5F) < 'a' (0x61). This test uses after=_zzz as the initial
-// cursor to skip past reserved scopes and exercise pagination on the
-// user-managed scopes alone.
 func TestScopelist_LimitAndAfterCursor(t *testing.T) {
 	h, _ := newTestHandler(10)
 	scopes := []string{"a", "b", "c", "d", "e"}
@@ -1135,7 +1130,7 @@ func TestScopelist_LimitAndAfterCursor(t *testing.T) {
 		_, _, _ = doRequest(t, h, "POST", "/append", body)
 	}
 
-	_, out, _ := doRequest(t, h, "GET", "/scopelist?limit=2&after=_zzz", "")
+	_, out, _ := doRequest(t, h, "GET", "/scopelist?limit=2", "")
 	if !mustBool(t, out, "truncated") {
 		t.Error("truncated=false on limit=2 with 5 scopes")
 	}
@@ -1227,12 +1222,10 @@ func TestScopelist_MethodNotAllowed(t *testing.T) {
 }
 
 // Empty store → empty array, count=0, truncated=false. Wire-format check
-// that no client sees null instead of []. Uses after=_zzz to skip past
-// the reserved scopes (_events, _inbox) that NewStore pre-creates so the
-// "empty" assertion exercises the empty-result code path.
+// that no client sees null instead of [].
 func TestScopelist_EmptyStore(t *testing.T) {
 	h, _ := newTestHandler(10)
-	_, out, _ := doRequest(t, h, "GET", "/scopelist?after=_zzz", "")
+	_, out, _ := doRequest(t, h, "GET", "/scopelist", "")
 	if mustFloat(t, out, "count") != 0 {
 		t.Errorf("count=%v want 0", out["count"])
 	}
@@ -1472,73 +1465,6 @@ func TestRace_ParallelMixedWorkload(t *testing.T) {
 	// it also exercises every concurrent write/delete path against the
 	// atomic counters.
 	assertStatsCountersInvariant(t, api.store, "after parallel race workload")
-}
-
-// --- Reserved-scope HTTP-level integration tests -----------------------------
-//
-// These exercise the reservation contract end-to-end via the HTTP handler
-// rather than via the validator or Store-method layer alone. They pin the
-// guarantees an operator actually relies on:
-//   - /append on _inbox round-trips the item, and the per-scope counters
-//     in /scopelist plus the store-wide counters in /stats reflect the
-//     append correctly.
-//   - The drainer pattern (append → tail → delete_up_to) actually frees
-//     items + bytes on a reserved scope.
-//   - The HTTP layer rejects every operation that the reservation contract
-//     forbids (/upsert, /update, /counter_add, /delete_scope, /warm,
-//     /rebuild) with status 400.
-//   - /wipe restores the reserved-scope baseline (scopes=2, items=0,
-//     small but non-zero approx_store_mb) so subscribers attached to
-//     either reserved scope find their target still present.
-
-// newReservedScopesTestHandler constructs a Store + API with a custom
-// Config so the per-reserved-scope cap tests can drive the knobs that
-// the default newTestHandler doesn't expose. Same shape as that helper
-// — accepts Config, hands you (mux, api).
-func newReservedScopesTestHandler(t *testing.T, cfg Config) (http.Handler, *API) {
-	t.Helper()
-	api := NewAPI(NewGateway(cfg), APIConfig{})
-	mux := http.NewServeMux()
-	api.RegisterRoutes(mux)
-	return mux, api
-}
-
-// _events's per-item byte cap derivation (max(MaxItemBytes,
-// Inbox.MaxItemBytes) + 1 KiB envelope slack) is verified via:
-//
-//   - TestNewStore_DerivesReservedScopeCaps — the field-level
-//     derivation under several Config shapes.
-//   - TestEvents_AutoPopulate_FullModeNoDropOnLargeInboxWrite — the
-//     end-to-end path: a large _inbox /append in EventsModeFull
-//     auto-populates an event that fits the derived cap.
-//
-// Direct /append on _events used to drive a third synthetic check
-// here ("does _events accept a payload past the user's MaxItemBytes
-// but within the derived cap"), but with /append _events now closed
-// the synthetic path is gone. The two coverage points above test
-// the same underlying derivation through the only paths that can
-// still reach it.
-
-// eventsTailCount is a tiny helper for the auto-populate tests that
-// follow: hits /tail on `_events`, asserts the response is OK, and
-// returns the count + items list. Mirrors the inlined pattern used
-// elsewhere in this file but factored out because the auto-populate
-// tests all need the same probe.
-func eventsTailCount(t *testing.T, h http.Handler) (int, []map[string]interface{}) {
-	t.Helper()
-	code, out, raw := doRequest(t, h, "GET", "/tail?scope=_events&limit=100", "")
-	if code != 200 {
-		t.Fatalf("/tail _events: code=%d body=%s", code, raw)
-	}
-	count := int(mustFloat(t, out, "count"))
-	rawItems, _ := out["items"].([]interface{})
-	items := make([]map[string]interface{}, 0, len(rawItems))
-	for _, ri := range rawItems {
-		if m, ok := ri.(map[string]interface{}); ok {
-			items = append(items, m)
-		}
-	}
-	return count, items
 }
 
 // --- response marshal-failure path --------------------------------------------

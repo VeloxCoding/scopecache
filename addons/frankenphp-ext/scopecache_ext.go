@@ -378,8 +378,7 @@ func scopecache_delete_scope(scope *C.zend_string) unsafe.Pointer {
 }
 
 // scopecache_wipe — POST /wipe envelope. `scopes` / `items` count what
-// was dropped (reserved scopes are dropped + immediately re-created,
-// so a fresh-booted wipe still reports scopes=2).
+// was dropped.
 //
 // export_php:function scopecache_wipe(): ?string
 func scopecache_wipe() unsafe.Pointer {
@@ -500,9 +499,8 @@ func scopecache_warm(grouped *C.zend_array) unsafe.Pointer {
 }
 
 // scopecache_rebuild — POST /rebuild envelope. Atomically replaces the
-// entire user-managed cache state with `grouped`; reserved scopes are
-// re-created under the same all-shard write lock. Unlike /warm, scopes
-// not in `grouped` are dropped.
+// entire cache state with `grouped`. Unlike /warm, scopes not in
+// `grouped` are dropped.
 //
 // export_php:function scopecache_rebuild(array $grouped): ?string
 func scopecache_rebuild(grouped *C.zend_array) unsafe.Pointer {

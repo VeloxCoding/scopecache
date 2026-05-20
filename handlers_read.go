@@ -309,12 +309,9 @@ func (api *API) handleGet(w http.ResponseWriter, r *http.Request) {
 // Wire-format compatibility:
 //   - The envelope shape is identical to the previous orderedFields
 //     emission: ok, hit, count, item, approx_response_mb.
-//   - For items in the reserved _events scope the payload-bearing
-//     field is named "event" (matching Item.MarshalJSON's special
-//     case); otherwise it is "payload".
 //   - Field-omission rules mirror Item's struct tags: scope, id,
-//     and seq are dropped when zero-valued; ts and the payload-
-//     bearing field are always present on a hit.
+//     and seq are dropped when zero-valued; ts and payload are
+//     always present on a hit.
 //
 // approx_response_mb is computed from a single estimated total
 // rather than the convergence loop in marshalWithApproxSize. The

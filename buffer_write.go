@@ -35,7 +35,7 @@ func (b *scopeBuffer) appendItem(item Item) (Item, error) {
 	}
 
 	if b.itemCapExceeded(len(b.items) + 1) {
-		return Item{}, &ScopeFullError{Count: len(b.items), Cap: b.maxItems}
+		return Item{}, &ScopeFullError{Count: len(b.items), Cap: b.store.defaultMaxItems}
 	}
 
 	if item.ID != "" {
@@ -73,7 +73,7 @@ func (b *scopeBuffer) upsertByID(item Item) (Item, bool, error) {
 			newRender = precomputeRenderBytes(item.Payload)
 		}
 		delta := int64(len(item.Payload)+len(newRender)) - payloadAndRenderBytes(existing)
-		if b.store != nil && delta != 0 {
+		if delta != 0 {
 			ok, current, max := b.store.reserveBytes(delta)
 			if !ok {
 				return Item{}, false, &StoreFullError{StoreBytes: current, AddedBytes: delta, Cap: max}
@@ -95,14 +95,12 @@ func (b *scopeBuffer) upsertByID(item Item) (Item, bool, error) {
 		// writes above are already visible through every index.
 		b.bytes += delta
 		b.lastWriteTS = nowUs
-		if b.store != nil {
-			b.store.bumpLastWriteTS(nowUs)
-		}
+		b.store.bumpLastWriteTS(nowUs)
 		return *b.items[i], false, nil
 	}
 
 	if b.itemCapExceeded(len(b.items) + 1) {
-		return Item{}, false, &ScopeFullError{Count: len(b.items), Cap: b.maxItems}
+		return Item{}, false, &ScopeFullError{Count: len(b.items), Cap: b.store.defaultMaxItems}
 	}
 
 	// Reuse the replace branch's nowUs so create-vs-replace is
@@ -135,8 +133,7 @@ func (b *scopeBuffer) updateByID(id string, payload json.RawMessage, preRender [
 	}
 
 	// Scope/id are unchanged on /update, so the byte delta reduces to
-	// new vs old payload-bytes (payloadAndRenderBytes handles the
-	// counter-item case).
+	// new vs old payload-bytes via payloadAndRenderBytes.
 	newRender := preRender
 	if newRender == nil {
 		newRender = precomputeRenderBytes(payload)
@@ -186,18 +183,16 @@ func (b *scopeBuffer) updateBySeq(seq uint64, payload json.RawMessage, preRender
 	// via seq. updateByID needs no re-check: its validator path sees
 	// the stored id (the request *is* the address), so request-side
 	// and stored-side approxItemSize agree by construction.
-	if b.store != nil {
-		maxItemBytes := b.store.maxItemBytes
-		candidate := Item{
-			Scope:       existing.Scope,
-			ID:          existing.ID,
-			Payload:     payload,
-			renderBytes: newRender,
-		}
-		if size := approxItemSize(candidate); size > maxItemBytes {
-			return 0, fmt.Errorf("%w: the item's approximate size (%d bytes) exceeds the maximum of %d bytes",
-				ErrInvalidInput, size, maxItemBytes)
-		}
+	maxItemBytes := b.store.maxItemBytes
+	candidate := Item{
+		Scope:       existing.Scope,
+		ID:          existing.ID,
+		Payload:     payload,
+		renderBytes: newRender,
+	}
+	if size := approxItemSize(candidate); size > maxItemBytes {
+		return 0, fmt.Errorf("%w: the item's approximate size (%d bytes) exceeds the maximum of %d bytes",
+			ErrInvalidInput, size, maxItemBytes)
 	}
 
 	delta, err := b.reservePayloadDeltaLocked(
@@ -227,7 +222,7 @@ func (b *scopeBuffer) updateBySeq(seq uint64, payload json.RawMessage, preRender
 // PRECONDITIONS — caller responsibilities, not re-checked:
 //   - holds b.mu (write lock)
 //   - b.detached == false
-//   - len(b.items) < b.maxItems (or maxItems == sentinel)
+//   - len(b.items) < b.store.defaultMaxItems
 //   - duplicate-ID ruled out (when item.ID != "")
 //   - client-supplied Seq/Ts already rejected at the validator
 //
@@ -248,24 +243,18 @@ func (b *scopeBuffer) insertNewItemLocked(item Item, nowUs int64) (Item, error) 
 	}
 
 	size := approxItemSize(item)
-	if b.store != nil {
-		// Per-item cap enforcement at the lowest insert layer so any
-		// future caller that reaches this function (including trusted
-		// shortcuts that bypass validateWriteItem) inherits the
-		// invariant. The external write path's checkItemSize already
-		// rejected oversized items, so this fires either as
-		// defense-in-depth or as the canonical gate for trusted writes.
-		// b.maxItemBytes is cached at scope-create time so the check
-		// is a single int64 compare under b.mu — a method-call dispatch
-		// here amplified into ~15% RPS loss on contended-scope hot
-		// paths via lock-hold-time queueing.
-		if size > b.maxItemBytes {
-			return Item{}, fmt.Errorf("item size %d exceeds per-item cap %d for scope %q", size, b.maxItemBytes, item.Scope)
-		}
-		ok, current, max := b.store.reserveBytes(size)
-		if !ok {
-			return Item{}, &StoreFullError{StoreBytes: current, AddedBytes: size, Cap: max}
-		}
+	// Per-item cap enforcement at the lowest insert layer so any
+	// future caller that reaches this function (including trusted
+	// shortcuts that bypass validateWriteItem) inherits the
+	// invariant. The external write path's checkItemSize already
+	// rejected oversized items, so this fires either as
+	// defense-in-depth or as the canonical gate for trusted writes.
+	if size > b.store.maxItemBytes {
+		return Item{}, fmt.Errorf("item size %d exceeds per-item cap %d for scope %q", size, b.store.maxItemBytes, item.Scope)
+	}
+	ok, current, max := b.store.reserveBytes(size)
+	if !ok {
+		return Item{}, &StoreFullError{StoreBytes: current, AddedBytes: size, Cap: max}
 	}
 
 	b.lastSeq++
@@ -285,13 +274,10 @@ func (b *scopeBuffer) insertNewItemLocked(item Item, nowUs int64) (Item, error) 
 			b.byID = make(map[string]*Item)
 		}
 		b.byID[item.ID] = stored
-		b.idKeyBytes += int64(len(item.ID))
 	}
 	b.bytes += size
-	if b.store != nil {
-		b.store.totalItems.Add(1)
-		b.store.bumpLastWriteTS(nowUs)
-	}
+	b.store.totalItems.Add(1)
+	b.store.bumpLastWriteTS(nowUs)
 	b.lastWriteTS = nowUs
 
 	return item, nil

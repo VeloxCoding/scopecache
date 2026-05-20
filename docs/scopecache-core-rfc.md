@@ -230,14 +230,16 @@ deltas off a scheduler — see §9.
 | `items []Item`       | the items themselves, in `seq` order                                           |
 | `byID`, `bySeq`      | id→item and seq→item lookup maps (lazy-allocated; absent until first item)     |
 | `lastSeq`            | monotonic `seq` counter; never rewinds; deleted seqs are not reused            |
-| `maxItems`           | per-scope item cap (writes past this are rejected with 507)                    |
 | `bytes`              | Σ `approxItemSize` over items — feeds store-wide `totalBytes`                  |
-| `idKeyBytes`         | Σ `len(item.ID)` over `byID` — keeps `approxSizeBytes` O(1)                    |
 | `createdTS`          | microsecond timestamp of scope creation                                        |
 | `lastWriteTS`        | microsecond timestamp of the most recent write that touched the scope — `/append`, `/upsert` (create and replace), `/update`, `/delete`, `/delete_up_to`, `/warm`, `/rebuild` |
 | `lastAccessTS`       | microsecond timestamp of the most recent read hit (atomic, lock-free)         |
 | `readCountTotal`     | lifetime read-hit count (atomic, lock-free)                                    |
 | `detached`           | lifecycle flag set by `/delete_scope`, `/wipe`, `/rebuild` to fail in-flight writes against an orphan buffer |
+
+The per-scope item-count cap and per-item byte cap live on the store
+(`defaultMaxItems`, `maxItemBytes`); the buffer reads them directly
+on each write rather than caching per-scope copies.
 
 The seven primitives (`item_count`, `last_seq`, `approx_scope_mb`,
 `created_ts`, `last_write_ts`, `last_access_ts`, `read_count_total`)

@@ -1,9 +1,8 @@
 // types.go owns cross-cutting type definitions: Config (operator
 // knobs every adapter fills), Item (the on-the-wire shape, with Ts
-// contract, renderBytes optimisation, and counter side-channel), the
-// error types handlers convert to 4xx/5xx responses, and the
-// package-level capacity constants (ScopeMaxItems, MaxStoreMiB,
-// MaxItemBytes, …).
+// contract and renderBytes optimisation), the error types handlers
+// convert to 4xx/5xx responses, and the package-level capacity
+// constants (ScopeMaxItems, MaxStoreMiB, MaxItemBytes, …).
 //
 // Cross-cutting invariants other files inherit from here:
 //
@@ -46,11 +45,11 @@ const (
 
 	// singleRequestBytesOverhead is the headroom added on top of the configured
 	// per-item cap to produce the request body cap for single-item endpoints
-	// (/append, /update, /upsert, /delete, /delete_scope, /delete_up_to,
-	// /counter_add). Covers JSON framing — keys ("scope","id","payload"),
-	// quotes, colons, braces — on top of the item payload. The scope and id
-	// bytes themselves are already counted inside approxItemSize, so the
-	// framing overhead is tiny and constant. 4 KiB leaves generous slack.
+	// (/append, /update, /upsert, /delete, /delete_scope, /delete_up_to).
+	// Covers JSON framing — keys ("scope","id","payload"), quotes, colons,
+	// braces — on top of the item payload. The scope and id bytes themselves
+	// are already counted inside approxItemSize, so the framing overhead is
+	// tiny and constant. 4 KiB leaves generous slack.
 	singleRequestBytesOverhead = 4096
 
 	// bulkRequestBytesOverhead is the headroom added on top of the configured

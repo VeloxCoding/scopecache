@@ -8,14 +8,13 @@ import (
 	gojson "github.com/goccy/go-json"
 )
 
-// --- Auxiliary hot-path benches: Valid, Unmarshal-int, Unmarshal-string
+// --- Auxiliary hot-path benches: Valid, Unmarshal-string
 //
-// These cover validation.go, buffer_counter.go, and buffer_locked.go
-// respectively. All three live on the write path (every /append,
-// /upsert, /update, /counter_add); none of them was on the easy-to-
-// see HTTP-envelope path that earlier rounds covered. stdlib vs
-// goccy here decides whether routing the buffer-side calls through
-// jsonValid / jsonUnmarshal is a real win or noise.
+// These cover validation.go and buffer_locked.go. Both live on the
+// write path (every /append, /upsert, /update); none of them was on
+// the easy-to-see HTTP-envelope path that earlier rounds covered.
+// stdlib vs goccy here decides whether routing the buffer-side calls
+// through jsonValid / jsonUnmarshal is a real win or noise.
 
 // bench_unmarshal_test.go — goccy/go-json-vs-stdlib comparison for
 // the itemsRequest payload. /warm and /rebuild both accept this shape:
@@ -124,28 +123,6 @@ func BenchmarkValid_goccy_1KiB(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		_ = gojson.Valid(payload)
-	}
-}
-
-// --- Unmarshal int (buffer_counter.go parseCounterValue) ---
-
-func BenchmarkUnmarshal_counterInt_stdlib(b *testing.B) {
-	payload := json.RawMessage(`42`)
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		var num json.Number
-		_ = json.Unmarshal(payload, &num)
-	}
-}
-
-func BenchmarkUnmarshal_counterInt_goccy(b *testing.B) {
-	payload := json.RawMessage(`42`)
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		var num json.Number
-		_ = gojson.Unmarshal(payload, &num)
 	}
 }
 
