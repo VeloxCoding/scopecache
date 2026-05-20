@@ -223,6 +223,7 @@ func (b *scopeBuffer) updateBySeq(seq uint64, payload json.RawMessage, preRender
 //   - holds b.mu (write lock)
 //   - b.detached == false
 //   - len(b.items) < b.store.defaultMaxItems
+//   - approxItemSize(item) <= b.store.maxItemBytes
 //   - duplicate-ID ruled out (when item.ID != "")
 //   - client-supplied Seq/Ts already rejected at the validator
 //
@@ -243,15 +244,6 @@ func (b *scopeBuffer) insertNewItemLocked(item Item, nowUs int64) (Item, error) 
 	}
 
 	size := approxItemSize(item)
-	// Per-item cap enforcement at the lowest insert layer so any
-	// future caller that reaches this function (including trusted
-	// shortcuts that bypass validateWriteItem) inherits the
-	// invariant. The external write path's checkItemSize already
-	// rejected oversized items, so this fires either as
-	// defense-in-depth or as the canonical gate for trusted writes.
-	if size > b.store.maxItemBytes {
-		return Item{}, fmt.Errorf("item size %d exceeds per-item cap %d for scope %q", size, b.store.maxItemBytes, item.Scope)
-	}
 	ok, current, max := b.store.reserveBytes(size)
 	if !ok {
 		return Item{}, &StoreFullError{StoreBytes: current, AddedBytes: size, Cap: max}
