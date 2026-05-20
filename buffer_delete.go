@@ -53,6 +53,7 @@ func (b *scopeBuffer) deleteIndexLocked(i int) {
 	b.lastWriteTS = now
 	b.resetIfEmptyLocked()
 	b.shrinkIfSparseLocked()
+	releasePooledItem(removed)
 }
 
 // shrinkIfSparseLocked rebuilds the items slice and the bySeq/byID
@@ -202,6 +203,7 @@ func (b *scopeBuffer) deleteUpToSeq(maxSeq uint64) (int, error) {
 		if removed.ID != "" {
 			delete(b.byID, removed.ID)
 		}
+		releasePooledItem(removed)
 	}
 	// Copy the kept suffix into a fresh backing array so the old one —
 	// which still holds the removed payloads in its prefix — becomes

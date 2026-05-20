@@ -93,8 +93,8 @@ func buildReplacementState(items []Item) (scopeReplacement, error) {
 			item.renderBytes = precomputeRenderBytes(item.Payload)
 		}
 
-		// One heap *Item shared by built and bySeq (and byID below).
-		stored := &item
+		// One pool-borrowed *Item shared by built and bySeq (and byID below).
+		stored := getPooledItem(item)
 		built = append(built, stored)
 		bySeq[item.Seq] = stored
 	}
@@ -151,12 +151,16 @@ func (b *scopeBuffer) commitReplacement(r scopeReplacement, newBytes int64) {
 	// for bytes, which is pre-reserved in the PreReserved variant).
 	b.store.totalItems.Add(int64(len(r.items)) - int64(len(b.items)))
 	b.store.bumpLastWriteTS(now)
+	old := b.items
 	b.bytes = newBytes
 	b.items = r.items
 	b.byID = r.byID
 	b.bySeq = r.bySeq
 	b.lastSeq = r.lastSeq
 	b.lastWriteTS = now
+	for _, p := range old {
+		releasePooledItem(p)
+	}
 }
 
 // commitReplacementPreReserved is the batch-aware commit used by
@@ -192,12 +196,16 @@ func (b *scopeBuffer) commitReplacementPreReserved(r scopeReplacement, newBytes 
 	// naturally — its item is being discarded by the swap.
 	b.store.totalItems.Add(int64(len(r.items)) - int64(len(b.items)))
 	b.store.bumpLastWriteTS(now)
+	old := b.items
 	b.bytes = newBytes
 	b.items = r.items
 	b.byID = r.byID
 	b.bySeq = r.bySeq
 	b.lastSeq = r.lastSeq
 	b.lastWriteTS = now
+	for _, p := range old {
+		releasePooledItem(p)
+	}
 }
 
 func (b *scopeBuffer) replaceAll(items []Item) ([]Item, error) {

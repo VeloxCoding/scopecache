@@ -252,10 +252,11 @@ func (b *scopeBuffer) insertNewItemLocked(item Item, nowUs int64) (Item, error) 
 	b.lastSeq++
 	item.Seq = b.lastSeq
 
-	// One heap *Item, shared by all three indexes — items, bySeq and
-	// byID hold the same pointer, so later in-place mutations need no
-	// re-sync.
-	stored := &item
+	// One pool-borrowed *Item, shared by all three indexes — items,
+	// bySeq and byID hold the same pointer, so later in-place mutations
+	// need no re-sync. See itemSlabPool in buffer.go for the lifecycle
+	// contract.
+	stored := getPooledItem(item)
 	b.items = append(b.items, stored)
 	if b.bySeq == nil {
 		b.bySeq = make(map[uint64]*Item)
