@@ -21,15 +21,9 @@ package scopecache
 import "strconv"
 
 // AppendItemJSON appends item to buf as JSON, byte-identical to
-// Item.MarshalJSON. Items in the reserved _events scope rename
-// "payload" to "event"; empty Payload renders as `null` (defensive —
+// Item.MarshalJSON. Empty Payload renders as `null` (defensive —
 // validatePayload rejects empty on write).
 func AppendItemJSON(buf []byte, item Item) []byte {
-	payloadKey := "payload"
-	if item.Scope == EventsScopeName {
-		payloadKey = "event"
-	}
-
 	buf = append(buf, `{"scope":`...)
 	buf = AppendJSONString(buf, item.Scope)
 	buf = append(buf, `,"id":`...)
@@ -42,9 +36,7 @@ func AppendItemJSON(buf []byte, item Item) []byte {
 	buf = strconv.AppendUint(buf, item.Seq, 10)
 	buf = append(buf, `,"ts":`...)
 	buf = strconv.AppendInt(buf, item.Ts, 10)
-	buf = append(buf, ',', '"')
-	buf = append(buf, payloadKey...)
-	buf = append(buf, '"', ':')
+	buf = append(buf, `,"payload":`...)
 	if len(item.Payload) == 0 {
 		buf = append(buf, `null`...)
 	} else {

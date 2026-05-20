@@ -7,64 +7,14 @@ import (
 	"testing"
 )
 
-// newGatewayForTest builds a *Gateway with generous caps + events_mode=full
-// so the data-plane methods exercise the same auto-populate path that
-// production deployments will use.
+// newGatewayForTest builds a *Gateway with generous caps for tests.
 func newGatewayForTest(t *testing.T) *Gateway {
 	t.Helper()
 	return NewGateway(Config{
 		ScopeMaxItems: 1000,
 		MaxStoreBytes: 100 << 20,
 		MaxItemBytes:  1 << 20,
-		Events:        EventsConfig{Mode: EventsModeFull},
 	})
-}
-
-// Subscribe via Gateway must mirror Store.Subscribe — same scope rules,
-// same single-subscriber rule, same channel semantics. Smoke-test:
-// Gateway.Subscribe returns ErrInvalidSubscribeScope on a user scope,
-// ErrAlreadySubscribed on a duplicate, and a working channel on the
-// happy path.
-func TestGateway_Subscribe(t *testing.T) {
-	g := newGatewayForTest(t)
-
-	// Reject non-reserved scope.
-	if _, _, err := g.Subscribe("posts"); !errors.Is(err, ErrInvalidSubscribeScope) {
-		t.Errorf("Subscribe(posts): err=%v want ErrInvalidSubscribeScope", err)
-	}
-
-	// Happy path: _events accepted.
-	ch1, unsub1, err := g.Subscribe(EventsScopeName)
-	if err != nil {
-		t.Fatalf("Subscribe(_events): %v", err)
-	}
-
-	// Second Subscribe to same scope must reject.
-	if _, _, err := g.Subscribe(EventsScopeName); !errors.Is(err, ErrAlreadySubscribed) {
-		t.Errorf("second Subscribe(_events): err=%v want ErrAlreadySubscribed", err)
-	}
-
-	// A write triggers the wake-up — same as Store.Subscribe.
-	if _, err := g.Append(Item{
-		Scope:   "posts",
-		ID:      "p-1",
-		Payload: json.RawMessage(`{"v":1}`),
-	}); err != nil {
-		t.Fatalf("Append: %v", err)
-	}
-	select {
-	case <-ch1:
-	default:
-		t.Errorf("expected wake-up after Append; channel was empty")
-	}
-
-	unsub1()
-	// Re-subscribe after unsub must succeed (slot reusable).
-	_, unsub2, err := g.Subscribe(EventsScopeName)
-	if err != nil {
-		t.Errorf("Subscribe after unsub: %v", err)
-	}
-	unsub2()
 }
 
 // Direct Gateway callers can hand a json.RawMessage with arbitrary
@@ -230,9 +180,8 @@ func TestGateway_WipeStats(t *testing.T) {
 	}
 
 	post := g.Stats()
-	// Reserved scopes always re-created post-wipe.
-	if post.Scopes != 2 {
-		t.Errorf("post-wipe Scopes=%d want 2 (only _events + _inbox)", post.Scopes)
+	if post.Scopes != 0 {
+		t.Errorf("post-wipe Scopes=%d want 0", post.Scopes)
 	}
 	if post.Items != 0 {
 		t.Errorf("post-wipe Items=%d want 0", post.Items)
@@ -248,10 +197,10 @@ func TestGateway_ScopeList(t *testing.T) {
 		_, _ = g.Append(Item{Scope: scope, Payload: json.RawMessage(`{}`)})
 	}
 
-	// No filter — returns reserved + user scopes.
+	// No filter — returns all user scopes.
 	entries, _ := g.ScopeList("", "", 100)
-	if len(entries) < 5 {
-		t.Errorf("ScopeList: %d entries; want >= 5 (3 user + 2 reserved)", len(entries))
+	if len(entries) != 3 {
+		t.Errorf("ScopeList: %d entries; want 3", len(entries))
 	}
 
 	// Prefix filter.

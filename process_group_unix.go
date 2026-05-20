@@ -1,4 +1,4 @@
-// Process-group lifecycle for the subscriber bridge on Unix-like
+// Process-group lifecycle for exec'd helper scripts on Unix-like
 // platforms. Linux, macOS, the BSDs all have process groups; Windows
 // has a different process-tree model that's handled in the
 // _other.go sibling.
@@ -17,8 +17,8 @@ import (
 //
 // Without this, exec.CommandContext's default cancellation behaviour
 // is "SIGKILL Process.Pid" — which only targets the script the
-// bridge spawned. A subscriber script that backgrounds work
-// (`curl ... &; wait`, `python long_drain.py &; sleep 60`) would
+// caller spawned. A helper script that backgrounds work
+// (`curl ... &; wait`, `python long_init.py &; sleep 60`) would
 // have the shell wrapper killed but its children orphaned and
 // reparented to PID 1, so they can keep running after stop returns.
 //
@@ -35,7 +35,7 @@ import (
 //     spawned within that group dies.
 //
 // cmd.Wait then returns (the direct child got SIGKILL'd), the
-// bridge goroutine sees the closed wake-up channel, and stop()
+// caller's goroutine sees the closed wake-up channel, and stop()
 // returns bounded by OS kill latency.
 func configureProcessGroup(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}

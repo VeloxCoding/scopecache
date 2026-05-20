@@ -104,13 +104,11 @@ type RebuildResponse struct {
 // StatsResponse is the body of a successful GET /stats. Fields after
 // `ok` are flattened straight from storeStats.
 type StatsResponse struct {
-	OK               bool                 `json:"ok"`
-	Scopes           int                  `json:"scopes"`
-	Items            int                  `json:"items"`
-	ApproxStoreMB    MB                   `json:"approx_store_mb"`
-	LastWriteTS      int64                `json:"last_write_ts"`
-	EventsDropsTotal int64                `json:"events_drops_total"`
-	ReservedScopes   []reservedScopeEntry `json:"reserved_scopes"`
+	OK            bool  `json:"ok"`
+	Scopes        int   `json:"scopes"`
+	Items         int   `json:"items"`
+	ApproxStoreMB MB    `json:"approx_store_mb"`
+	LastWriteTS   int64 `json:"last_write_ts"`
 }
 
 // --- Success: cap-protected reads ----------------------------------

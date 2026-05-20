@@ -14,13 +14,6 @@
 //     /stats stays O(1). Adding a new write/delete path means adding
 //     the matching Adds in lockstep with the per-scope mutation —
 //     drift corrupts /stats silently.
-//   - **Reserved scopes.** `_events` and `_inbox` are pre-created at
-//     newStore time and re-created after /wipe / /rebuild via
-//     initReservedScopesLocked. isReservedScope is the single source
-//     of truth validators consult. Per-scope caps for the reserved
-//     pair are derived in newStore (eventsMaxItemBytes,
-//     inboxMaxItem{s,Bytes}) and dispatched via maxItemBytesFor /
-//     maxItemsFor.
 //   - **lastWriteTS.** Store-wide freshness signal, advanced via
 //     bumpLastWriteTS (CAS-max). User-write success bumps it; counter
 //     activity is silent (see buffer_counter.go), and pre-create /
@@ -66,39 +59,6 @@ type store struct {
 	defaultMaxItems int
 	maxStoreBytes   int64
 	maxItemBytes    int64
-
-	// Reserved-scope derived caps. Computed once in newStore from
-	// Config so write-path checks read directly.
-	//
-	// eventsMaxItemBytes = max(MaxItemBytes, Inbox.MaxItemBytes) +
-	// eventsItemEnvelopeOverhead. The max() is load-bearing: when an
-	// operator tunes Inbox.MaxItemBytes above MaxItemBytes, an _inbox
-	// write in EventsModeFull would otherwise commit successfully but
-	// have its event silently dropped on the per-event size check,
-	// breaking the "every successful write becomes an event" contract.
-	//
-	// `_events` is exempt from the item-count cap (best-effort
-	// observability — only the byte budget gates writes there).
-	eventsMaxItemBytes int64
-	inboxMaxItems      int
-	inboxMaxItemBytes  int64
-
-	// eventsMode controls auto-populate of the reserved `_events`
-	// scope (off | notify | full — see EventsMode in types.go).
-	// Resolved from Config.Events.Mode at newStore time; off is the
-	// zero-overhead default.
-	eventsMode EventsMode
-
-	// eventsDropsTotal counts events the cache attempted to auto-
-	// populate into `_events` but had to drop (byte budget saturated,
-	// or defensively, json.Marshal of the writeEvent failed).
-	// Incremented atomically inside the emit* helpers when the inner
-	// appendOne to `_events` returns any error. Surfaced on /stats.
-	//
-	// A drop NEVER affects the user-visible result of the underlying
-	// mutation — the user-write already committed before the emit
-	// ran. Degraded observability, not a degraded primary operation.
-	eventsDropsTotal atomic.Int64
 
 	// totalBytes is the authoritative byte counter for admission
 	// control: Σ approxItemSize over items + scopeBufferOverhead per
@@ -158,15 +118,6 @@ type store struct {
 	// bumps to its own commit time so a client polling right after
 	// a wipe still sees a non-zero "something happened" tick.
 	lastWriteTS atomic.Int64
-
-	// subsMu + subscribers form the Subscribe primitive's per-scope
-	// registry. Subscribers are restricted to reserved scopes and at
-	// most one per scope (RFC §7.4.1). Lives at Store level (NOT on
-	// *scopeBuffer) so the subscription survives /wipe and /rebuild
-	// buffer churn. Full lifecycle + lock-discipline lives in
-	// subscribe.go.
-	subsMu      sync.RWMutex
-	subscribers map[string]*subscriber
 }
 
 // bumpLastWriteTS advances s.lastWriteTS to nowUs if nowUs > current.
@@ -187,167 +138,17 @@ func (s *store) bumpLastWriteTS(nowUs int64) {
 	}
 }
 
-// reservedScopeNames is the canonical list dispatched through
-// isReservedScope, maxItemBytesFor, and maxItemsFor. See RFC §2.6
-// for the reservation contract and §2.7 for boot-time pre-creation.
-var reservedScopeNames = [...]string{EventsScopeName, InboxScopeName}
-
-// reservedScopesOverhead is the byte cost of pre-creating every
-// reserved scope. Used by rebuildAll's cap check so a /rebuild input
-// that fills the cache exactly doesn't blow past the cap when init
-// re-creates the reserved scopes after the swap.
-const reservedScopesOverhead = int64(len(reservedScopeNames)) * scopeBufferOverhead
-
-// isReservedScope reports whether scope is a cache-reserved name.
-// Single source of truth for /delete_scope, /warm and /rebuild
-// rejection.
-func isReservedScope(scope string) bool {
-	for _, name := range reservedScopeNames {
-		if scope == name {
-			return true
-		}
-	}
-	return false
-}
-
-// maxItemBytesFor returns the per-item byte cap that applies to
-// writes against scope: eventsMaxItemBytes for `_events`,
-// inboxMaxItemBytes for `_inbox`, maxItemBytes otherwise. Cap
-// derivation lives in newStore; reservation contract in RFC §2.6.
-//
-// Called only by /append in production: the other write handlers
-// reject reserved scopes at the validator and always see the global
-// cap.
-func (s *store) maxItemBytesFor(scope string) int64 {
-	switch scope {
-	case EventsScopeName:
-		return s.eventsMaxItemBytes
-	case InboxScopeName:
-		return s.inboxMaxItemBytes
-	default:
-		return s.maxItemBytes
-	}
-}
-
-// maxItemBytesAnyScope returns the largest per-item cap any scope on
-// this store can accept. Used by NewAPI to size the HTTP single-item
-// body cap so the wire-level guardrail is permissive enough for every
-// destination scope; the scope-aware semantic check (maxItemBytesFor +
-// validator) still catches actual overruns. Without this, an inbox
-// configured with Inbox.MaxItemBytes > MaxItemBytes would produce
-// asymmetric behaviour: Gateway.Append accepts the payload, POST
-// /append rejects it at decodeBody before the scope is even known.
-func (s *store) maxItemBytesAnyScope() int64 {
-	biggest := s.maxItemBytes
-	if s.eventsMaxItemBytes > biggest {
-		biggest = s.eventsMaxItemBytes
-	}
-	if s.inboxMaxItemBytes > biggest {
-		biggest = s.inboxMaxItemBytes
-	}
-	return biggest
-}
-
-// maxItemsFor returns the per-scope item-count cap to install on a
-// freshly-created buffer for scope: unboundedScopeMaxItems for
-// `_events` (best-effort observability, byte-budget-gated only),
-// inboxMaxItems for `_inbox`, defaultMaxItems otherwise.
-func (s *store) maxItemsFor(scope string) int {
-	switch scope {
-	case EventsScopeName:
-		return unboundedScopeMaxItems
-	case InboxScopeName:
-		return s.inboxMaxItems
-	default:
-		return s.defaultMaxItems
-	}
-}
-
-// unboundedScopeMaxItems is the sentinel value for "no item-count cap
-// on this scope" stored in scopeBuffer.maxItems. The write paths in
-// buffer_write.go treat 0 as "skip the count check" — only the
-// reserved `_events` scope is created with this sentinel because
-// best-effort observability writes are gated by the global byte
-// budget, not by an arbitrary item-count cap.
-const unboundedScopeMaxItems = 0
-
-// initReservedScopes pre-creates every entry in reservedScopeNames
-// at newStore time. Idempotent. Paths holding all-shard write locks
-// (wipe, rebuildAll) call initReservedScopesLocked — this version
-// would deadlock under those locks.
-//
-// Boot-time pre-creation is silent on s.lastWriteTS and resets per-
-// scope buf.lastWriteTS to 0 so a fresh store reports
-// last_write_ts = 0 — the "have I seen this cache before" sentinel
-// for polling clients works regardless of reserved-scope creation.
-func (s *store) initReservedScopes() {
-	for _, name := range reservedScopeNames {
-		sh := s.shardFor(name)
-		sh.mu.Lock()
-		if _, exists := sh.scopes[name]; !exists {
-			buf := s.newscopeBuffer()
-			buf.maxItems = s.maxItemsFor(name)
-			buf.maxItemBytes = s.maxItemBytesFor(name)
-			buf.lastWriteTS = 0 // bootstrap: no writes yet
-			sh.scopes[name] = buf
-			s.totalBytes.Add(scopeBufferOverhead)
-			s.scopeCount.Add(1)
-		}
-		sh.mu.Unlock()
-	}
-}
-
-// initReservedScopesLocked re-creates the reserved scopes assuming
-// the caller holds every shard's write lock (wipe, rebuildAll).
-// Idempotent. Per-scope buf.lastWriteTS aligns with the surrounding
-// destructive event's tick — same logical operation, not a separate
-// one — and s.lastWriteTS was already bumped by the caller.
-func (s *store) initReservedScopesLocked() {
-	for _, name := range reservedScopeNames {
-		sh := s.shardFor(name)
-		if _, exists := sh.scopes[name]; exists {
-			continue
-		}
-		buf := s.newscopeBuffer()
-		buf.maxItems = s.maxItemsFor(name)
-		buf.maxItemBytes = s.maxItemBytesFor(name)
-		buf.lastWriteTS = s.lastWriteTS.Load() // align with surrounding event
-		sh.scopes[name] = buf
-		s.totalBytes.Add(scopeBufferOverhead)
-		s.scopeCount.Add(1)
-	}
-}
-
 func newStore(c Config) *store {
 	c = c.WithDefaults()
-	// The events scope must accommodate any event the cache might emit,
-	// so its per-item cap is sized from the LARGEST upstream cap (user
-	// scopes vs `_inbox`) plus the envelope slack. Default config has
-	// MaxItemBytes (1 MiB) ≥ Inbox.MaxItemBytes (64 KiB) so the max is
-	// usually MaxItemBytes; the inbox branch only matters when an
-	// operator tuned _inbox larger than the global cap.
-	biggestUserCap := c.MaxItemBytes
-	if c.Inbox.MaxItemBytes > biggestUserCap {
-		biggestUserCap = c.Inbox.MaxItemBytes
-	}
 	s := &store{
-		hashSeed:           maphash.MakeSeed(),
-		defaultMaxItems:    c.ScopeMaxItems,
-		maxStoreBytes:      c.MaxStoreBytes,
-		maxItemBytes:       c.MaxItemBytes,
-		eventsMaxItemBytes: addClampedInt64(biggestUserCap, eventsItemEnvelopeOverhead),
-		inboxMaxItems:      c.Inbox.MaxItems,
-		inboxMaxItemBytes:  c.Inbox.MaxItemBytes,
-		eventsMode:         c.Events.Mode,
-		subscribers:        make(map[string]*subscriber),
+		hashSeed:        maphash.MakeSeed(),
+		defaultMaxItems: c.ScopeMaxItems,
+		maxStoreBytes:   c.MaxStoreBytes,
+		maxItemBytes:    c.MaxItemBytes,
 	}
 	for i := range s.shards {
 		s.shards[i].scopes = make(map[string]*scopeBuffer)
 	}
-	// Pre-create reserved scopes so subscribers can attach
-	// immediately at boot (before any writes happen) and so the
-	// auto-populate hooks have a destination ready.
-	s.initReservedScopes()
 	return s
 }
 
@@ -611,37 +412,18 @@ func (s *store) cleanupIfEmptyAndUnused(scope string, buf *scopeBuffer) {
 
 // appendOne is the atomic /append write-path for external callers
 // (HTTP handlers + Gateway.Append). Validates the item, then routes
-// through appendOneTrusted for the actual commit. /append on
-// `_events` is rejected at the validator: that scope is cache-only.
-// Apps inject events by /append on a user scope with EventsModeFull,
-// which auto-populates `_events` via the trusted path.
+// through appendOneTrusted for the actual commit.
 func (s *store) appendOne(item Item) (Item, error) {
-	if err := validateWriteItem(&item, "/append", s.maxItemBytesFor(item.Scope)); err != nil {
+	if err := validateWriteItem(&item, "/append", s.maxItemBytes); err != nil {
 		return Item{}, err
 	}
 	return s.appendOneTrusted(item)
 }
 
 // appendOneTrusted is the post-validation commit path used by
-// appendOne (after shape validation) and by emitEvent (auto-populate
-// into `_events`, where the caller has already produced
-// well-formed bytes via json.Marshal of writeEvent). Skips the
-// validator entirely; all callers are responsible for delivering an
-// item the validator would have accepted.
-//
-// Per-item cap enforcement is canonicalised in insertNewItemLocked
-// (buffer_write.go) so any caller landing in the buffer-level insert
-// pipeline picks up the invariant — including this trusted path.
-// The cap derivation eventsMaxItemBytes = max(user-cap, inbox-cap)
-// + 1 KiB envelope slack covers every emit shape today, but a
-// future writeEvent field addition could quietly grow past the
-// slack; the lower-layer gate stops that scenario loud.
-//
-// On commit it invokes emitAppendEvent to auto-populate `_events`,
-// AFTER buf.appendItem returned (b.mu released) — capture-under-
-// lock, emit-outside-lock. With Events.Mode == Off the emit is a
-// one-branch no-op; Notify / Full do a second appendOneTrusted
-// into `_events`, recursion-guarded inside the helper.
+// appendOne after shape validation. Skips the validator entirely;
+// callers are responsible for delivering an item the validator would
+// have accepted.
 func (s *store) appendOneTrusted(item Item) (Item, error) {
 	buf, created, err := s.getOrCreateScopeTrackingCreated(item.Scope)
 	if err != nil {
@@ -654,28 +436,12 @@ func (s *store) appendOneTrusted(item Item) (Item, error) {
 		}
 		return result, appendErr
 	}
-	// Order: emit FIRST (recurses into appendOneTrusted(_events) which
-	// itself fires notifySubscriber(_events) at the bottom of its own
-	// frame), THEN notify on the SCOPE we just wrote. The outer
-	// notify is gated to reserved scopes because Subscribe rejects
-	// non-reserved scopes outright (see ErrInvalidSubscribeScope) —
-	// for any other scope notifySubscriber would acquire subsMu.RLock
-	// and do a map lookup that can never hit. Skipping the call
-	// entirely on the hot user-scope path saves that lock/lookup pair
-	// per append. The recursive emitAppendEvent → appendOneTrusted
-	// (_events) frame still notifies _events because _events IS
-	// reserved, so EventsModeFull drainers stay woken correctly.
-	s.emitAppendEvent(result.Scope, result.ID, result.Seq, result.Ts, result.Payload)
-	if isReservedScope(result.Scope) {
-		s.notifySubscriber(result.Scope)
-	}
 	return result, nil
 }
 
 // upsertOne is the atomic /upsert write-path; same rollback contract
 // as appendOne. Returns (item, created, err) where created reflects
-// the upsert outcome, not the scope-creation outcome. Emits an
-// upsert event on success (gated on Events.Mode).
+// the upsert outcome, not the scope-creation outcome.
 func (s *store) upsertOne(item Item) (Item, bool, error) {
 	if err := validateUpsertItem(&item, s.maxItemBytes); err != nil {
 		return Item{}, false, err
@@ -691,24 +457,19 @@ func (s *store) upsertOne(item Item) (Item, bool, error) {
 		}
 		return result, itemCreated, upsertErr
 	}
-	s.emitUpsertEvent(result.Scope, result.ID, result.Seq, result.Ts, result.Payload)
 	return result, itemCreated, nil
 }
 
 // counterAddOne is the atomic /counter_add write-path; same rollback
 // contract as appendOne. Returns (value, created, err) where created
-// reflects the counter outcome, not the scope-creation outcome. On
-// success it emits a counter_add event into `_events` carrying the
-// increment `by` — never the post-add value (action-logging, not
-// result-logging; see events.go).
+// reflects the counter outcome, not the scope-creation outcome.
 func (s *store) counterAddOne(scope, id string, by int64) (int64, bool, error) {
 	// Construct the request shape the validator expects so the same
-	// rules (scope shape + reserved-rejection + by != 0 + range) apply
-	// to both HTTP and Go-API callers. The pointer-nil check
-	// (`by required`) is the HTTP-only concern (JSON missing-field
-	// detection) and stays in the handler — Go callers always pass an
-	// int64.
-	if _, err := validateCounterAddRequest(counterAddRequest{Scope: scope, ID: id, By: &by}, s.maxItemBytesFor(scope)); err != nil {
+	// rules (scope shape + by != 0 + range) apply to both HTTP and
+	// Go-API callers. The pointer-nil check (`by required`) is the
+	// HTTP-only concern (JSON missing-field detection) and stays in
+	// the handler — Go callers always pass an int64.
+	if _, err := validateCounterAddRequest(counterAddRequest{Scope: scope, ID: id, By: &by}, s.maxItemBytes); err != nil {
 		return 0, false, err
 	}
 	buf, scopeCreated, err := s.getOrCreateScopeTrackingCreated(scope)
@@ -730,7 +491,6 @@ func (s *store) counterAddOne(scope, id string, by int64) (int64, bool, error) {
 	if scopeCreated {
 		s.bumpLastWriteTS(nowUnixMicro())
 	}
-	s.emitCounterAddEvent(scope, id, by)
 	return value, counterCreated, nil
 }
 
@@ -766,18 +526,12 @@ func (s *store) updateOne(item Item) (int, error) {
 	if err != nil {
 		return updated, err
 	}
-	if updated > 0 {
-		s.emitUpdateEvent(item.Scope, item.ID, item.Seq, item.Payload)
-	}
 	return updated, nil
 }
 
 // deleteOne removes a single item by scope+id or scope+seq. Returns
 // (deleted_count, err); missing scope reports (0, nil) — same miss
 // shape as updateOne. Validator-enforced id-xor-seq invariant.
-//
-// Emits a delete event on hit (count > 0); see updateOne for the
-// action-logging-on-effective-change rationale.
 func (s *store) deleteOne(scope, id string, seq uint64) (int, error) {
 	if err := validateDeleteRequest(deleteRequest{Scope: scope, ID: id, Seq: seq}); err != nil {
 		return 0, err
@@ -798,16 +552,11 @@ func (s *store) deleteOne(scope, id string, seq uint64) (int, error) {
 	if err != nil {
 		return deleted, err
 	}
-	if deleted > 0 {
-		s.emitDeleteEvent(scope, id, seq)
-	}
 	return deleted, nil
 }
 
 // deleteUpTo removes every item in the scope with seq <= maxSeq.
-// Returns (deleted_count, err); missing scope reports (0, nil). Emits
-// a delete_up_to event on hit (count > 0); a cursor that selects no
-// items is a no-op against cache state and is not emitted.
+// Returns (deleted_count, err); missing scope reports (0, nil).
 func (s *store) deleteUpTo(scope string, maxSeq uint64) (int, error) {
 	if err := validateDeleteUpToRequest(deleteUpToRequest{Scope: scope, MaxSeq: maxSeq}); err != nil {
 		return 0, err
@@ -819,9 +568,6 @@ func (s *store) deleteUpTo(scope string, maxSeq uint64) (int, error) {
 	deleted, err := buf.deleteUpToSeq(maxSeq)
 	if err != nil {
 		return deleted, err
-	}
-	if deleted > 0 {
-		s.emitDeleteUpToEvent(scope, maxSeq)
 	}
 	return deleted, nil
 }
@@ -976,51 +722,37 @@ func (s *store) deleteScope(scope string) (int, bool, error) {
 		return 0, false, err
 	}
 
-	// The locked phase is wrapped in an inline closure so `defer
-	// sh.mu.Unlock()` fires before emitDeleteScopeEvent below — emit
-	// recurses into appendOne(_events) which acquires the _events
-	// shard's lock, and that shard might be the very one we just
-	// released. Without the closure the emit-while-locked path would
-	// either deadlock (when the deleted scope and `_events` hash to
-	// the same shard) or live-lock under heavy /delete_scope traffic.
-	itemCount, ok := func() (int, bool) {
-		sh := s.shardFor(scope)
-		sh.mu.Lock()
-		defer sh.mu.Unlock()
+	sh := s.shardFor(scope)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 
-		buf, ok := sh.scopes[scope]
-		if !ok {
-			return 0, false
-		}
-
-		// Hold buf.mu as a write lock across the whole sequence so an in-flight
-		// mutator on this buf (via a stale pointer obtained before we ran) either
-		// completes before we touch the counter or waits until after we're done.
-		// Crucially we also detach the buffer: any write that wakes up afterwards
-		// returns *ScopeDetachedError instead of silently writing into an orphan
-		// that is unreachable and about to be GC'd. store is cleared too so any
-		// remaining code path that survives the detach check still skips
-		// store-counter accounting.
-		buf.mu.Lock()
-		itemCount := len(buf.items)
-		scopeBytes := buf.bytes
-		delete(sh.scopes, scope)
-		// Release item bytes AND the per-scope overhead reserved at create
-		// time. Combined into one Add so observers never see a transient
-		// state with one released and the other still charged.
-		s.totalBytes.Add(-(scopeBytes + scopeBufferOverhead))
-		s.totalItems.Add(-int64(itemCount))
-		s.scopeCount.Add(-1)
-		s.bumpLastWriteTS(nowUnixMicro())
-		buf.detached = true
-		buf.store = nil
-		buf.mu.Unlock()
-		return itemCount, true
-	}()
+	buf, ok := sh.scopes[scope]
 	if !ok {
-		return itemCount, false, nil
+		return 0, false, nil
 	}
-	s.emitDeleteScopeEvent(scope)
+
+	// Hold buf.mu as a write lock across the whole sequence so an in-flight
+	// mutator on this buf (via a stale pointer obtained before we ran) either
+	// completes before we touch the counter or waits until after we're done.
+	// Crucially we also detach the buffer: any write that wakes up afterwards
+	// returns *ScopeDetachedError instead of silently writing into an orphan
+	// that is unreachable and about to be GC'd. store is cleared too so any
+	// remaining code path that survives the detach check still skips
+	// store-counter accounting.
+	buf.mu.Lock()
+	itemCount := len(buf.items)
+	scopeBytes := buf.bytes
+	delete(sh.scopes, scope)
+	// Release item bytes AND the per-scope overhead reserved at create
+	// time. Combined into one Add so observers never see a transient
+	// state with one released and the other still charged.
+	s.totalBytes.Add(-(scopeBytes + scopeBufferOverhead))
+	s.totalItems.Add(-int64(itemCount))
+	s.scopeCount.Add(-1)
+	s.bumpLastWriteTS(nowUnixMicro())
+	buf.detached = true
+	buf.store = nil
+	buf.mu.Unlock()
 	return itemCount, true, nil
 }
 
@@ -1031,45 +763,13 @@ func (s *store) deleteScope(scope string) (int, bool, error) {
 // The aggregate fields are intentionally not a per-scope map: at
 // 100k+ scopes, per-scope enumeration was the dominant cost of /stats
 // and routinely blew past practical client/proxy response limits.
-// Per-scope enumeration for user-managed scopes lives at /scopelist,
-// which paginates alphabetically.
-//
-// ReservedScopes is the small, fixed exception: `_events` and
-// `_inbox` are cache infrastructure (pre-created at boot, drainer-
-// fed, drainer-consumed), and operators monitoring the cache need
-// their per-scope state — drainer-backlog on `_events`, fan-in queue
-// depth on `_inbox` — without paging /scopelist for two known names.
-// Length is bounded by the reserved-scope set (currently 2), so the
-// O(1) /stats budget is preserved: two getScope() lookups + two
-// buf.stats() calls regardless of total scope count.
+// Per-scope enumeration lives at /scopelist, which paginates
+// alphabetically.
 type storeStats struct {
-	Scopes           int                  `json:"scopes"`
-	Items            int                  `json:"items"`
-	ApproxStoreMB    MB                   `json:"approx_store_mb"`
-	LastWriteTS      int64                `json:"last_write_ts"`
-	EventsDropsTotal int64                `json:"events_drops_total"`
-	ReservedScopes   []reservedScopeEntry `json:"reserved_scopes"`
-}
-
-// reservedScopeEntry is one row in /stats's reserved_scopes array.
-// Field set is the (ii)-tier of /scopelist's full row: scope, item
-// count, last seq, byte size, created and last-write timestamps —
-// what operators need to monitor drainer-backlog and fan-in depth.
-// last_access_ts and read_count_total are intentionally omitted:
-// reserved scopes are read by drainers/admins, not user-facing
-// traffic, so those signals are noise on this endpoint. /scopelist
-// still surfaces the full row for anyone who does want them.
-//
-// Field declaration order = wire field order (encoding/json honours
-// it). Mirrors scopeListEntry's field order so a consumer who
-// accepts both shapes can fold them through one parser.
-type reservedScopeEntry struct {
-	Scope         string `json:"scope"`
-	ItemCount     int    `json:"item_count"`
-	LastSeq       uint64 `json:"last_seq"`
-	ApproxScopeMB MB     `json:"approx_scope_mb"`
-	CreatedTS     int64  `json:"created_ts"`
-	LastWriteTS   int64  `json:"last_write_ts"`
+	Scopes        int   `json:"scopes"`
+	Items         int   `json:"items"`
+	ApproxStoreMB MB    `json:"approx_store_mb"`
+	LastWriteTS   int64 `json:"last_write_ts"`
 }
 
 // stats returns the store-wide aggregate snapshot in O(1) — four
@@ -1082,47 +782,11 @@ type reservedScopeEntry struct {
 // is an advisory snapshot.
 func (s *store) stats() storeStats {
 	return storeStats{
-		Scopes:           int(s.scopeCount.Load()),
-		Items:            int(s.totalItems.Load()),
-		ApproxStoreMB:    MB(s.totalBytes.Load()),
-		LastWriteTS:      s.lastWriteTS.Load(),
-		EventsDropsTotal: s.eventsDropsTotal.Load(),
-		ReservedScopes:   s.reservedScopeStats(),
+		Scopes:        int(s.scopeCount.Load()),
+		Items:         int(s.totalItems.Load()),
+		ApproxStoreMB: MB(s.totalBytes.Load()),
+		LastWriteTS:   s.lastWriteTS.Load(),
 	}
-}
-
-// reservedScopeStats materialises one entry per name in
-// reservedScopeNames. Each entry is the slim-tier scopeStats: item
-// count, last seq, byte size, creation + last-write timestamps. A
-// reserved scope that doesn't exist (impossible during steady state
-// but defensible against init-races / future refactors) is silently
-// skipped — operators see "the scope wasn't there" as an empty entry
-// instead of a hard error or a stale snapshot.
-//
-// getScope takes one shard RLock per call; buf.stats() takes the
-// scope's own buf.mu.RLock briefly for the materialisation. A
-// concurrent destructive op (/wipe or /rebuild) holds every shard in
-// write mode for the whole sweep, so this method either runs entirely
-// before or entirely after the destructive op — never observing a
-// half-wiped state.
-func (s *store) reservedScopeStats() []reservedScopeEntry {
-	out := make([]reservedScopeEntry, 0, len(reservedScopeNames))
-	for _, name := range reservedScopeNames {
-		buf, ok := s.getScope(name)
-		if !ok {
-			continue
-		}
-		st := buf.stats()
-		out = append(out, reservedScopeEntry{
-			Scope:         name,
-			ItemCount:     st.ItemCount,
-			LastSeq:       st.LastSeq,
-			ApproxScopeMB: st.ApproxScopeMB,
-			CreatedTS:     st.CreatedTS,
-			LastWriteTS:   st.LastWriteTS,
-		})
-	}
-	return out
 }
 
 func (s *store) listScopes() map[string]*scopeBuffer {

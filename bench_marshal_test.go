@@ -168,56 +168,16 @@ func BenchmarkMarshal_RebuildResponse(b *testing.B) {
 
 func BenchmarkMarshal_StatsResponse(b *testing.B) {
 	resp := StatsResponse{
-		OK:               true,
-		Scopes:           4,
-		Items:            12,
-		ApproxStoreMB:    MB(3564),
-		LastWriteTS:      1715600000999000,
-		EventsDropsTotal: 0,
-		ReservedScopes: []reservedScopeEntry{
-			{Scope: "_events", ItemCount: 12},
-			{Scope: "_inbox", ItemCount: 0},
-		},
+		OK:            true,
+		Scopes:        4,
+		Items:         12,
+		ApproxStoreMB: MB(3564),
+		LastWriteTS:   1715600000999000,
 	}
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		_, _ = json.Marshal(resp)
-	}
-}
-
-// --- Events stream ----------------------------------------------------
-
-func BenchmarkMarshal_writeEvent_append(b *testing.B) {
-	// Typical /append event: op, scope, id, seq, ts, payload.
-	evt := writeEvent{
-		Op:      "append",
-		Scope:   "users",
-		ID:      "alice",
-		Seq:     42,
-		Ts:      1715600000123456,
-		Payload: json.RawMessage(`{"name":"Alice"}`),
-	}
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_, _ = json.Marshal(evt)
-	}
-}
-
-func BenchmarkMarshal_writeEvent_notify(b *testing.B) {
-	// Notify mode strips Payload, leaving the action-vector only.
-	evt := writeEvent{
-		Op:    "append",
-		Scope: "users",
-		ID:    "alice",
-		Seq:   42,
-		Ts:    1715600000123456,
-	}
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_, _ = json.Marshal(evt)
 	}
 }
 
@@ -240,31 +200,13 @@ func BenchmarkMarshalGoccy_AppendResponse(b *testing.B) {
 	}
 }
 
-func BenchmarkMarshalGoccy_writeEvent_append(b *testing.B) {
-	evt := writeEvent{
-		Op: "append", Scope: "users", ID: "alice",
-		Seq: 42, Ts: 1715600000123456,
-		Payload: json.RawMessage(`{"name":"Alice"}`),
-	}
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_, _ = gojson.Marshal(evt)
-	}
-}
-
 func BenchmarkMarshalGoccy_StatsResponse(b *testing.B) {
 	resp := StatsResponse{
-		OK:               true,
-		Scopes:           4,
-		Items:            12,
-		ApproxStoreMB:    MB(3564),
-		LastWriteTS:      1715600000999000,
-		EventsDropsTotal: 0,
-		ReservedScopes: []reservedScopeEntry{
-			{Scope: "_events", ItemCount: 12},
-			{Scope: "_inbox", ItemCount: 0},
-		},
+		OK:            true,
+		Scopes:        4,
+		Items:         12,
+		ApproxStoreMB: MB(3564),
+		LastWriteTS:   1715600000999000,
 	}
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -279,23 +221,5 @@ func BenchmarkMarshalGoccy_DeleteResponse(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		_, _ = gojson.Marshal(resp)
-	}
-}
-
-func BenchmarkMarshal_writeEvent_counter(b *testing.B) {
-	// Counter event carries the `By` increment.
-	by := int64(3)
-	evt := writeEvent{
-		Op:    "counter_add",
-		Scope: "stats",
-		ID:    "visits",
-		Seq:   17,
-		Ts:    1715600000123456,
-		By:    &by,
-	}
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_, _ = json.Marshal(evt)
 	}
 }

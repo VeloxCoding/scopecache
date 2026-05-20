@@ -36,16 +36,9 @@ import (
 //
 // JSON config fields map 1:1 to the same capacity knobs the standalone
 // binary reads from env vars (SCOPECACHE_SCOPE_MAX_ITEMS,
-// SCOPECACHE_MAX_STORE_MB, SCOPECACHE_MAX_ITEM_MB,
-// SCOPECACHE_INBOX_MAX_ITEMS, SCOPECACHE_INBOX_MAX_ITEM_KB,
-// SCOPECACHE_EVENTS_MODE). Zero / empty values fall back to the
-// compile-time defaults declared in the core package.
-//
-// MaxStoreMB and MaxItemMB are MiB-facing (matching the env-var
-// convention); InboxMaxItemKB is KiB-facing because its default
-// (64 KiB) reads awkwardly as MiB. EventsMode is a string enum
-// (off / notify / full). All are converted at the boundary before
-// being handed to the core.
+// SCOPECACHE_MAX_STORE_MB, SCOPECACHE_MAX_ITEM_MB). Zero / empty
+// values fall back to the compile-time defaults declared in the core
+// package.
 type Handler struct {
 	// ScopeMaxItems caps items per scope. 0 = use scopecache.ScopeMaxItems.
 	ScopeMaxItems int `json:"scope_max_items,omitempty"`
@@ -53,23 +46,6 @@ type Handler struct {
 	MaxStoreMB int `json:"max_store_mb,omitempty"`
 	// MaxItemMB caps a single item's approxItemSize in MiB. 0 = use scopecache.MaxItemBytes.
 	MaxItemMB int `json:"max_item_mb,omitempty"`
-	// InboxMaxItems caps items in the reserved `_inbox` scope. 0 =
-	// fall back to ScopeMaxItems.
-	InboxMaxItems int `json:"inbox_max_items,omitempty"`
-	// InboxMaxItemKB caps a single `_inbox` item's approxItemSize in
-	// KiB. 0 = use scopecache.InboxMaxItemBytes (64 KiB).
-	InboxMaxItemKB int `json:"inbox_max_item_kb,omitempty"`
-	// EventsMode controls auto-populate of the reserved `_events`
-	// scope. Valid values: "off" (default), "notify" (events without
-	// payload), "full" (events with payload). Empty string = "off".
-	EventsMode string `json:"events_mode,omitempty"`
-	// SubscriberCommand is the absolute path to an executable invoked
-	// by the in-core subscriber bridge on every wake-up from a
-	// reserved scope (`_events`, `_inbox`). Empty (default) = no
-	// subscriber spawned. The script receives SCOPECACHE_SCOPE in env
-	// to branch on which reserved scope fired. Full contract on
-	// scopecache.Gateway.StartSubscriber.
-	SubscriberCommand string `json:"subscriber_command,omitempty"`
 	// InitCommand is the absolute path to an executable invoked once
 	// at Provision time, before Caddy starts listening. The script
 	// reaches the cache via `curl --unix-socket "$SCOPECACHE_SOCKET_PATH"`
@@ -82,9 +58,8 @@ type Handler struct {
 	// timeout; Caddy reload / shutdown still cancels the script.
 	InitTimeoutSec int `json:"init_timeout_sec,omitempty"`
 
-	api             *scopecache.API
-	mux             *http.ServeMux
-	stopSubscribers func()
+	api *scopecache.API
+	mux *http.ServeMux
 	// gateway holds the *Gateway this Provision created, so Cleanup
 	// can pass it to DeregisterGatewayIf and not clobber a newer
 	// instance's registration during Caddy config reload.
@@ -109,43 +84,23 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	if err := h.validateConfig(); err != nil {
 		return err
 	}
-	mode, err := scopecache.ParseEventsMode(h.EventsMode)
-	if err != nil {
-		return err
-	}
 	gw := scopecache.NewGateway(scopecache.Config{
 		ScopeMaxItems: h.ScopeMaxItems,
 		MaxStoreBytes: int64(h.MaxStoreMB) << 20,
 		MaxItemBytes:  int64(h.MaxItemMB) << 20,
-		Events: scopecache.EventsConfig{
-			Mode: mode,
-		},
-		Inbox: scopecache.InboxConfig{
-			MaxItems:     h.InboxMaxItems,
-			MaxItemBytes: int64(h.InboxMaxItemKB) << 10,
-		},
 	})
 	h.api = scopecache.NewAPI(gw, scopecache.APIConfig{})
 	h.mux = http.NewServeMux()
 	h.api.RegisterRoutes(h.mux)
 	guarded.RegisterRoutes(h.mux, gw)
 
-	// Run init before subscribers so init-created `_events` noise is
-	// wiped before drains start. Provision blocks until the script
-	// exits; Caddy keeps the previous instance serving during reload
-	// so a long init does not interrupt service. A failure is logged
-	// and ignored (empty cache is still a working cache).
+	// Run init at Provision time. A failure is logged and ignored
+	// (empty cache is still a working cache).
 	if h.InitCommand != "" {
 		if err := h.runInitWithPrivateSocket(ctx, gw); err != nil {
 			caddy.Log().Named("scopecache.init").Sugar().Warnf("init: %v", err)
 		}
 	}
-
-	// Subscribers start after init. See RFC §2.7.
-	h.stopSubscribers = gw.StartReservedSubscribers(
-		h.SubscriberCommand,
-		caddy.Log().Named("scopecache.subscriber").Sugar().Infof,
-	)
 
 	// Publish the gateway under the conventional "default" name so
 	// in-process consumers (PHP extensions, future Go-side addons)
@@ -216,21 +171,8 @@ func (h *Handler) runInitWithPrivateSocket(ctx context.Context, gw *scopecache.G
 }
 
 // Cleanup is called by Caddy when the module is being torn down (config
-// reload, server shutdown). Stops any active subscriber goroutines so
-// the scope-subscription slots release before Caddy spins up the next
-// Handler instance.
-//
-// Stop is abortive, not graceful: each goroutine's context is cancelled,
-// which SIGKILLs the in-flight drain command (whole process group, see
-// configureProcessGroup) instead of waiting for it to exit voluntarily.
-// This bounds the reload latency by OS kill time rather than letting a
-// stuck script tarpit a Caddy reload; see the StartSubscriber comment
-// in subscriber_command.go for the full trade-off rationale.
+// reload, server shutdown).
 func (h *Handler) Cleanup() error {
-	if h.stopSubscribers != nil {
-		h.stopSubscribers()
-		h.stopSubscribers = nil
-	}
 	// Deregister from the gateway registry. DeregisterGatewayIf is
 	// the safe form: during Caddy config reload the NEW Provision
 	// has already overwritten our entry by the time we run, and we
@@ -260,15 +202,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 // inside Provision. Example:
 //
 //	scopecache {
-//	    scope_max_items     100000
-//	    max_store_mb        100
-//	    max_item_mb         1
-//	    inbox_max_items     100000
-//	    inbox_max_item_kb   64
-//	    events_mode         off
-//	    subscriber_command  /usr/local/bin/drain.sh
-//	    init_command        /usr/local/bin/rebuild.sh
-//	    init_timeout_sec    600
+//	    scope_max_items   100000
+//	    max_store_mb      100
+//	    max_item_mb       1
+//	    init_command      /usr/local/bin/rebuild.sh
+//	    init_timeout_sec  600
 //	}
 func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	for d.Next() {
@@ -282,25 +220,11 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			}
 			value := d.Val()
 
-			// String-valued directives go first; integer parsing
-			// would otherwise fail before the switch saw "off"/etc.
-			if key == "events_mode" {
-				if _, err := scopecache.ParseEventsMode(value); err != nil {
-					return d.Err(err.Error())
-				}
-				h.EventsMode = value
-				continue
-			}
-			if key == "subscriber_command" {
-				h.SubscriberCommand = value
-				continue
-			}
 			if key == "init_command" {
 				h.InitCommand = value
 				continue
 			}
 
-			// Integer-valued directives.
 			n, err := strconv.Atoi(value)
 			if err != nil {
 				return d.Errf("%s: %v", key, err)
@@ -312,10 +236,6 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				h.MaxStoreMB = n
 			case "max_item_mb":
 				h.MaxItemMB = n
-			case "inbox_max_items":
-				h.InboxMaxItems = n
-			case "inbox_max_item_kb":
-				h.InboxMaxItemKB = n
 			case "init_timeout_sec":
 				h.InitTimeoutSec = n
 			default:
@@ -327,15 +247,12 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 }
 
 // validateConfig rejects values the standalone binary's env-var
-// parsers would have ignored with a warning (negative integers,
-// unknown events_mode strings).
+// parsers would have ignored with a warning (negative integers).
 //
-// maxConfigMB / maxConfigKB / maxConfigSec are the upper bounds
-// beyond which a later unit conversion in Provision would silently
-// overflow int64:
+// maxConfigMB / maxConfigSec are the upper bounds beyond which a
+// later unit conversion in Provision would silently overflow int64:
 //
 //   - MaxStoreMB / MaxItemMB:    `int64(value) << 20` (MiB→bytes).
-//   - InboxMaxItemKB:            `int64(value) << 10` (KiB→bytes).
 //   - InitTimeoutSec:            `time.Duration(value) * time.Second`
 //     (seconds → nanoseconds).
 //
@@ -343,30 +260,22 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 // silently-wrong cap.
 const (
 	maxConfigMB  = math.MaxInt64 >> 20                // ~8.79 trillion MiB
-	maxConfigKB  = math.MaxInt64 >> 10                // ~9 quadrillion KiB
 	maxConfigSec = math.MaxInt64 / int64(time.Second) // ~292 years
 )
 
 func (h *Handler) validateConfig() error {
-	// value/upper are int64 so the seconds bound (~292 years, fits
-	// int64) does not need an int(maxConfigSec) cast that could
-	// overflow on a 32-bit build. Caddy is practically 64-bit Linux
-	// today, but the int64 typing is the cheap correctness move.
 	for _, e := range []struct {
 		key      string
 		value    int64
 		upper    int64
 		upperFmt string
 	}{
-		// scope_max_items / inbox_max_items are plain int counts —
-		// no unit conversion, no upper bound check beyond
-		// non-negative. upper == 0 disables the bound check for
-		// those rows.
+		// scope_max_items is a plain int count — no unit conversion,
+		// no upper bound check beyond non-negative. upper == 0
+		// disables the bound check for that row.
 		{"scope_max_items", int64(h.ScopeMaxItems), 0, ""},
 		{"max_store_mb", int64(h.MaxStoreMB), maxConfigMB, "MiB"},
 		{"max_item_mb", int64(h.MaxItemMB), maxConfigMB, "MiB"},
-		{"inbox_max_items", int64(h.InboxMaxItems), 0, ""},
-		{"inbox_max_item_kb", int64(h.InboxMaxItemKB), maxConfigKB, "KiB"},
 		{"init_timeout_sec", int64(h.InitTimeoutSec), maxConfigSec, "seconds"},
 	} {
 		if e.value < 0 {
@@ -376,9 +285,6 @@ func (h *Handler) validateConfig() error {
 			return fmt.Errorf("%s=%d exceeds the maximum (%d %s); larger values would overflow int64 after unit conversion",
 				e.key, e.value, e.upper, e.upperFmt)
 		}
-	}
-	if _, err := scopecache.ParseEventsMode(h.EventsMode); err != nil {
-		return err
 	}
 	return nil
 }

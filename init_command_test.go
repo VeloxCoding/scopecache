@@ -19,6 +19,32 @@ import (
 	"time"
 )
 
+// pidIsRunning returns true iff /proc/<pid>/status reports a live
+// (non-zombie) process. kill(pid, 0) is unsuitable: the kernel keeps
+// the PID slot until reaping, so an unreaped zombie still answers
+// "alive" via that path even though the process is functionally
+// dead. The orphan-children regression test specifically needs to
+// distinguish "running" from "zombie" because the group-kill fix
+// leaves children as zombies — they are killed but not reaped (PID 1
+// in a Docker container without a tini-style reaper picks them up
+// only on container teardown).
+func pidIsRunning(pid int) bool {
+	data, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "status"))
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "State:") {
+			fields := strings.Fields(line)
+			if len(fields) >= 2 && fields[1] == "Z" {
+				return false
+			}
+			return true
+		}
+	}
+	return false
+}
+
 // writeInitCommandHelper creates a `chmod +x` script in dir that
 // records its environment to outFile. One line per invocation; the
 // line includes the SCOPECACHE_SOCKET_PATH env var so tests can

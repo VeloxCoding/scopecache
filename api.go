@@ -60,7 +60,7 @@ func NewAPI(gw *Gateway, _ APIConfig) *API {
 	return &API{
 		store:            gw.store,
 		maxBulkBytes:     bulkRequestBytesFor(gw.store.maxStoreBytes),
-		maxSingleBytes:   singleRequestBytesFor(gw.store.maxItemBytesAnyScope()),
+		maxSingleBytes:   singleRequestBytesFor(gw.store.maxItemBytes),
 		maxResponseBytes: gw.store.maxStoreBytes,
 	}
 }

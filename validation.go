@@ -255,15 +255,6 @@ func validateWriteItem(item *Item, endpoint string, maxItemBytes int64) (returnE
 	if err := validateScope(item.Scope, endpoint); err != nil {
 		return err
 	}
-	// `_events` is cache-only; auto-populate writes go through
-	// store.appendOneTrusted which bypasses this validator. External
-	// callers landing here on /append cannot target `_events` —
-	// otherwise drainers would see mixed-shape entries (writeEvent
-	// JSON from auto-populate vs arbitrary user payloads). `_inbox`
-	// stays open: it's the app-populated fan-in by design.
-	if endpoint == "/append" && item.Scope == EventsScopeName {
-		return errors.New("scope '" + item.Scope + "' is reserved for cache-emitted events; /append is rejected (use a user-managed scope with events_mode=full to inject)")
-	}
 	if err := validateID(item.ID); err != nil {
 		return err
 	}
@@ -284,9 +275,6 @@ func validateUpsertItem(item *Item, maxItemBytes int64) (returnErr error) {
 	if err := validateScope(item.Scope, "/upsert"); err != nil {
 		return err
 	}
-	if isReservedScope(item.Scope) {
-		return errors.New("scope '" + item.Scope + "' is reserved; in-place mutation (/upsert) is not supported on the drain-stream scopes (use /append)")
-	}
 	if err := requireID(item.ID, "/upsert"); err != nil {
 		return err
 	}
@@ -306,9 +294,6 @@ func validateUpdateItem(item *Item, maxItemBytes int64) (returnErr error) {
 	defer func() { returnErr = wrapValidation(returnErr) }()
 	if err := validateScope(item.Scope, "/update"); err != nil {
 		return err
-	}
-	if isReservedScope(item.Scope) {
-		return errors.New("scope '" + item.Scope + "' is reserved; in-place mutation (/update) is not supported on the drain-stream scopes")
 	}
 	if err := validateIDOrSeq("/update", item.ID, item.Seq); err != nil {
 		return err
@@ -335,9 +320,6 @@ func validateCounterAddRequest(req counterAddRequest, maxItemBytes int64) (by in
 	defer func() { returnErr = wrapValidation(returnErr) }()
 	if err := validateScope(req.Scope, "/counter_add"); err != nil {
 		return 0, err
-	}
-	if isReservedScope(req.Scope) {
-		return 0, errors.New("scope '" + req.Scope + "' is reserved; counters are not supported on the drain-stream scopes")
 	}
 	if err := requireID(req.ID, "/counter_add"); err != nil {
 		return 0, err
@@ -376,13 +358,7 @@ func validateDeleteRequest(req deleteRequest) (returnErr error) {
 
 func validateDeleteScopeRequest(req deleteScopeRequest) (returnErr error) {
 	defer func() { returnErr = wrapValidation(returnErr) }()
-	if err := validateScope(req.Scope, "/delete_scope"); err != nil {
-		return err
-	}
-	if isReservedScope(req.Scope) {
-		return errors.New("scope '" + req.Scope + "' is reserved and cannot be deleted")
-	}
-	return nil
+	return validateScope(req.Scope, "/delete_scope")
 }
 
 func validateDeleteUpToRequest(req deleteUpToRequest) (returnErr error) {

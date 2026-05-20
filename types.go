@@ -1,9 +1,9 @@
-// types.go owns cross-cutting type definitions: Config + EventsMode +
-// {Events,Inbox}Config (operator knobs every adapter fills), Item
-// (the on-the-wire shape, with Ts contract, renderBytes optimisation,
-// and counter side-channel), the error types handlers convert to
-// 4xx/5xx responses, and the package-level capacity constants
-// (ScopeMaxItems, MaxStoreMiB, MaxItemBytes, …).
+// types.go owns cross-cutting type definitions: Config (operator
+// knobs every adapter fills), Item (the on-the-wire shape, with Ts
+// contract, renderBytes optimisation, and counter side-channel), the
+// error types handlers convert to 4xx/5xx responses, and the
+// package-level capacity constants (ScopeMaxItems, MaxStoreMiB,
+// MaxItemBytes, …).
 //
 // Cross-cutting invariants other files inherit from here:
 //
@@ -11,8 +11,6 @@
 //     MiB/KiB-facing operator config to bytes at the boundary; the
 //     core never re-converts. The MB JSON helper renders bytes back
 //     to MiB-with-4-decimals on observability surfaces.
-//   - Reserved scopes (`_events`, `_inbox`) have their names defined
-//     here; the rejection-and-recreation contract lives in store.go.
 //   - approxItemSize is the single byte-cost function admission
 //     control consults. Counters charge counterCellOverhead instead
 //     of len(Payload) so increments stay lock-free; renderBytes is
@@ -22,7 +20,6 @@ package scopecache
 
 import (
 	"encoding/json"
-	"fmt"
 	"strconv"
 	"sync/atomic"
 	"time"
@@ -48,45 +45,6 @@ const (
 	// for the scope and id fields.
 	MaxScopeBytes = 256
 	MaxIDBytes    = 256
-
-	// InboxMaxItemBytes is the default per-item cap for the reserved
-	// `_inbox` scope, in bytes. 64 KiB matches the "fan-in event drop"
-	// shape `_inbox` is designed for — small structured records that
-	// drainers process in bulk. Overridable via
-	// SCOPECACHE_INBOX_MAX_ITEM_KB (integer KiB).
-	InboxMaxItemBytes = 64 << 10
-
-	// eventsItemEnvelopeOverhead is the slack added to the largest
-	// upstream user-cap to derive the `_events` scope's per-item cap.
-	// An event entry wraps the user payload in a JSON envelope (op,
-	// scope, id?, seq, ts, plus framing); 1 KiB is generous over the
-	// actual ~150 B of envelope so future field additions don't force
-	// a knob bump.
-	//
-	// `_events`'s per-item cap is derived as
-	// `max(MaxItemBytes, Inbox.MaxItemBytes) + eventsItemEnvelopeOverhead`
-	// in newStore, not exposed as a knob: an event entry must always
-	// be at least as wide as the largest user-write that could
-	// produce it, otherwise an Inbox configured with
-	// MaxItemBytes > MaxItemBytes would silently drop its events on
-	// the auto-populate path. Operators tune the upstream caps;
-	// `_events` follows.
-	eventsItemEnvelopeOverhead = 1024
-
-	// EventsScopeName is the reserved scope name for the auto-populated
-	// write-event stream. Pre-created at newStore time and re-created
-	// at /wipe / /rebuild time. Scope-level destructive ops
-	// (/delete_scope, /warm-target, /rebuild-input) reject the name;
-	// item-level ops (/append, /delete, /delete_up_to, /get, /head,
-	// /tail, /render) pass through so the drainer pattern (subscribe
-	// → tail → process → delete_up_to) keeps working.
-	EventsScopeName = "_events"
-
-	// InboxScopeName is the reserved scope name for application-side
-	// fan-in ingestion. Same pre-creation + reservation contract as
-	// EventsScopeName. Apps /append into _inbox; the cache itself
-	// never auto-writes to it.
-	InboxScopeName = "_inbox"
 
 	// singleRequestBytesOverhead is the headroom added on top of the configured
 	// per-item cap to produce the request body cap for single-item endpoints
@@ -115,114 +73,15 @@ const (
 // fills before constructing a Gateway. WithDefaults replaces non-
 // positive fields with the compile-time defaults; `Config{}` is "all
 // defaults".
-//
-// `_events` is exempt from ScopeMaxItems (observability; byte-cap
-// only) and derives its per-item cap from
-// `max(MaxItemBytes, Inbox.MaxItemBytes) + eventsItemEnvelopeOverhead`
-// — the max() is what keeps a large `_inbox` write from silently
-// dropping its event when `Inbox.MaxItemBytes > MaxItemBytes`.
-// `_inbox` itself uses the operator-tunable Inbox.{MaxItems,
-// MaxItemBytes} independently of the user-scope caps.
 type Config struct {
 	ScopeMaxItems int
 	MaxStoreBytes int64
 	MaxItemBytes  int64
-
-	Events EventsConfig
-	Inbox  InboxConfig
-}
-
-// EventsMode controls auto-populate of the reserved `_events` scope
-// on every successful mutation:
-//
-//   - EventsModeOff    (default) — no auto-populate; zero write-path
-//     overhead. Opt in when a drainer is ready.
-//   - EventsModeNotify           — metadata only (op, scope, id?, seq,
-//     ts). Smallest entries; sufficient for drainers that re-fetch
-//     from cache state on wake-up.
-//   - EventsModeFull             — metadata + action-payload.
-//     Sufficient for drainers that replicate state without re-querying.
-//
-// "Action-payload" = the inputs the caller sent. /counter_add logs
-// `by`, not the post-add value — the event stream stays replay-able
-// and matches the WAL discipline downstream sinks expect.
-type EventsMode int
-
-const (
-	EventsModeOff    EventsMode = iota // 0 — default; no auto-populate
-	EventsModeNotify                   // 1 — events without payload
-	EventsModeFull                     // 2 — events with payload
-)
-
-// String returns the canonical lowercase form (off | notify | full),
-// matching the values SCOPECACHE_EVENTS_MODE / events_mode accept.
-// Unknown values render as "unknown" so a forgotten new mode shows up
-// in observability output rather than silently rendering as "off".
-func (m EventsMode) String() string {
-	switch m {
-	case EventsModeOff:
-		return "off"
-	case EventsModeNotify:
-		return "notify"
-	case EventsModeFull:
-		return "full"
-	default:
-		return "unknown"
-	}
-}
-
-// ParseEventsMode parses the string form (off | notify | full) into
-// the typed enum. Empty maps to EventsModeOff so adapter code passes
-// through "unset" without special-casing.
-func ParseEventsMode(s string) (EventsMode, error) {
-	switch s {
-	case "", "off":
-		return EventsModeOff, nil
-	case "notify":
-		return EventsModeNotify, nil
-	case "full":
-		return EventsModeFull, nil
-	default:
-		return EventsModeOff, fmt.Errorf("invalid events_mode %q (expected: off | notify | full)", s)
-	}
-}
-
-// EventsConfig holds the operator knob for the `_events` scope.
-// Per-item cap and item-count cap are intentionally not configurable:
-// the per-event cap stays coupled to MaxItemBytes (+ envelope slack)
-// so large user-writes never 507 on the auto-populate path, and the
-// item-count cap is exempt because `_events` is observability, not
-// user state.
-type EventsConfig struct {
-	Mode EventsMode
-}
-
-// InboxConfig holds operator knobs for the reserved `_inbox` scope
-// (app-populated fan-in). Both caps are independent of the user-
-// scope globals: per-item is typically 64 KiB (small structured
-// records) where user-scopes may be MiB; item-count stays tunable so
-// drainer cadence sets the ceiling, not user-scope economics.
-type InboxConfig struct {
-	MaxItems     int
-	MaxItemBytes int64
 }
 
 // WithDefaults returns a copy of c with non-positive numeric fields
 // replaced by the compile-time defaults. Called by NewGateway so
 // `Config{}` is a valid "all defaults" input.
-//
-// MaxStoreBytes is also clamped up to reservedScopesOverhead so the
-// reserved scopes always fit at boot — only fires for absurdly
-// small caps (under 2 KiB), realistic MB/GB caps are untouched.
-//
-// Events.Mode outside the recognised range (Off / Notify / Full)
-// gets clamped to Off. The HTTP and env-var parsers reject unknown
-// strings via ParseEventsMode, but a pure Go-API caller could pass
-// an out-of-range int value directly. Defaulting silently to Off is
-// the safe call: the alternative — letting an unrecognised value
-// fall through to the "anything not Off is Full" branch in
-// emitEvent — would silently emit events with payload, the most
-// privacy-sensitive mode.
 func (c Config) WithDefaults() Config {
 	if c.ScopeMaxItems <= 0 {
 		c.ScopeMaxItems = ScopeMaxItems
@@ -230,23 +89,8 @@ func (c Config) WithDefaults() Config {
 	if c.MaxStoreBytes <= 0 {
 		c.MaxStoreBytes = int64(MaxStoreMiB) << 20
 	}
-	if c.MaxStoreBytes < reservedScopesOverhead {
-		c.MaxStoreBytes = reservedScopesOverhead
-	}
 	if c.MaxItemBytes <= 0 {
 		c.MaxItemBytes = int64(MaxItemBytes)
-	}
-	if c.Inbox.MaxItems <= 0 {
-		c.Inbox.MaxItems = c.ScopeMaxItems
-	}
-	if c.Inbox.MaxItemBytes <= 0 {
-		c.Inbox.MaxItemBytes = int64(InboxMaxItemBytes)
-	}
-	switch c.Events.Mode {
-	case EventsModeOff, EventsModeNotify, EventsModeFull:
-		// recognised
-	default:
-		c.Events.Mode = EventsModeOff
 	}
 	return c
 }
@@ -281,14 +125,14 @@ func (m MB) MarshalJSON() ([]byte, error) {
 // any write endpoint). The field is observability only — not
 // searchable, not indexed, not used for ordering. Microsecond (not
 // millisecond) granularity keeps two writes inside the same ms
-// distinguishable, which matters for ordered /inbox draining and
-// counter "last activity" stamping under burst load.
+// distinguishable, which matters for counter "last activity"
+// stamping under burst load.
 type Item struct {
 	Scope   string          `json:"scope,omitempty"`
 	ID      string          `json:"id,omitempty"`
 	Seq     uint64          `json:"seq,omitempty"`
 	Ts      int64           `json:"ts"`
-	Payload json.RawMessage `json:"payload"` // see MarshalJSON: serialised as `event` for _events items
+	Payload json.RawMessage `json:"payload"`
 
 	// renderBytes is the JSON-string-decoded form of Payload, set at
 	// write-time for payloads whose first non-whitespace byte is `"`,
@@ -314,26 +158,13 @@ type Item struct {
 	counter *counterCell
 }
 
-// MarshalJSON keeps the universal Item shape (scope/id/seq/ts +
-// payload-bearing field) but renames the payload-bearing key to
-// `event` when the item lives in the reserved `_events` scope. The
-// stored bytes there are a writeEvent envelope (see events.go), not
-// a user-supplied payload — calling that field `payload` would put
-// the same word at two nesting levels with two different meanings
-// (outer = envelope, inner = client-content). Renaming the outer
-// key removes the ambiguity: `payload` always means "the bytes the
-// client originally stored", at every level it appears.
+// MarshalJSON emits the universal Item shape (scope/id/seq/ts/payload).
 //
 // `id` is always emitted: items with no client-supplied id render
 // as `"id":null` rather than dropping the key. Uniform-shape rule
 // means every item on the wire has the same key set; clients can
 // read `item.id` directly without a presence check.
 //
-// Implementation note: emitting via two struct literals (one per
-// scope) keeps the generated JSON well-defined. encoding/json's
-// reflection path produces consistent field-order matching the
-// struct declaration, so /tail _events output remains stable across
-// Go versions.
 // Hand-rolled to bypass json.Marshal's reflection of an anonymous
 // struct. The reflection path was the dominant cost in any json.Marshal
 // call that included an Item — ~630 ns of CPU per item on top of the
@@ -351,10 +182,6 @@ type Item struct {
 // inside appendJSONString preserves byte-exact escape semantics for
 // any unexpected input.
 func (i Item) MarshalJSON() ([]byte, error) {
-	payloadKey := `"payload":`
-	if i.Scope == EventsScopeName {
-		payloadKey = `"event":`
-	}
 	buf := make([]byte, 0, 128)
 	buf = append(buf, `{"scope":`...)
 	buf = AppendJSONString(buf, i.Scope)
@@ -368,8 +195,7 @@ func (i Item) MarshalJSON() ([]byte, error) {
 	buf = strconv.AppendUint(buf, i.Seq, 10)
 	buf = append(buf, `,"ts":`...)
 	buf = strconv.AppendInt(buf, i.Ts, 10)
-	buf = append(buf, ',')
-	buf = append(buf, payloadKey...)
+	buf = append(buf, `,"payload":`...)
 	if len(i.Payload) == 0 {
 		buf = append(buf, `null`...)
 	} else {

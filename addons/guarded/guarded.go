@@ -51,9 +51,8 @@ import (
 
 // tokensScope is the cache-internal scope where the addon looks up
 // capIDs. Naming convention: leading underscore flags it as
-// infrastructure (same shape as `_events` / `_inbox`), but it is NOT
-// one of the core's two reserved scopes — the core makes no special
-// promise about `_tokens`. The addon owns the invariant.
+// infrastructure. The core makes no special promise about `_tokens`;
+// the addon owns the invariant.
 const tokensScope = "_tokens"
 
 // RegisterRoutes mounts the addon's routes on mux. Adapters call this

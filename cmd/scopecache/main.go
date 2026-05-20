@@ -3,7 +3,7 @@
 // private temp socket, then serves the cache routes until SIGTERM /
 // SIGINT.
 //
-// Boot sequence (matters for the init/subscriber contract):
+// Boot sequence:
 //
 //  1. Build *Gateway + *API from env-driven Config.
 //  2. If SCOPECACHE_INIT_COMMAND is set, runInitWithPrivateSocket
@@ -12,11 +12,8 @@
 //     then tears the temp socket down. The PUBLIC socket is NOT
 //     bound during this phase — external clients hitting it get
 //     connection-refused, not a half-populated cache.
-//  3. Start subscribers (StartReservedSubscribers). RunInitCommand
-//     has wiped `_events` already, and `_inbox` was unreachable to
-//     external writers, so subscribers see an empty stream.
-//  4. Bind the public socket and start serving.
-//  5. SIGINT/SIGTERM cancels signalCtx → graceful shutdown.
+//  3. Bind the public socket and start serving.
+//  4. SIGINT/SIGTERM cancels signalCtx → graceful shutdown.
 //
 // Recognised env vars (operator interface):
 //
@@ -24,10 +21,6 @@
 //	SCOPECACHE_SCOPE_MAX_ITEMS     per-scope item cap
 //	SCOPECACHE_MAX_STORE_MB        store-wide byte cap (MiB)
 //	SCOPECACHE_MAX_ITEM_MB         per-item byte cap (MiB)
-//	SCOPECACHE_INBOX_MAX_ITEMS     per-scope item cap on `_inbox`
-//	SCOPECACHE_INBOX_MAX_ITEM_KB   per-item byte cap on `_inbox` (KiB)
-//	SCOPECACHE_EVENTS_MODE         off | notify | full
-//	SCOPECACHE_SUBSCRIBER_COMMAND  drain-script path (empty = disabled)
 //	SCOPECACHE_INIT_COMMAND        boot-init-script path (empty = disabled)
 //	SCOPECACHE_INIT_TIMEOUT_SEC    hard cap on init script (0 = no timeout)
 //
@@ -57,18 +50,16 @@ import (
 	"github.com/VeloxCoding/scopecache/addons/guarded"
 )
 
-// maxEnvConfig{MB,KB,Sec} are the upper bounds beyond which a later
-// unit conversion would silently overflow int64:
+// maxEnvConfig{MB,Sec} are the upper bounds beyond which a later unit
+// conversion would silently overflow int64:
 //
 //   - MB  (MiB→bytes via `<< 20`)
-//   - KB  (KiB→bytes via `<< 10`)
 //   - Sec (seconds → nanoseconds via `time.Duration * time.Second`)
 //
-// Mirrors caddymodule's maxConfig{MB,KB,Sec}; same rationale (loud
+// Mirrors caddymodule's maxConfig{MB,Sec}; same rationale (loud
 // rejection beats silent wrong cap).
 const (
 	maxEnvConfigMB  = math.MaxInt64 >> 20
-	maxEnvConfigKB  = math.MaxInt64 >> 10
 	maxEnvConfigSec = math.MaxInt64 / int64(time.Second)
 )
 
@@ -150,49 +141,6 @@ func maxItemBytesFromEnv() int64 {
 	return int64(n) << 20
 }
 
-// inboxMaxItemsFromEnv reads SCOPECACHE_INBOX_MAX_ITEMS.
-// Returns 0 (sentinel for Config.WithDefaults to fall back to
-// ScopeMaxItems) on missing / invalid input.
-func inboxMaxItemsFromEnv() int {
-	raw := os.Getenv("SCOPECACHE_INBOX_MAX_ITEMS")
-	if raw == "" {
-		return 0
-	}
-	n, err := strconv.Atoi(raw)
-	if err != nil || n <= 0 {
-		log.Printf("SCOPECACHE_INBOX_MAX_ITEMS=%q is not a positive integer; falling back to ScopeMaxItems", raw)
-		return 0
-	}
-	return n
-}
-
-// inboxMaxItemBytesFromEnv reads SCOPECACHE_INBOX_MAX_ITEM_KB and
-// converts to bytes. KiB rather than MiB because the default (64 KiB)
-// reads awkwardly as MiB. Returns 0 (Config.WithDefaults sentinel)
-// on missing / invalid / overflow input.
-func inboxMaxItemBytesFromEnv() int64 {
-	raw := os.Getenv("SCOPECACHE_INBOX_MAX_ITEM_KB")
-	if raw == "" {
-		return 0
-	}
-	n, err := strconv.Atoi(raw)
-	if err != nil || n <= 0 {
-		log.Printf("SCOPECACHE_INBOX_MAX_ITEM_KB=%q is not a positive integer; falling back to %d KiB", raw, scopecache.InboxMaxItemBytes>>10)
-		return 0
-	}
-	if int64(n) > maxEnvConfigKB {
-		log.Printf("SCOPECACHE_INBOX_MAX_ITEM_KB=%d exceeds the maximum KiB value (%d); falling back to %d KiB", n, maxEnvConfigKB, scopecache.InboxMaxItemBytes>>10)
-		return 0
-	}
-	return int64(n) << 10
-}
-
-// subscriberCommandFromEnv reads SCOPECACHE_SUBSCRIBER_COMMAND.
-// Empty = no subscriber spawned.
-func subscriberCommandFromEnv() string {
-	return os.Getenv("SCOPECACHE_SUBSCRIBER_COMMAND")
-}
-
 // initCommandFromEnv reads SCOPECACHE_INIT_COMMAND.
 // Empty = no init script.
 func initCommandFromEnv() string {
@@ -219,18 +167,6 @@ func initTimeoutFromEnv() time.Duration {
 		return 0
 	}
 	return time.Duration(n) * time.Second
-}
-
-// eventsModeFromEnv reads SCOPECACHE_EVENTS_MODE.
-// Empty / invalid = EventsModeOff. Valid: off | notify | full.
-func eventsModeFromEnv() scopecache.EventsMode {
-	raw := os.Getenv("SCOPECACHE_EVENTS_MODE")
-	mode, err := scopecache.ParseEventsMode(raw)
-	if err != nil {
-		log.Printf("SCOPECACHE_EVENTS_MODE=%q is invalid; falling back to off (valid: off | notify | full)", raw)
-		return scopecache.EventsModeOff
-	}
-	return mode
 }
 
 // --- Boot helpers ---------------------------------------------------
@@ -338,22 +274,13 @@ func main() {
 		ScopeMaxItems: scopeMaxItemsFromEnv(),
 		MaxStoreBytes: maxStoreBytesFromEnv(),
 		MaxItemBytes:  maxItemBytesFromEnv(),
-		Events: scopecache.EventsConfig{
-			Mode: eventsModeFromEnv(),
-		},
-		Inbox: scopecache.InboxConfig{
-			MaxItems:     inboxMaxItemsFromEnv(),
-			MaxItemBytes: inboxMaxItemBytesFromEnv(),
-		},
 	}
 	cfg = cfg.WithDefaults()
 	gw := scopecache.NewGateway(cfg)
 	api := scopecache.NewAPI(gw, scopecache.APIConfig{})
 
-	log.Printf("scopecache capacity: %d items per scope, %d MiB store-wide, %d MiB per item; inbox %d items, %d KiB per item; events_mode=%s",
-		cfg.ScopeMaxItems, cfg.MaxStoreBytes>>20, cfg.MaxItemBytes>>20,
-		cfg.Inbox.MaxItems, cfg.Inbox.MaxItemBytes>>10,
-		cfg.Events.Mode)
+	log.Printf("scopecache capacity: %d items per scope, %d MiB store-wide, %d MiB per item",
+		cfg.ScopeMaxItems, cfg.MaxStoreBytes>>20, cfg.MaxItemBytes>>20)
 
 	mux := http.NewServeMux()
 	api.RegisterRoutes(mux)
@@ -390,31 +317,14 @@ func main() {
 		}
 	}
 
-	// Subscribers start AFTER init. RunInitCommand wipes `_events`
-	// itself when it returns (init is restoration, not a domain
-	// action) and `_inbox` was unreachable to external writers, so
-	// subscribers register against an empty stream. The first
-	// wake-up fires on the first user-write after the public socket
-	// is up.
-	stopSubscribers := gw.StartReservedSubscribers(subscriberCommandFromEnv(), log.Printf)
-	defer stopSubscribers()
-
 	ln, err := listenUnixSocket(socketPath)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	// Shutdown order on signal: stop subscribers FIRST while the
-	// HTTP server is still up — exec.CommandContext SIGKILLs the
-	// whole drain-script process group, bounded by OS-kill latency
-	// rather than the script's voluntary completion. Then Shutdown
-	// drains in-flight HTTP requests. Both stops are idempotent, so
-	// the deferred backstops above are no-ops if this goroutine
-	// fires first.
 	go func() {
 		<-signalCtx.Done()
 		log.Print("scopecache shutting down")
-		stopSubscribers()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownGracePeriod)
 		defer cancel()
 		if err := server.Shutdown(shutdownCtx); err != nil {

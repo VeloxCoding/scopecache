@@ -44,13 +44,11 @@ func (api *API) handleStats(w http.ResponseWriter, r *http.Request) {
 	// client decide "anything changed since I last looked?" with a
 	// single integer comparison instead of refetching state.
 	writeJSONResponse(w, http.StatusOK, StatsResponse{
-		OK:               true,
-		Scopes:           st.Scopes,
-		Items:            st.Items,
-		ApproxStoreMB:    st.ApproxStoreMB,
-		LastWriteTS:      st.LastWriteTS,
-		EventsDropsTotal: st.EventsDropsTotal,
-		ReservedScopes:   st.ReservedScopes,
+		OK:            true,
+		Scopes:        st.Scopes,
+		Items:         st.Items,
+		ApproxStoreMB: st.ApproxStoreMB,
+		LastWriteTS:   st.LastWriteTS,
 	})
 }
 

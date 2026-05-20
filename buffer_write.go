@@ -190,7 +190,7 @@ func (b *scopeBuffer) updateBySeq(seq uint64, payload json.RawMessage, preRender
 	// the stored id (the request *is* the address), so request-side
 	// and stored-side approxItemSize agree by construction.
 	if b.store != nil {
-		maxItemBytes := b.store.maxItemBytesFor(existing.Scope)
+		maxItemBytes := b.store.maxItemBytes
 		candidate := Item{
 			Scope:       existing.Scope,
 			ID:          existing.ID,

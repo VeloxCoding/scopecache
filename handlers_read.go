@@ -335,9 +335,6 @@ func writeGetResponse(w http.ResponseWriter, resp GetResponse) {
 		item := *resp.Item
 		payload = item.Payload
 		payloadKey := "payload"
-		if item.Scope == EventsScopeName {
-			payloadKey = "event"
-		}
 
 		prefix = append(prefix, `{"ok":true,"hit":true,"count":1,"item":{"scope":`...)
 		prefix = AppendJSONString(prefix, item.Scope)

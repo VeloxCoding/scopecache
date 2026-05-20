@@ -34,19 +34,6 @@ type Stats = storeStats
 // ScopeListEntry is the public name for one row of /scopelist.
 type ScopeListEntry = scopeListEntry
 
-// ReservedScopeEntry is the public name for one row of /stats's
-// reserved_scopes array.
-type ReservedScopeEntry = reservedScopeEntry
-
-// --- Control-plane --------------------------------------------------
-
-// Subscribe attaches a coalescing wake-up channel to the named
-// reserved scope (`_events` or `_inbox`).
-// See subscribe.go for the full contract.
-func (g *Gateway) Subscribe(scope string) (<-chan struct{}, func(), error) {
-	return g.store.Subscribe(scope)
-}
-
 // --- Data-plane: writes ---------------------------------------------
 //
 // Every write returns ErrInvalidInput when shape validation fails.
