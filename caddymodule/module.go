@@ -14,10 +14,8 @@
 package caddymodule
 
 import (
-	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"math"
 	"net"
 	"net/http"
@@ -83,14 +81,6 @@ type Handler struct {
 	// the helper SIGKILLs its process group. 0 (default) = no
 	// timeout; Caddy reload / shutdown still cancels the script.
 	InitTimeoutSec int `json:"init_timeout_sec,omitempty"`
-	// MissFallthrough, when true, hands a cache miss to the next
-	// handler in the Caddy chain instead of returning scopecache's
-	// own miss response. The miss is detected via the
-	// scopecache.MissHeader response header (core RFC §5.6). Default
-	// false. Pair it with a `reverse_proxy` (or any handler) placed
-	// after the scopecache directive: hits are served from cache,
-	// misses reach the application — the source of truth.
-	MissFallthrough bool `json:"miss_fallthrough,omitempty"`
 
 	api             *scopecache.API
 	mux             *http.ServeMux
@@ -253,68 +243,14 @@ func (h *Handler) Cleanup() error {
 	return nil
 }
 
-// maxFallthroughBodyBytes caps the request body the miss-fallthrough
-// path buffers for replay to the next handler. A scopecache write is a
-// single item, bounded by the per-item cap (default 1 MiB); 8 MiB
-// leaves wide headroom. A larger body trips the limit, the core handler
-// answers with its own 4xx, and no fallthrough happens.
-const maxFallthroughBodyBytes = 8 << 20
-
 // ServeHTTP dispatches to the scopecache mux. Any path the mux does not
 // recognise falls through to the next Caddy handler — this lets operators
 // mount scopecache under a path prefix (`handle /cache/*`) alongside other
 // handlers without scopecache swallowing unrelated traffic.
-//
-// With MissFallthrough set, a scopecache path that results in a miss
-// (signalled by the scopecache.MissHeader response header) is likewise
-// handed to the next handler instead of returning scopecache's miss
-// response. The core handler's response is recorded rather than streamed
-// until hit-vs-miss is known; on a hit the recorder is a straight
-// passthrough, so the hot path keeps streaming with no buffering.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
-	handler, pattern := h.mux.Handler(r)
-	if pattern == "" {
-		// Not a scopecache path — leave it to the rest of the chain.
-		return next.ServeHTTP(w, r)
-	}
-	if !h.MissFallthrough {
+	if handler, pattern := h.mux.Handler(r); pattern != "" {
 		handler.ServeHTTP(w, r)
 		return nil
-	}
-
-	// The core write handlers consume the request body before
-	// hit-vs-miss is known; buffer a POST body up front so a
-	// write-miss can still reach `next` with its body intact.
-	var replayBody []byte
-	if r.Method == http.MethodPost && r.Body != nil {
-		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxFallthroughBodyBytes))
-		if err != nil {
-			// Oversize or unreadable body — an error, not a miss. Let
-			// the core handler answer with its own 4xx; no fallthrough.
-			r.Body = io.NopCloser(bytes.NewReader(body))
-			handler.ServeHTTP(w, r)
-			return nil
-		}
-		replayBody = body
-		r.Body = io.NopCloser(bytes.NewReader(body))
-	}
-
-	rec := caddyhttp.NewResponseRecorder(w, &bytes.Buffer{}, func(_ int, header http.Header) bool {
-		return header.Get(scopecache.MissHeader) != ""
-	})
-	handler.ServeHTTP(rec, r)
-	if !rec.Buffered() {
-		// Hit — the recorder streamed the response straight to w.
-		return nil
-	}
-
-	// Miss. The recorder wrote nothing to w, but the core handler set
-	// the miss response's headers on w's map (the recorder delegates
-	// Header() to w); drop them so `next` writes a clean response.
-	w.Header().Del("Content-Type")
-	w.Header().Del(scopecache.MissHeader)
-	if replayBody != nil {
-		r.Body = io.NopCloser(bytes.NewReader(replayBody))
 	}
 	return next.ServeHTTP(w, r)
 }
@@ -333,7 +269,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 //	    subscriber_command  /usr/local/bin/drain.sh
 //	    init_command        /usr/local/bin/rebuild.sh
 //	    init_timeout_sec    600
-//	    miss_fallthrough    false
 //	}
 func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	for d.Next() {
@@ -362,14 +297,6 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			}
 			if key == "init_command" {
 				h.InitCommand = value
-				continue
-			}
-			if key == "miss_fallthrough" {
-				enabled, err := strconv.ParseBool(value)
-				if err != nil {
-					return d.Errf("miss_fallthrough: %v", err)
-				}
-				h.MissFallthrough = enabled
 				continue
 			}
 

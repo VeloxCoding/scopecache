@@ -333,36 +333,14 @@ An addon cannot bypass validation that an HTTP caller faces.
 
 ## Built-in convenience mechanisms
 
-ScopeCache has three optional hooks around the core. All are off by
-default; each is enabled with one directive in the Caddy config.
+ScopeCache includes two convenience mechanisms around the core:
 
-- **`init_command`** — runs a script once when the web server starts,
-  before the first request is served. Use it to rebuild the cache from
-  the source of truth (a database, a JSON file, an API) so the cache is
-  warm from the very first request.
-- **`subscriber_command`** — runs a script whenever data changes. A
-  worker drains new items in batches, processes them, and persists them
-  elsewhere — immediately or after a short delay. This is the
-  drain-and-persistence model.
-- **`miss_fallthrough`** — when a request misses the cache, ScopeCache
-  hands it to the next handler instead of answering with a miss
-  response. Place a `reverse_proxy` to your application after the
-  `scopecache` block: hits are served from the cache, misses reach the
-  application — the source of truth.
+- a warm-up script hook that can run when the web server starts
+- a subscription model that can notify external processes when data changes
 
-```caddyfile
-scopecache {
-    init_command       /usr/local/bin/rebuild.sh
-    subscriber_command /usr/local/bin/drain.sh
-    miss_fallthrough   true
-}
-reverse_proxy localhost:9000   # your application — answers the misses
-```
+The subscription model is useful for draining and persistence workflows. A worker can be notified when new items are appended, drain them in batches, process them, and persist them elsewhere.
 
-`miss_fallthrough` is specific to the Caddy module. In a standalone
-deployment the application calls ScopeCache directly, sees the miss in
-the response, and handles it itself — there is no handler chain to fall
-through to.
+Depending on the use case, draining can happen immediately or after a short delay so items can be processed in batches.
 
 ## Quickstart: Docker
 

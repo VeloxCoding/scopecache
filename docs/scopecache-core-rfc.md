@@ -942,38 +942,6 @@ an endpoint with the wrong method returns `405 Method Not Allowed`
 with the standard error envelope. The exact method per endpoint is
 listed in §6.
 
-### 5.6 Miss header
-
-The item-level read and mutate endpoints set a response header,
-`Scopecache-Miss: true`, when the operation matched no item:
-
-| endpoints            | miss condition                        |
-|----------------------|----------------------------------------|
-| `/get`, `/render`    | no item at the given `id` / `seq`      |
-| `/tail`, `/head`     | scope empty or unknown                 |
-| `/update`, `/delete` | no item at the target                  |
-
-The header lifts the body's `hit: false` (and `/render`'s `404`) to
-the header layer, so a proxy or middleware can branch on
-hit-vs-miss without parsing the response body. It is presence-only:
-present and `true` on a miss, absent on a hit.
-
-It is deliberately *not* set on:
-
-- the error statuses `400`, `405`, `409`, `507` — a miss is "the
-  item is not here", not "the request was malformed"; conflating
-  the two would make a fronting layer retry unretryable failures.
-  (`/render`'s `404` *is* a miss, not an error, and carries it.)
-- the always-storing writes `/append`, `/upsert`, `/counter_add` —
-  these never miss.
-- bulk operations (`/wipe`, `/warm`, `/rebuild`, `/delete_up_to`,
-  `/delete_scope`) and observability (`/stats`, `/scopelist`,
-  `/help`) — "found nothing" there is not a per-item data miss.
-
-Its purpose is to let a fronting layer treat a cache miss as a
-fall-through signal — for example a Caddy handler that forwards
-missed requests to the source-of-truth application.
-
 ---
 
 ## 6. Endpoints
@@ -1134,8 +1102,6 @@ with `hit: false`).
   responses (§5.1).
 - `count` — number of items modified (always 0 or 1 since `id`/`seq`
   is unique-in-scope). `count == 0` is the soft-miss signal.
-- A soft-miss (`count == 0`) also sets the `Scopecache-Miss: true`
-  response header (§5.6).
 
 **Side effects**
 
@@ -1244,8 +1210,6 @@ on a non-existent item.
 
 - `hit` — whether an item was found and deleted (`count > 0`).
 - `count` — number of items removed (always 0 or 1).
-- A miss (`hit: false`) also sets the `Scopecache-Miss: true`
-  response header (§5.6).
 
 **Example**
 
@@ -1281,9 +1245,6 @@ Drain a `seq`-prefix from a scope: removes every item with
 - `hit` — whether anything was removed (`count > 0`).
 - `count` — number of items actually removed (may be 0 if no items
   had `seq ≤ max_seq`).
-- Neither `/delete_up_to` nor `/delete_scope` sets the
-  `Scopecache-Miss` header, even when nothing was removed: these are
-  bulk / structural operations, not per-item data misses (§5.6).
 
 **Example**
 
@@ -1534,8 +1495,6 @@ without a presence check (§4.2).
 {"ok": true, "hit": false, "count": 0, "item": null, "approx_response_mb": 0.0001}
 ```
 
-A miss also sets the `Scopecache-Miss: true` response header (§5.6).
-
 **Side effects**
 
 A successful hit bumps the per-scope read-bookkeeping atomics (§9).
@@ -1574,8 +1533,6 @@ Same as `/get`: `scope`, plus exactly one of `id` or `seq`.
   a not-found resource — the use case (proxy-fronted byte
   streaming) does not benefit from a JSON envelope, so a status
   code is the lowest-friction signal.
-- The `404` also sets the `Scopecache-Miss: true` response header
-  (§5.6).
 
 **Side effects**
 
@@ -1635,8 +1592,6 @@ the key.
 {"ok": true, "hit": false, "count": 0, "truncated": false, "items": [], "approx_response_mb": 0.0001}
 ```
 
-A miss also sets the `Scopecache-Miss: true` response header (§5.6).
-
 **Endpoint-specific errors**
 
 | status | error                                                     | when                       |
@@ -1659,8 +1614,7 @@ curl -s 'http://localhost:8080/head?scope=events&limit=10'
 #### `GET /tail`
 
 Return the newest items in a scope, optionally offset back from the
-tail. Returns 200 in both the hit and miss case; a miss also sets
-the `Scopecache-Miss: true` response header (§5.6).
+tail. Returns 200 in both the hit and miss case.
 
 **Query parameters**
 

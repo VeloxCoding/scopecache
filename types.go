@@ -88,13 +88,6 @@ const (
 	// never auto-writes to it.
 	InboxScopeName = "_inbox"
 
-	// MissHeader is set to "true" on a response whose lookup found
-	// no item: a /get, /render, /tail, /head, /update, or /delete
-	// miss. It lifts the body's `hit:false` to the header layer so
-	// proxies and middleware can branch without parsing the body.
-	// Absent on a hit, on errors, and on bulk/observability endpoints.
-	MissHeader = "Scopecache-Miss"
-
 	// singleRequestBytesOverhead is the headroom added on top of the configured
 	// per-item cap to produce the request body cap for single-item endpoints
 	// (/append, /update, /upsert, /delete, /delete_scope, /delete_up_to,
