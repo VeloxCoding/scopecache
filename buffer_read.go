@@ -16,24 +16,31 @@ package scopecache
 import "sort"
 
 // tailOffset returns the window of newest `limit` items after
-// skipping `offset` from the newest end. The window is the slice
-// b.items[start:end] preserved in its native seq-ascending
-// (oldest-first) order; clients sort by seq if they want
-// newest-first.
+// skipping `offset` from the newest end, appended into `out`. out
+// MAY be nil or empty (a pool-borrowed scratch slice is fine); the
+// method always returns out[:0] sliced to the actual result length.
+// The window is preserved in its native seq-ascending (oldest-first)
+// order; clients sort by seq if they want newest-first.
 //
 // hasMore is true when older items exist before the window (i.e.
 // start > 0), signalling to the caller that the response is clipped
 // at the oldest end. It does NOT signal truncation at the newest end
 // (that is what offset already describes to the client).
-func (b *scopeBuffer) tailOffset(limit int, offset int) ([]Item, bool) {
+//
+// Scratch-slice contract: out may be a pool-borrowed slice with
+// cap ≥ limit to avoid the per-call alloc that dominates GC pressure
+// on the /head + /tail hot path (45% of bench-measured allocation
+// space pre-pool). Caller is responsible for releasing out back to
+// its pool after consuming the result.
+func (b *scopeBuffer) tailOffset(out []Item, limit, offset int) ([]Item, bool) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 
 	if limit <= 0 || offset < 0 {
-		return []Item{}, false
+		return out[:0], false
 	}
 	if offset >= len(b.items) {
-		return []Item{}, false
+		return out[:0], false
 	}
 
 	end := len(b.items) - offset
@@ -43,21 +50,22 @@ func (b *scopeBuffer) tailOffset(limit int, offset int) ([]Item, bool) {
 		start = 0
 	}
 	if start >= end {
-		return []Item{}, false
+		return out[:0], false
 	}
 
-	// items is []*Item; deref-copy the window into a fresh value slice
-	// so the read path never hands back the live pointers.
+	// items is []*Item; deref-copy the window into out so the read path
+	// never hands back the live pointers.
 	window := b.items[start:end]
-	out := make([]Item, len(window))
-	for i, p := range window {
-		out[i] = *p
+	out = out[:0]
+	for _, p := range window {
+		out = append(out, *p)
 	}
 	return out, hasMore
 }
 
 // sinceSeq returns items with seq > afterSeq, oldest-first, up to
-// limit. limit ≤ 0 returns an empty slice — matches every other
+// limit, appended into `out`. Same scratch-slice contract as
+// tailOffset. limit ≤ 0 returns out[:0] — matches every other
 // multi-item read on the public surface. HTTP rejects 0/negative
 // with 400 via normalizeLimit; the guard here exists for direct
 // Gateway callers.
@@ -65,16 +73,16 @@ func (b *scopeBuffer) tailOffset(limit int, offset int) ([]Item, bool) {
 // The bool is true when more matching items exist beyond the
 // returned slice, so the handler surfaces truncated=true without
 // the client guessing from count == limit.
-func (b *scopeBuffer) sinceSeq(afterSeq uint64, limit int) ([]Item, bool) {
+func (b *scopeBuffer) sinceSeq(out []Item, afterSeq uint64, limit int) ([]Item, bool) {
 	if limit <= 0 {
-		return []Item{}, false
+		return out[:0], false
 	}
 
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 
 	if len(b.items) == 0 {
-		return []Item{}, false
+		return out[:0], false
 	}
 
 	idx := sort.Search(len(b.items), func(i int) bool {
@@ -82,7 +90,7 @@ func (b *scopeBuffer) sinceSeq(afterSeq uint64, limit int) ([]Item, bool) {
 	})
 
 	if idx >= len(b.items) {
-		return []Item{}, false
+		return out[:0], false
 	}
 
 	available := len(b.items) - idx
@@ -92,9 +100,9 @@ func (b *scopeBuffer) sinceSeq(afterSeq uint64, limit int) ([]Item, bool) {
 		take = limit
 		hasMore = true
 	}
-	out := make([]Item, take)
+	out = out[:0]
 	for j := 0; j < take; j++ {
-		out[j] = *b.items[idx+j]
+		out = append(out, *b.items[idx+j])
 	}
 	return out, hasMore
 }

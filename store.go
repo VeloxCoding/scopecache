@@ -538,17 +538,22 @@ func (s *store) deleteUpTo(scope string, maxSeq uint64) (int, error) {
 }
 
 // head returns up to `limit` oldest items in the scope with seq >
-// afterSeq. Returns (items, truncated, scopeFound). On a non-empty
-// result the scope's read-bookkeeping atomics are bumped via
-// recordRead. A missing scope reports (nil, false, false); a
-// found-but-empty window reports (empty, false, true) — handlers
-// translate that into hit:false / count:0.
-func (s *store) head(scope string, afterSeq uint64, limit int) ([]Item, bool, bool) {
+// afterSeq, appended into `out`. Returns (items, truncated, scopeFound).
+// On a non-empty result the scope's read-bookkeeping atomics are
+// bumped via recordRead. A missing scope reports (out[:0], false,
+// false); a found-but-empty window reports (out[:0], false, true) —
+// handlers translate that into hit:false / count:0.
+//
+// out may be a pool-borrowed scratch slice (see handleHead) to avoid
+// the per-call alloc that dominates /head + /tail GC pressure.
+// Passing nil is also valid (allocates fresh) — callers that don't
+// pool (Gateway.Head, tests) do that.
+func (s *store) head(scope string, afterSeq uint64, limit int, out []Item) ([]Item, bool, bool) {
 	buf, ok := s.getScope(scope)
 	if !ok {
-		return nil, false, false
+		return out[:0], false, false
 	}
-	items, truncated := buf.sinceSeq(afterSeq, limit)
+	items, truncated := buf.sinceSeq(out, afterSeq, limit)
 	if len(items) > 0 {
 		buf.recordRead(nowUnixMicro())
 	}
@@ -556,13 +561,13 @@ func (s *store) head(scope string, afterSeq uint64, limit int) ([]Item, bool, bo
 }
 
 // tail returns up to `limit` newest items in the scope, skipping the
-// first `offset`. Same return shape and bookkeeping as head.
-func (s *store) tail(scope string, limit, offset int) ([]Item, bool, bool) {
+// first `offset`. Same scratch-slice contract and return shape as head.
+func (s *store) tail(scope string, limit, offset int, out []Item) ([]Item, bool, bool) {
 	buf, ok := s.getScope(scope)
 	if !ok {
-		return nil, false, false
+		return out[:0], false, false
 	}
-	items, truncated := buf.tailOffset(limit, offset)
+	items, truncated := buf.tailOffset(out, limit, offset)
 	if len(items) > 0 {
 		buf.recordRead(nowUnixMicro())
 	}

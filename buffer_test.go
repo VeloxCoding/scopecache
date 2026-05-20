@@ -696,7 +696,7 @@ func TestTailOffset_BasicAndEdges(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		got, _ := buf.tailOffset(tc.limit, tc.offset)
+		got, _ := buf.tailOffset(nil, tc.limit, tc.offset)
 		if len(got) != len(tc.wantSeq) {
 			t.Errorf("tail(limit=%d offset=%d): len=%d want %d", tc.limit, tc.offset, len(got), len(tc.wantSeq))
 			continue
@@ -721,7 +721,7 @@ func TestSinceSeq_ReturnsItemsAfterCursor(t *testing.T) {
 	// behaviour without relying on the historical limit=0 → unlimited
 	// semantics (tightened to limit ≤ 0 → empty for cross-method
 	// uniformity; see sinceSeq's doc-comment).
-	got, _ := buf.sinceSeq(2, 100)
+	got, _ := buf.sinceSeq(nil, 2, 100)
 	if len(got) != 3 {
 		t.Fatalf("len=%d want 3", len(got))
 	}
@@ -736,7 +736,7 @@ func TestSinceSeq_RespectsLimit(t *testing.T) {
 		_, _ = buf.appendItem(newItem("s", "", nil))
 	}
 
-	got, _ := buf.sinceSeq(0, 2)
+	got, _ := buf.sinceSeq(nil, 0, 2)
 	if len(got) != 2 {
 		t.Fatalf("len=%d want 2", len(got))
 	}
@@ -746,7 +746,7 @@ func TestSinceSeq_EmptyWhenPastEnd(t *testing.T) {
 	buf := newTestBuffer(10)
 	_, _ = buf.appendItem(newItem("s", "", nil))
 
-	got, _ := buf.sinceSeq(100, 100)
+	got, _ := buf.sinceSeq(nil, 100, 100)
 	if len(got) != 0 {
 		t.Fatalf("len=%d want 0", len(got))
 	}
@@ -766,7 +766,7 @@ func TestSinceSeq_NonPositiveLimitReturnsEmpty(t *testing.T) {
 	}
 
 	for _, limit := range []int{0, -1, -1000} {
-		got, more := buf.sinceSeq(0, limit)
+		got, more := buf.sinceSeq(nil, 0, limit)
 		if len(got) != 0 {
 			t.Errorf("limit=%d: len=%d want 0", limit, len(got))
 		}

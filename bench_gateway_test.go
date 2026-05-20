@@ -302,7 +302,7 @@ func BenchmarkStore_TailDirect(b *testing.B) {
 			b.ResetTimer()
 
 			for i := 0; i < b.N; i++ {
-				items, _, found := s.tail(scope, 10, 0)
+				items, _, found := s.tail(scope, 10, 0, nil)
 				if !found || len(items) != 10 {
 					b.Fatalf("tail: found=%v len=%d", found, len(items))
 				}

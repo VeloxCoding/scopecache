@@ -47,6 +47,35 @@ var responseBufferPool = sync.Pool{
 	},
 }
 
+// itemsScratchPool recycles []Item scratch slices used by handleHead
+// and handleTail to receive the buffer's window without an alloc per
+// request. tailOffset / sinceSeq used to make([]Item, N) per call —
+// at ~12 KiB per /tail-5k request and 6k qps that was ~72 MiB/s of
+// GC churn (45% of bench-measured allocation space).
+//
+// New() returns a small (256-entry) starter so cold paths and small
+// /head requests don't oversize. Steady-state pool entries grow to
+// match the realistic per-request limit (default DefaultLimit=1000,
+// MaxLimit=10000) via append doubling on first use; subsequent
+// requests reuse without re-grow.
+//
+// Storing *[]Item (not []Item directly) avoids an interface-box alloc
+// on every Put — same pattern as responseBufferPool.
+//
+// Pool slots retain Item value references in the backing array slots
+// past the current len. Those slots' Payload []byte headers reference
+// scopeBuffer storage; under load the pool turns over fast enough
+// that retention is sub-second, and sync.Pool clears stale entries on
+// GC. Not zeroing on Put because clearing the full cap would cost
+// ~100 µs at the upper bound (10k items × 96 B = ~1 MiB of writes),
+// dwarfing the saving we're trying to capture.
+var itemsScratchPool = sync.Pool{
+	New: func() any {
+		s := make([]Item, 0, 256)
+		return &s
+	},
+}
+
 // getResponseBuf returns a byte slice with length 0 and cap at least
 // estCapacity. Either reuses a pooled buffer (if big enough) or
 // allocates fresh. Pair with putResponseBuf.
@@ -225,7 +254,15 @@ func (api *API) handleHead(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	items, truncated, found := api.store.head(q.Scope, afterSeq, q.Limit)
+	scratchPtr := itemsScratchPool.Get().(*[]Item)
+	scratch := *scratchPtr
+	defer func() {
+		*scratchPtr = scratch[:0]
+		itemsScratchPool.Put(scratchPtr)
+	}()
+
+	items, truncated, found := api.store.head(q.Scope, afterSeq, q.Limit, scratch)
+	scratch = items
 	if !found {
 		api.writeHeadResponse(w, HeadResponse{OK: true, Hit: false, Count: 0, Truncated: false, Items: nil})
 		return
@@ -256,7 +293,15 @@ func (api *API) handleTail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	items, truncated, found := api.store.tail(q.Scope, q.Limit, offset)
+	scratchPtr := itemsScratchPool.Get().(*[]Item)
+	scratch := *scratchPtr
+	defer func() {
+		*scratchPtr = scratch[:0]
+		itemsScratchPool.Put(scratchPtr)
+	}()
+
+	items, truncated, found := api.store.tail(q.Scope, q.Limit, offset, scratch)
+	scratch = items
 	if !found {
 		api.writeTailResponse(w, TailResponse{OK: true, Hit: false, Count: 0, Offset: offset, Truncated: false, Items: nil})
 		return

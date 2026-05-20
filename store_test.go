@@ -144,7 +144,7 @@ func TestStore_deleteUpTo_MissingScope(t *testing.T) {
 
 func TestStore_head_MissingScope(t *testing.T) {
 	s := newStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
-	items, truncated, found := s.head("nope", 0, 10)
+	items, truncated, found := s.head("nope", 0, 10, nil)
 	if found {
 		t.Error("found=true; want false")
 	}
@@ -158,7 +158,7 @@ func TestStore_head_MissingScope(t *testing.T) {
 
 func TestStore_tail_MissingScope(t *testing.T) {
 	s := newStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
-	items, truncated, found := s.tail("nope", 10, 0)
+	items, truncated, found := s.tail("nope", 10, 0, nil)
 	if found {
 		t.Error("found=true; want false")
 	}

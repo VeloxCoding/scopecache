@@ -123,9 +123,14 @@ func (g *Gateway) Rebuild(grouped map[string][]Item) (int, int, error) {
 // to remember.
 
 // Head returns up to `limit` oldest items in `scope` with seq > afterSeq.
-// Returns (items, truncated, scope_found).
+// Returns (items, truncated, scope_found). Payloads are fresh
+// allocations — callers may mutate freely.
+//
+// Internal scratch slice is nil (fresh alloc) because the returned
+// slice is handed to a Go-API caller who keeps it; pooling here
+// would require API surface for release.
 func (g *Gateway) Head(scope string, afterSeq uint64, limit int) ([]Item, bool, bool) {
-	items, truncated, found := g.store.head(scope, afterSeq, limit)
+	items, truncated, found := g.store.head(scope, afterSeq, limit, nil)
 	return cloneItemsPayloads(items), truncated, found
 }
 
@@ -133,9 +138,10 @@ func (g *Gateway) Head(scope string, afterSeq uint64, limit int) ([]Item, bool, 
 // skipping `offset` from the newest end. Items are in the cache's
 // native seq-ascending (oldest-first) order; clients sort by seq if
 // they want newest-first.
-// Returns (items, has_more, scope_found).
+// Returns (items, has_more, scope_found). See Head for the rationale
+// behind the unpooled scratch.
 func (g *Gateway) Tail(scope string, limit, offset int) ([]Item, bool, bool) {
-	items, hasMore, found := g.store.tail(scope, limit, offset)
+	items, hasMore, found := g.store.tail(scope, limit, offset, nil)
 	return cloneItemsPayloads(items), hasMore, found
 }
 

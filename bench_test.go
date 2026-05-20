@@ -332,7 +332,7 @@ func BenchmarkStore_Tail_Parallel(b *testing.B) {
 		for pb.Next() {
 			scope := scopes[i%numScopes]
 			buf, _ := store.getScope(scope)
-			_, _ = buf.tailOffset(10, 0)
+			_, _ = buf.tailOffset(nil, 10, 0)
 			i++
 		}
 	})
@@ -353,7 +353,7 @@ func BenchmarkStore_Head_Parallel(b *testing.B) {
 		for pb.Next() {
 			scope := scopes[i%numScopes]
 			buf, _ := store.getScope(scope)
-			_, _ = buf.sinceSeq(0, 10)
+			_, _ = buf.sinceSeq(nil, 0, 10)
 			i++
 		}
 	})

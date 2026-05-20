@@ -55,13 +55,13 @@ func TestPointerSafety_BufferReadReturnsValueCopy(t *testing.T) {
 	g2.Seq, g2.Scope = 4242, "hijacked"
 	assertUntouched("after getBySeq mutate")
 
-	win, _ := buf.tailOffset(10, 0)
+	win, _ := buf.tailOffset(nil, 10, 0)
 	for i := range win {
 		win[i].Seq, win[i].Scope = 4242, "hijacked"
 	}
 	assertUntouched("after tailOffset mutate")
 
-	since, _ := buf.sinceSeq(0, 10)
+	since, _ := buf.sinceSeq(nil, 0, 10)
 	for i := range since {
 		since[i].Seq, since[i].Scope = 4242, "hijacked"
 	}
