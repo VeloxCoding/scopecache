@@ -99,10 +99,17 @@ func (b *scopeBuffer) sinceSeq(afterSeq uint64, limit int) ([]Item, bool) {
 	return out, hasMore
 }
 
+// getByID / getBySeq run in ~15 ns under RLock. At that size the
+// `defer b.mu.RUnlock()` overhead is a measurable fraction of the
+// total cost (Go 1.14 inlines the defer but not for free on this
+// size of function), so the unlock is inlined manually here. Pattern:
+// take RLock → do the map lookup → unlock → branch on ok. Hot read
+// paths only — keep `defer` on slower paths where the overhead is
+// noise.
 func (b *scopeBuffer) getByID(id string) (Item, bool) {
 	b.mu.RLock()
-	defer b.mu.RUnlock()
 	item, ok := b.byID[id]
+	b.mu.RUnlock()
 	if !ok {
 		return Item{}, false
 	}
@@ -111,8 +118,8 @@ func (b *scopeBuffer) getByID(id string) (Item, bool) {
 
 func (b *scopeBuffer) getBySeq(seq uint64) (Item, bool) {
 	b.mu.RLock()
-	defer b.mu.RUnlock()
 	item, ok := b.bySeq[seq]
+	b.mu.RUnlock()
 	if !ok {
 		return Item{}, false
 	}
