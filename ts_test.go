@@ -136,37 +136,6 @@ func TestUpdate_RefreshesTs(t *testing.T) {
 	}
 }
 
-func TestCounterAdd_AssignsTsOnCreate(t *testing.T) {
-	h, _ := newTestHandler(10)
-	before := time.Now().UnixMicro()
-	_, _, _ = doRequest(t, h, "POST", "/counter_add",
-		`{"scope":"s","id":"c","by":5}`)
-	after := time.Now().UnixMicro()
-
-	_, out, _ := doRequest(t, h, "GET", "/get?scope=s&id=c", "")
-	ts := int64(out["item"].(map[string]interface{})["ts"].(float64))
-	if ts < before || ts > after {
-		t.Fatalf("create ts=%d outside [%d, %d]", ts, before, after)
-	}
-}
-
-func TestCounterAdd_RefreshesTsOnIncrement(t *testing.T) {
-	h, _ := newTestHandler(10)
-	_, _, _ = doRequest(t, h, "POST", "/counter_add", `{"scope":"s","id":"c","by":5}`)
-	_, getOut, _ := doRequest(t, h, "GET", "/get?scope=s&id=c", "")
-	firstTs := int64(getOut["item"].(map[string]interface{})["ts"].(float64))
-
-	time.Sleep(2 * time.Millisecond)
-
-	_, _, _ = doRequest(t, h, "POST", "/counter_add", `{"scope":"s","id":"c","by":3}`)
-	_, getOut2, _ := doRequest(t, h, "GET", "/get?scope=s&id=c", "")
-	secondTs := int64(getOut2["item"].(map[string]interface{})["ts"].(float64))
-
-	if secondTs <= firstTs {
-		t.Fatalf("counter increment did not refresh ts: first=%d, second=%d", firstTs, secondTs)
-	}
-}
-
 // --- /warm and /rebuild stamp ts on every item --------------------------------
 
 func TestWarm_StampsTs(t *testing.T) {

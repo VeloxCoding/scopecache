@@ -10,40 +10,10 @@
 // the buffer had at detach time, which is fine for reads — no
 // orphan-write hazard, only an eventually-stale snapshot. The
 // read-bookkeeping (recordRead) runs separately and is lock-free.
-//
-// Every read path runs returned items through materialiseCounter so
-// consumers see the cell's current value/ts rather than the stored
-// (stale-by-design) Payload bytes. Cheap on counters, no-op
-// otherwise.
 
 package scopecache
 
 import "sort"
-
-func materialiseCounter(item Item) Item {
-	if item.counter == nil {
-		return item
-	}
-	item.Payload = renderCounterPayload(item.counter)
-	item.Ts = item.counter.ts.Load()
-	// renderBytes is never set on counter items — bare integers don't
-	// hit the JSON-string shortcut path — so nothing to clear.
-	return item
-}
-
-// materialiseCountersInPlace walks `items` and rewrites any counter-
-// shaped entry with a fresh Payload/Ts derived from its cell. Used by
-// the multi-item read paths (tailOffset, sinceSeq) on the slice they
-// are about to return; the caller owns the slice (it's a fresh copy of
-// b.items) so in-place is safe.
-func materialiseCountersInPlace(items []Item) []Item {
-	for i := range items {
-		if items[i].counter != nil {
-			items[i] = materialiseCounter(items[i])
-		}
-	}
-	return items
-}
 
 // tailOffset returns the window of newest `limit` items after
 // skipping `offset` from the newest end. The window is the slice
@@ -83,7 +53,7 @@ func (b *scopeBuffer) tailOffset(limit int, offset int) ([]Item, bool) {
 	for i, p := range window {
 		out[i] = *p
 	}
-	return materialiseCountersInPlace(out), hasMore
+	return out, hasMore
 }
 
 // sinceSeq returns items with seq > afterSeq, oldest-first, up to
@@ -126,7 +96,7 @@ func (b *scopeBuffer) sinceSeq(afterSeq uint64, limit int) ([]Item, bool) {
 	for j := 0; j < take; j++ {
 		out[j] = *b.items[idx+j]
 	}
-	return materialiseCountersInPlace(out), hasMore
+	return out, hasMore
 }
 
 func (b *scopeBuffer) getByID(id string) (Item, bool) {
@@ -136,7 +106,7 @@ func (b *scopeBuffer) getByID(id string) (Item, bool) {
 	if !ok {
 		return Item{}, false
 	}
-	return materialiseCounter(*item), true
+	return *item, true
 }
 
 func (b *scopeBuffer) getBySeq(seq uint64) (Item, bool) {
@@ -146,5 +116,5 @@ func (b *scopeBuffer) getBySeq(seq uint64) (Item, bool) {
 	if !ok {
 		return Item{}, false
 	}
-	return materialiseCounter(*item), true
+	return *item, true
 }

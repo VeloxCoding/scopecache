@@ -16,10 +16,7 @@
 
 package scopecache
 
-import (
-	"errors"
-	"net/http"
-)
+import "net/http"
 
 // writeAck is the response shape /append and /upsert nest under
 // "item". Mirrors Item's JSON layout for scope/id/seq/ts but
@@ -103,68 +100,6 @@ func (api *API) handleUpsert(w http.ResponseWriter, r *http.Request) {
 		OK:      true,
 		Created: created,
 		Item:    newWriteAck(result),
-	})
-}
-
-// handleCounterAdd atomically increments (or creates) a numeric
-// counter at scope+id by `by`. The only endpoint that reads or
-// mutates a payload as a typed value — every other write path
-// treats payloads as opaque bytes.
-func (api *API) handleCounterAdd(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		methodNotAllowed(w, http.MethodPost)
-		return
-	}
-
-	var req counterAddRequest
-	if err := decodeBody(w, r, api.maxSingleBytes, &req); err != nil {
-		badRequest(w, err.Error())
-		return
-	}
-
-	// /counter_add is the one endpoint where the JSON-shape check is
-	// HTTP-only: req.By is *int64 to distinguish "field missing" from
-	// "explicit zero". The "missing" case is a JSON-decode shape
-	// concern, not a Go-API concern (Go callers always pass int64), so
-	// the nil-check stays here. Range + non-zero validation lives in
-	// Store.counterAddOne (it sees int64).
-	if req.By == nil {
-		badRequest(w, "the 'by' field is required for the '/counter_add' endpoint")
-		return
-	}
-
-	origScope := req.Scope
-	value, created, err := api.store.counterAddOne(req.Scope, req.ID, *req.By)
-	if err != nil {
-		if errors.Is(err, ErrInvalidInput) {
-			badRequest(w, err.Error())
-			return
-		}
-		// Capacity-class errors (*ScopeFullError + *StoreFullError).
-		// Counter-specific errors are handled inline below — they do
-		// not fit writeStoreCapacityError because *CounterPayloadError
-		// maps to 409 conflict and *CounterOverflowError maps to 400.
-		if writeStoreCapacityError(w, err, origScope) {
-			return
-		}
-		var payloadErr *CounterPayloadError
-		if errors.As(err, &payloadErr) {
-			conflict(w, payloadErr.Error())
-			return
-		}
-		var overflowErr *CounterOverflowError
-		if errors.As(err, &overflowErr) {
-			badRequest(w, overflowErr.Error())
-			return
-		}
-		conflict(w, err.Error())
-		return
-	}
-
-	writeJSONResponse(w, http.StatusOK, CounterAddResponse{
-		OK:      true,
-		Created: created,
-		Value:   value,
 	})
 }
 

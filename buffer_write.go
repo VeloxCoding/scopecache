@@ -90,9 +90,6 @@ func (b *scopeBuffer) upsertByID(item Item) (Item, bool, error) {
 		// stored ts always reflects when the current content arrived.
 		b.items[i].Ts = nowUs
 		b.items[i].renderBytes = newRender
-		// /upsert replaces the whole item shape — clear any prior
-		// counter cell so it's no longer canonical.
-		b.items[i].counter = nil
 
 		// items[i], byID and bySeq alias one *Item, so the field
 		// writes above are already visible through every index.
@@ -242,13 +239,6 @@ func (b *scopeBuffer) updateBySeq(seq uint64, payload json.RawMessage, preRender
 // untouched in that case (no Seq increment, no b.items mutation, no
 // b.bytes increment), so the caller returns without rollback.
 func (b *scopeBuffer) insertNewItemLocked(item Item, nowUs int64) (Item, error) {
-	// Defensive clear of counter — Gateway boundary already strips it,
-	// HTTP json-decode never sets it, but internal callers (helpers,
-	// direct-construction tests) might. A leaked non-nil counter
-	// would make approxItemSize charge counterCellOverhead instead of
-	// len(Payload), and reads would materialise from the orphaned
-	// cell instead of the new payload bytes.
-	item.counter = nil
 	item.Ts = nowUs
 	// validator's checkItemSize normally fills renderBytes already;
 	// the recompute is a defensive fallback for internal callers /

@@ -63,13 +63,6 @@ func (g *Gateway) Update(item Item) (int, error) {
 	return g.store.updateOne(item)
 }
 
-// CounterAdd atomically increments (or creates) a counter at
-// (scope, id) by `by`.
-// Returns (post-add value, created, err).
-func (g *Gateway) CounterAdd(scope, id string, by int64) (int64, bool, error) {
-	return g.store.counterAddOne(scope, id, by)
-}
-
 // --- Data-plane: deletes --------------------------------------------
 
 // Delete removes a single item addressed by scope+id (id != "") or

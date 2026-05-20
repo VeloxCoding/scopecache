@@ -15,19 +15,9 @@
 // gw.store), so HTTP traffic does not pay the cloning cost in this
 // file.
 //
-// Unexported Item fields (renderBytes, counter) also need clearing at
-// the boundary, despite being unreachable to outside-package callers
-// directly. The hazard is round-tripping: a caller does
-//   item, _ := gw.GetByID("scope", "id")  // counter item — pointer rides on the Item
-//   item.Scope = "other"; item.Payload = newBytes
-//   _, _ = gw.Append(item)                // counter pointer rides through Append
-// without the clearing, the cache treats the new item as a counter,
-// approxItemSize charges counterCellOverhead instead of len(payload)
-// (under-counting MaxItemBytes), and the next read materialises from
-// the cell — silently returning the original counter value instead of
-// the supplied payload. Output-side clearing alone closes the hazard
-// (callers can never have set these fields themselves); input-side
-// clearing is a second guard.
+// The unexported renderBytes field is also cleared on the boundary so
+// outside-package callers cannot smuggle in a pre-computed render —
+// it must always be derived by the store from the payload itself.
 
 package scopecache
 
@@ -47,14 +37,12 @@ func clonePayload(p json.RawMessage) json.RawMessage {
 }
 
 // cloneItemPayload returns a copy of item with item.Payload replaced
-// by a fresh allocation and the unexported renderBytes + counter
-// fields cleared. Other exported fields are value types and don't
-// alias caller-side state. Applied symmetrically on input and output
-// boundaries — the clearing closes the round-trip hazard.
+// by a fresh allocation and the unexported renderBytes field
+// cleared. Other exported fields are value types and don't alias
+// caller-side state.
 func cloneItemPayload(item Item) Item {
 	item.Payload = clonePayload(item.Payload)
 	item.renderBytes = nil
-	item.counter = nil
 	return item
 }
 
@@ -80,15 +68,14 @@ func cloneGroupedItemPayloads(grouped map[string][]Item) map[string][]Item {
 }
 
 // cloneItemsPayloads rewrites every Item.Payload in items with a fresh
-// allocation and clears the unexported renderBytes + counter fields.
-// Operates in place — the caller owns items (read paths already return
-// a fresh slice header, so this never mutates cache storage). Returns
-// the same slice for ergonomic chaining.
+// allocation and clears the unexported renderBytes field. Operates in
+// place — the caller owns items (read paths already return a fresh
+// slice header, so this never mutates cache storage). Returns the
+// same slice for ergonomic chaining.
 func cloneItemsPayloads(items []Item) []Item {
 	for i := range items {
 		items[i].Payload = clonePayload(items[i].Payload)
 		items[i].renderBytes = nil
-		items[i].counter = nil
 	}
 	return items
 }

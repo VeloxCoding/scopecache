@@ -293,7 +293,6 @@ func (api *API) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/append", api.handleAppend)
 	mux.HandleFunc("/update", api.handleUpdate)
 	mux.HandleFunc("/upsert", api.handleUpsert)
-	mux.HandleFunc("/counter_add", api.handleCounterAdd)
 	mux.HandleFunc("/delete", api.handleDelete)
 	mux.HandleFunc("/delete_up_to", api.handleDeleteUpTo)
 

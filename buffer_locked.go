@@ -71,15 +71,9 @@ func (b *scopeBuffer) itemCapExceeded(proposed int) bool {
 }
 
 // payloadAndRenderBytes returns the byte cost approxItemSize charges
-// for an item's payload-related fields: counterCellOverhead for
-// counter items (where stored Payload is stale-by-construction),
-// len(Payload) + len(renderBytes) otherwise. Used by replace paths
-// (upsert/update) to compute size deltas correctly when either side
-// is a counter item.
+// for an item's payload-related fields. Used by replace paths
+// (upsert/update) to compute size deltas correctly.
 func payloadAndRenderBytes(item *Item) int64 {
-	if item.counter != nil {
-		return counterCellOverhead
-	}
 	return int64(len(item.Payload)) + int64(len(item.renderBytes))
 }
 
@@ -100,11 +94,6 @@ func (b *scopeBuffer) replaceItemAtIndexLocked(i int, payload json.RawMessage, t
 	b.items[i].Payload = payload
 	b.items[i].Ts = ts
 	b.items[i].renderBytes = renderBytes
-	// /update + /upsert replace the whole item shape; clear any
-	// prior counter cell so a subsequent /counter_add takes the
-	// promote branch on the new payload instead of using the
-	// orphaned cell.
-	b.items[i].counter = nil
 	b.bytes += delta
 	b.lastWriteTS = ts
 	if b.store != nil {

@@ -234,7 +234,7 @@ deltas off a scheduler — see §9.
 | `bytes`              | Σ `approxItemSize` over items — feeds store-wide `totalBytes`                  |
 | `idKeyBytes`         | Σ `len(item.ID)` over `byID` — keeps `approxSizeBytes` O(1)                    |
 | `createdTS`          | microsecond timestamp of scope creation                                        |
-| `lastWriteTS`        | microsecond timestamp of the most recent write that touched the scope — `/append`, `/upsert` (create and replace), `/update`, `/delete`, `/delete_up_to`, `/warm`, `/rebuild`. `/counter_add` is excluded by design; see note below. |
+| `lastWriteTS`        | microsecond timestamp of the most recent write that touched the scope — `/append`, `/upsert` (create and replace), `/update`, `/delete`, `/delete_up_to`, `/warm`, `/rebuild` |
 | `lastAccessTS`       | microsecond timestamp of the most recent read hit (atomic, lock-free)         |
 | `readCountTotal`     | lifetime read-hit count (atomic, lock-free)                                    |
 | `detached`           | lifecycle flag set by `/delete_scope`, `/wipe`, `/rebuild` to fail in-flight writes against an orphan buffer |
@@ -245,16 +245,6 @@ are surfaced as a per-scope bundle on `/scopelist` (§6.5), with
 optional prefix filtering and alphabetical cursor pagination.
 `/stats` itself stays aggregate-only (§2.5). In-process Go callers
 read the same per-scope fields via `*Gateway.ScopeList` (§7.2).
-
-**`/counter_add` and the freshness signal.** `/counter_add` refreshes
-the per-item `ts` on every create and increment, but does NOT bump the
-scope's `lastWriteTS` or the store-wide `last_write_ts` (§2.5).
-Counters are typically used to track read-driven activity (view
-counters bumping on every page hit), and folding those increments into
-`lastWriteTS` would degrade it from a "did meaningful content change?"
-signal into a heartbeat. Consumers who specifically care about a
-counter's freshness do `GET /get?scope=…&id=…` and read `item.ts`,
-which is the per-counter "last activity" timestamp.
 
 ### 2.5 Store-wide metadata
 
@@ -584,7 +574,6 @@ Validation rules for the fields that appear across the API:
 | `payload`   | any JSON value  | required; must be syntactically valid JSON; literal `null` is rejected; bytes are opaque to the cache |
 | `seq`       | uint64          | cache-assigned; clients must omit on every write; reads accept it as an addressing key |
 | `ts`        | int64           | cache-assigned; clients must omit on every write |
-| `by`        | int64           | required for `/counter_add`; non-zero; within ±(2^53 − 1) |
 | `max_seq`   | uint64          | required for `/delete_up_to`; must be > 0 |
 
 Per-item byte size (the sum of `scope`, `id`, fixed overhead, and
@@ -683,15 +672,14 @@ schema:
 - `hit` — present on every endpoint where the call may legitimately
   not match anything (`/get`, `/head`, `/tail`, `/scopelist`, the
   three delete endpoints). Not present on unconditional ops
-  (`/append`, `/upsert`, `/counter_add`, `/wipe`, `/warm`,
-  `/rebuild`) where `hit` would always be `true` and convey no
-  information.
+  (`/append`, `/upsert`, `/wipe`, `/warm`, `/rebuild`) where `hit`
+  would always be `true` and convey no information.
 - `created` — present on every write response (`/append`,
-  `/upsert`, `/update`, `/counter_add`). `true` when the call
-  produced a brand-new item, `false` when an existing item was
-  modified in place. `/append` always emits `true` and `/update`
-  always emits `false` (by construction); they carry the field
-  anyway so every write response has the same key set.
+  `/upsert`, `/update`). `true` when the call produced a brand-new
+  item, `false` when an existing item was modified in place.
+  `/append` always emits `true` and `/update` always emits `false`
+  (by construction); they carry the field anyway so every write
+  response has the same key set.
 
 ### 5.2 Error envelope
 
@@ -756,7 +744,7 @@ scopecache exposes the following endpoints, grouped by purpose:
 
 | group                       | endpoints                                                  |
 |-----------------------------|------------------------------------------------------------|
-| §6.1 Single-item writes     | `/append`, `/upsert`, `/update`, `/counter_add`            |
+| §6.1 Single-item writes     | `/append`, `/upsert`, `/update`                            |
 | §6.2 Deletes                | `/delete`, `/delete_up_to`, `/delete_scope`, `/wipe`       |
 | §6.3 Bulk                   | `/warm`, `/rebuild`                                         |
 | §6.4 Reads                  | `/get`, `/render`, `/head`, `/tail`                         |
@@ -814,8 +802,8 @@ Insert a new item into a scope. Rejects on duplicate `id`-in-scope.
 The `item` object echoes the stored `scope`, `id`, `seq`, and `ts`.
 Payload bytes are not echoed (they doubled the wire cost on the
 write path that just delivered them). `created` is always `true` on
-`/append` — kept for uniformity with `/upsert` and `/counter_add`
-(§5.1). When the request omits `id` the response renders
+`/append` — kept for uniformity with `/upsert` (§5.1). When the
+request omits `id` the response renders
 `"id":null` rather than dropping the key (uniform-shape rule, §4.2).
 
 **Endpoint-specific errors**
@@ -932,68 +920,6 @@ curl -s -X POST http://localhost:8080/update \
 ```
 
 ---
-
-#### `POST /counter_add`
-
-Atomically increment (or create) a numeric counter at `scope`+`id`
-by `by`. The only endpoint that reads or mutates a payload as a
-typed value — every other write path treats payloads as opaque
-bytes.
-
-**Request body**
-
-| field   | type    | required | notes                                                      |
-|---------|---------|----------|------------------------------------------------------------|
-| `scope` | string  | yes      | shape per §4.1                                             |
-| `id`    | string  | yes      | shape per §4.1                                             |
-| `by`    | int64   | yes      | non-zero; within ±(2^53 − 1)                               |
-
-**Response (200)**
-
-```json
-{"ok": true, "created": false, "value": 7}
-```
-
-- `created` — `true` when the counter did not exist (item created
-  with payload `by`); `false` when an existing counter was
-  incremented.
-- `value` — the post-increment counter value.
-
-**Endpoint-specific errors**
-
-| status | error                                                      | when                                              |
-|--------|------------------------------------------------------------|---------------------------------------------------|
-| 400    | `the counter operation would exceed the allowed range of ±(2^53-1)` | result would overflow the JS-safe integer range |
-| 400    | `scope '<name>' is reserved …`                             | `scope` is `_events` or `_inbox` (§2.6)              |
-| 409    | `payload is not a JSON integer` (or similar)               | existing item's payload is not a valid integer    |
-
-**Side effects**
-
-The counter value is incremented atomically by `by`. Increments run
-lock-free under the scope's read lock (CAS on an atomic int64 sidecar
-on the item) — concurrent `/counter_add` calls on the same counter do
-not serialise on each other or on read endpoints, only on actual
-mutations of the same scope (`/append`, `/upsert`, `/delete`).
-
-A worst-case payload reservation (max int64 width plus cell heap) is
-charged against the per-item and store-wide caps once at creation
-time, so subsequent increments never re-evaluate the byte budget;
-`99 → 100` and `999_999 → 1_000_000` are both free at the cap level.
-
-`item.ts` (visible via `/get`) advances on every successful
-increment. The scope's `lastWriteTS` and `/stats.last_write_ts` do
-NOT — see §2.4 for the rationale.
-
-**Example**
-
-```bash
-curl -s -X POST http://localhost:8080/counter_add \
-  -H 'Content-Type: application/json' \
-  -d '{"scope":"hits","id":"page-42","by":1}'
-# → {"ok":true,"created":false,"value":7}
-```
-
-### 6.2 Deletes
 
 #### `POST /delete`
 
@@ -1870,7 +1796,6 @@ Go method arguments; HTTP response fields become return values.
 | `POST /append`         | `Append(item Item) (Item, error)`                                                | committed item (Seq + Ts assigned)   |
 | `POST /upsert`         | `Upsert(item Item) (Item, bool, error)`                                          | item, `created` (true on new)        |
 | `POST /update`         | `Update(item Item) (int, error)`                                                 | updated count (0 = miss)             |
-| `POST /counter_add`    | `CounterAdd(scope, id string, by int64) (int64, bool, error)`                    | post-add value, `created`            |
 | `POST /delete`         | `Delete(scope, id string, seq uint64) (int, error)`                              | deleted count                        |
 | `POST /delete_up_to`   | `DeleteUpTo(scope string, maxSeq uint64) (int, error)`                           | deleted count                        |
 | `POST /delete_scope`   | `DeleteScope(scope string) (int, bool, error)`                                   | item count, `found`                  |
@@ -1941,11 +1866,8 @@ returned from `Get` / `Head` / `Tail` / `Render`.
   may mutate or retain the returned slice freely; cached state is
   independent.
 
-`Subscribe` and `StartSubscriber` carry no payload bytes — they
-return a wake-up channel and a stop function — so the clone
-discipline does not apply. `Stats` and `ScopeList` return only
-metadata. `CounterAdd`, `Delete`, `DeleteUpTo`, `DeleteScope`,
-`Wipe` take and return value types only.
+`Stats` and `ScopeList` return only metadata. `Delete`, `DeleteUpTo`,
+`DeleteScope`, `Wipe` take and return value types only.
 
 The HTTP path does not pay the cloning cost. `NewAPI` extracts
 `gw.store` and dispatches handlers directly; the request body
@@ -2248,16 +2170,14 @@ type Item struct {
     Payload json.RawMessage `json:"payload"`
 
     // Unexported — not part of the wire format:
-    renderBytes []byte        // pre-decoded payload for the /render fast path
-    counter     *atomic.Int64 // non-nil only for items created or promoted by /counter_add
+    renderBytes []byte // pre-decoded payload for the /render fast path
 }
 ```
 
-Five exported fields plus two internal. `Payload` is a
+Five exported fields plus one internal. `Payload` is a
 `json.RawMessage` — a `[]byte` holding the original JSON text — so
-the cache treats it as opaque and never parses it, except in two
-specific paths: the `/render` fast-path pre-decode (`renderBytes`)
-and `/counter_add` payload typing.
+the cache treats it as opaque and never parses it, except for the
+`/render` fast-path pre-decode (`renderBytes`).
 
 #### The per-scope buffer
 

@@ -110,15 +110,6 @@ func BenchmarkMarshal_UpdateResponse(b *testing.B) {
 	}
 }
 
-func BenchmarkMarshal_CounterAddResponse(b *testing.B) {
-	resp := CounterAddResponse{OK: true, Created: false, Value: 7}
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_, _ = json.Marshal(resp)
-	}
-}
-
 func BenchmarkMarshal_DeleteResponse(b *testing.B) {
 	resp := DeleteResponse{OK: true, Hit: true, Count: 1}
 	b.ReportAllocs()

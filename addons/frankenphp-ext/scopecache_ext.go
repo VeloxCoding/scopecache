@@ -313,28 +313,6 @@ func scopecache_update(scope *C.zend_string, id *C.zend_string, payload *C.zend_
 	return phpStringFromBytes(body)
 }
 
-// scopecache_counter_add — POST /counter_add envelope. `created` is
-// true on first-touch; `value` is the post-add counter value.
-//
-// export_php:function scopecache_counter_add(string $scope, string $id, int $by): ?string
-func scopecache_counter_add(scope *C.zend_string, id *C.zend_string, by int64) unsafe.Pointer {
-	gw := defaultSlot.Load()
-	if gw == nil {
-		return nil
-	}
-	value, created, err := gw.CounterAdd(zendStringCopy(scope), zendStringCopy(id), by)
-	if err != nil {
-		return errorEnvelope(err.Error())
-	}
-	body, mErr := scopecache.MarshalEnvelope(scopecache.CounterAddResponse{
-		OK: true, Created: created, Value: value,
-	})
-	if mErr != nil {
-		return errorEnvelope("internal: response marshal failed")
-	}
-	return phpStringFromBytes(body)
-}
-
 // --- Deletes ---------------------------------------------------------
 
 // scopecache_delete — POST /delete envelope. `count` is 0 or 1.

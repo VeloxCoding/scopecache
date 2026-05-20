@@ -155,7 +155,7 @@ This may look similar to an HTTP response cache, but the model is different. Sco
 The core HTTP API is intentionally small.
 
 - **Read:** `get`, `render`, `head`, `tail`
-- **Write:** `append`, `upsert`, `update`, `counter_add`
+- **Write:** `append`, `upsert`, `update`
 - **Bulk / load:** `warm`, `rebuild`
 - **Cleanup:** `delete`, `delete_up_to`, `delete_scope`, `wipe`
 - **Observe:** `stats`, `scopelist`, `help`

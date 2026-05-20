@@ -478,42 +478,6 @@ func TestValidateUpdateItem(t *testing.T) {
 	}
 }
 
-// validateCounterAddRequest pre-checks the candidate counter item's
-// approximate size against maxItemBytes. The candidate carries no
-// Payload (counters store cell state, not payload bytes) and a non-nil
-// counter marker so approxItemSize charges counterCellOverhead in
-// place of len(Payload) + len(renderBytes). Without this gate, the
-// store's create + promote paths committed counter items past the
-// per-item cap whenever scope+id+56 exceeded it.
-func TestValidateCounterAddRequest_EnforcesPerItemCap(t *testing.T) {
-	by := int64(1)
-
-	// Fits: 48 + 1 + 1 + 56 = 106 ≤ 200.
-	if _, err := validateCounterAddRequest(
-		counterAddRequest{Scope: "s", ID: "x", By: &by},
-		200,
-	); err != nil {
-		t.Errorf("106 ≤ 200 rejected: %v", err)
-	}
-
-	// Exceeds: 106 > 64.
-	if _, err := validateCounterAddRequest(
-		counterAddRequest{Scope: "s", ID: "x", By: &by},
-		64,
-	); err == nil {
-		t.Error("106 > 64 accepted; expected per-item-cap rejection")
-	}
-
-	// Sentinel: maxItemBytes <= 0 disables the check (used by fuzz
-	// callers that exercise shape rules without a realistic budget).
-	if _, err := validateCounterAddRequest(
-		counterAddRequest{Scope: "s", ID: "x", By: &by},
-		0,
-	); err != nil {
-		t.Errorf("sentinel maxItemBytes=0 unexpectedly rejected: %v", err)
-	}
-}
-
 func TestValidateDeleteRequest(t *testing.T) {
 	if err := validateDeleteRequest(deleteRequest{Scope: "s", ID: "a"}); err != nil {
 		t.Errorf("valid (by id) rejected: %v", err)

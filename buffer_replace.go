@@ -90,13 +90,6 @@ func buildReplacementState(items []Item) (scopeReplacement, error) {
 
 		lastSeq++
 		item := src
-		// Defensive clear of counter — public API boundaries strip
-		// it; clear here for internal callers / tests that built an
-		// Item directly. A smuggled non-nil cell would make
-		// approxItemSize charge counterCellOverhead instead of
-		// len(Payload), and post-warm reads would materialise from
-		// the orphaned cell.
-		item.counter = nil
 		item.Seq = lastSeq
 		item.Ts = nowUs
 		// /warm and /rebuild's per-item validateWriteItem already filled

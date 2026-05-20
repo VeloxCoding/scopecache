@@ -460,40 +460,6 @@ func (s *store) upsertOne(item Item) (Item, bool, error) {
 	return result, itemCreated, nil
 }
 
-// counterAddOne is the atomic /counter_add write-path; same rollback
-// contract as appendOne. Returns (value, created, err) where created
-// reflects the counter outcome, not the scope-creation outcome.
-func (s *store) counterAddOne(scope, id string, by int64) (int64, bool, error) {
-	// Construct the request shape the validator expects so the same
-	// rules (scope shape + by != 0 + range) apply to both HTTP and
-	// Go-API callers. The pointer-nil check (`by required`) is the
-	// HTTP-only concern (JSON missing-field detection) and stays in
-	// the handler — Go callers always pass an int64.
-	if _, err := validateCounterAddRequest(counterAddRequest{Scope: scope, ID: id, By: &by}, s.maxItemBytes); err != nil {
-		return 0, false, err
-	}
-	buf, scopeCreated, err := s.getOrCreateScopeTrackingCreated(scope)
-	if err != nil {
-		return 0, false, err
-	}
-	value, counterCreated, addErr := buf.counterAdd(scope, id, by)
-	if addErr != nil {
-		if scopeCreated {
-			s.cleanupIfEmptyAndUnused(scope, buf)
-		}
-		return value, counterCreated, addErr
-	}
-	// Counter mutations are silent on s.lastWriteTS by design — but
-	// when counter_add allocated a brand-new scope as a side effect,
-	// scope_count just grew on /stats and polling clients need a
-	// tick. Bump after the commit (not in getOrCreate) so a cell-
-	// allocation failure doesn't leave a ghost tick.
-	if scopeCreated {
-		s.bumpLastWriteTS(nowUnixMicro())
-	}
-	return value, counterCreated, nil
-}
-
 // updateOne mutates the payload of an item addressed by scope+id or
 // scope+seq. Returns (updated_count, err); a missing scope is reported
 // as (0, nil), the same wire shape an absent id/seq inside an existing

@@ -12,16 +12,14 @@
 //     core never re-converts. The MB JSON helper renders bytes back
 //     to MiB-with-4-decimals on observability surfaces.
 //   - approxItemSize is the single byte-cost function admission
-//     control consults. Counters charge counterCellOverhead instead
-//     of len(Payload) so increments stay lock-free; renderBytes is
-//     counted so HTML-rendered stores report their real footprint.
+//     control consults. renderBytes is counted so HTML-rendered
+//     stores report their real footprint.
 
 package scopecache
 
 import (
 	"encoding/json"
 	"strconv"
-	"sync/atomic"
 	"time"
 )
 
@@ -60,13 +58,6 @@ const (
 	// bulkRequestBytesFor: a full cache must fit into a single bulk request,
 	// plus JSON framing (keys, quotes, separators, wrapper object).
 	bulkRequestBytesOverhead = 16 << 20 // 16 MiB
-
-	// MaxCounterValue is the largest absolute value a /counter_add operation
-	// may observe or produce. Matches the JavaScript safe-integer range
-	// (2^53 - 1), so counter values marshalled into JSON round-trip through
-	// every client without loss of precision. Applies to `by`, the existing
-	// counter value, and the result of the addition.
-	MaxCounterValue int64 = (1 << 53) - 1 // 9,007,199,254,740,991
 )
 
 // Config bundles the cache-internal capacity knobs every adapter
@@ -116,17 +107,13 @@ func (m MB) MarshalJSON() ([]byte, error) {
 // of arbitrary user content) but enforces three wire-level
 // invariants on the raw bytes — must be syntactically valid JSON,
 // must be valid UTF-8, and must not be empty or literal `null`.
-// Documented inspection paths beyond those invariants:
-// renderBytes precompute for JSON-string shortcuts in /render,
-// and counter parsing in /counter_add.
+// Beyond those invariants the cache inspects payload bytes only
+// for the /render JSON-string shortcut (renderBytes precompute).
 //
 // Ts is cache-owned (time.Now().UnixMicro()) and refreshed on every
 // write that touches the item; clients must not supply ts (400 on
 // any write endpoint). The field is observability only — not
-// searchable, not indexed, not used for ordering. Microsecond (not
-// millisecond) granularity keeps two writes inside the same ms
-// distinguishable, which matters for counter "last activity"
-// stamping under burst load.
+// searchable, not indexed, not used for ordering.
 type Item struct {
 	Scope   string          `json:"scope,omitempty"`
 	ID      string          `json:"id,omitempty"`
@@ -143,19 +130,6 @@ type Item struct {
 	// Unexported so encoding/json never marshals it: in-process state,
 	// not part of the wire format.
 	renderBytes []byte
-
-	// counter is non-nil iff this item was created or promoted by
-	// /counter_add. cell.{value,ts} are the source of truth; Payload
-	// and Ts on the surrounding Item are stale by construction and
-	// re-rendered from the cell at read time (materialiseCounter in
-	// buffer_read.go).
-	//
-	// Side-channel rather than in-place Payload mutation because the
-	// fast path runs under b.mu.RLock — rewriting []byte under a read
-	// lock would race with concurrent readers. atomic.Int64 fields on
-	// the cell give us lock-free increment + CAS-max ts under RLock;
-	// Payload bytes are only ever produced fresh on the read boundary.
-	counter *counterCell
 }
 
 // MarshalJSON emits the universal Item shape (scope/id/seq/ts/payload).
@@ -204,36 +178,6 @@ func (i Item) MarshalJSON() ([]byte, error) {
 	return append(buf, '}'), nil
 }
 
-// counterCell is the lock-free state for a counter item. value is
-// the current integer, ts the microsecond timestamp of the most
-// recent increment. Both atomic so /counter_add's fast path runs
-// under b.mu.RLock without serialising on the scope's write lock.
-//
-// atomic.Int64 is non-copyable per `go vet`, so Item.counter is a
-// pointer: map/slice copies of Item share the same cell. That's the
-// point — an increment on any copy is observed by every reader.
-type counterCell struct {
-	value atomic.Int64
-	ts    atomic.Int64
-}
-
-// counterCellOverhead is the byte cost approxItemSize charges for a
-// counter item's payload-related state, in place of len(Payload) +
-// len(renderBytes) for regular items. Two components:
-//
-//   - 24 bytes for the maximum decimal int64 representation
-//     ("-9223372036854775808" is 20 chars, plus slack). The cell's
-//     value is rendered fresh on every read so we charge the worst
-//     case once at creation and never re-reserve on increment.
-//   - 32 bytes for the *counterCell heap allocation itself
-//     (two atomic.Int64 fields + struct overhead).
-//
-// Pre-reserving the worst case is what lets counter increments run
-// lock-free: every increment that bumps the value's digit count would
-// otherwise need to take Lock to reserve the byte delta. With this
-// fixed overhead, increments never touch byte accounting.
-const counterCellOverhead = 24 + 32
-
 type deleteRequest struct {
 	Scope string `json:"scope"`
 	ID    string `json:"id,omitempty"`
@@ -247,16 +191,6 @@ type deleteScopeRequest struct {
 type deleteUpToRequest struct {
 	Scope  string `json:"scope"`
 	MaxSeq uint64 `json:"max_seq"`
-}
-
-// counterAddRequest is the body of /counter_add. By is a pointer so
-// the handler can distinguish a missing field from an explicit zero;
-// the latter is rejected with 400 because it has no observable
-// effect.
-type counterAddRequest struct {
-	Scope string `json:"scope"`
-	ID    string `json:"id"`
-	By    *int64 `json:"by"`
 }
 
 type itemsRequest struct {
@@ -312,31 +246,6 @@ func (e *StoreFullError) Error() string {
 	return "store is at byte capacity"
 }
 
-// CounterPayloadError is returned by scopeBuffer.counterAdd when the existing
-// item at scope+id cannot participate in a counter operation: its payload is
-// not a JSON number, not an integer, or outside the allowed ±MaxCounterValue
-// range. The handler converts it to 409 Conflict.
-type CounterPayloadError struct {
-	Reason string
-}
-
-func (e *CounterPayloadError) Error() string {
-	return e.Reason
-}
-
-// CounterOverflowError is returned by scopeBuffer.counterAdd when the
-// resulting value would exceed ±MaxCounterValue. The handler converts it to
-// 400 Bad Request — the caller supplied a `by` that combined with the current
-// value would push the counter outside the JS-safe integer range.
-type CounterOverflowError struct {
-	Current int64
-	By      int64
-}
-
-func (e *CounterOverflowError) Error() string {
-	return "the counter operation would exceed the allowed range of ±(2^53-1)"
-}
-
 // ScopeDetachedError is returned by a scope-buffer write method when the
 // buffer has been unlinked from its Store (by /delete_scope, /wipe, or
 // /rebuild) between the handler's getScope/getOrCreateScope call and the
@@ -360,16 +269,6 @@ func approxItemSize(item Item) int64 {
 	n += int64(len(item.ID))
 	n += 8 // Seq
 	n += 8 // Ts (always set, plain int64)
-	if item.counter != nil {
-		// Counter items charge a fixed overhead (cell heap + max int64
-		// string) instead of len(Payload). The actual stored Payload
-		// bytes on a counter item are stale by construction — readers
-		// materialise from cell.value at the boundary, so we don't
-		// account for them. See counterCellOverhead's comment for the
-		// rationale of pre-reserving the worst case at creation.
-		n += counterCellOverhead
-		return n
-	}
 	n += int64(len(item.Payload))
 	// renderBytes is heap-resident only for JSON-string payloads
 	// (precomputed at write time so /render skips a per-hit

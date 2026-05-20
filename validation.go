@@ -307,47 +307,6 @@ func validateUpdateItem(item *Item, maxItemBytes int64) (returnErr error) {
 	return checkItemSize(item, maxItemBytes)
 }
 
-// validateCounterAddRequest returns the parsed `by` on success so the
-// handler can pass it straight to the store without re-dereferencing.
-//
-// maxItemBytes is the per-item cap. Counter items have a fully-
-// determined size (48 fixed overhead + len(scope) + len(id) +
-// counterCellOverhead) — no payload-size variance — so the candidate
-// is checkable up-front. Without this gate, counterAddSlow's create
-// and promote paths would silently commit counter items past
-// MaxItemBytes on small caps.
-func validateCounterAddRequest(req counterAddRequest, maxItemBytes int64) (by int64, returnErr error) {
-	defer func() { returnErr = wrapValidation(returnErr) }()
-	if err := validateScope(req.Scope, "/counter_add"); err != nil {
-		return 0, err
-	}
-	if err := requireID(req.ID, "/counter_add"); err != nil {
-		return 0, err
-	}
-	if req.By == nil {
-		return 0, errors.New("the 'by' field is required for the '/counter_add' endpoint")
-	}
-	by = *req.By
-	if by == 0 {
-		return 0, errors.New("the 'by' field must not be zero")
-	}
-	if by > MaxCounterValue || by < -MaxCounterValue {
-		return 0, errors.New("the 'by' field must be within ±(2^53-1)")
-	}
-	// Cap pre-flight on the candidate counter shape: non-nil counter
-	// marker so approxItemSize charges counterCellOverhead instead of
-	// len(Payload). maxItemBytes <= 0 disables the check for
-	// internal/test callers that exercise shape rules without
-	// provisioning a realistic per-item budget.
-	if maxItemBytes > 0 {
-		candidate := Item{Scope: req.Scope, ID: req.ID, counter: &counterCell{}}
-		if size := approxItemSize(candidate); size > maxItemBytes {
-			return 0, fmt.Errorf("the counter item's approximate size (%d bytes) exceeds the maximum of %d bytes", size, maxItemBytes)
-		}
-	}
-	return by, nil
-}
-
 func validateDeleteRequest(req deleteRequest) (returnErr error) {
 	defer func() { returnErr = wrapValidation(returnErr) }()
 	if err := validateScope(req.Scope, "/delete"); err != nil {
