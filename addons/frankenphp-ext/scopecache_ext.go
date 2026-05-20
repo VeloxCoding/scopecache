@@ -427,13 +427,11 @@ func scopecache_stats() unsafe.Pointer {
 	}
 	st := gw.Stats()
 	return phpStringFromBytes(mustMarshal(scopecache.StatsResponse{
-		OK:               true,
-		Scopes:           st.Scopes,
-		Items:            st.Items,
-		ApproxStoreMB:    st.ApproxStoreMB,
-		LastWriteTS:      st.LastWriteTS,
-		EventsDropsTotal: st.EventsDropsTotal,
-		ReservedScopes:   st.ReservedScopes,
+		OK:            true,
+		Scopes:        st.Scopes,
+		Items:         st.Items,
+		ApproxStoreMB: st.ApproxStoreMB,
+		LastWriteTS:   st.LastWriteTS,
 	}))
 }
 
